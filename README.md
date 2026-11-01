@@ -12,27 +12,27 @@ Use JDK 21, CMake 3.24+, Visual Studio 2022 C++ tools, and the Windows SDK.
 .\gradlew.bat build test javadoc nativeSmokeTest
 ```
 
-`build` compiles the Java mod and native DLL on Windows. The native smoke test creates a D3D12 WARP device, direct queue/list, and fence. `compileJava`, `test`, and `javadoc` can also run on Linux without building the Windows renderer.
+`build` compiles the Java mod and native DLL on Windows. The native smoke test creates a D3D12 WARP device, direct queue/list, and fence. `compileJava`, `test`, and `javadoc` can also run on Linux without building the Windows renderer. The Linux CI job runs only those Java checks and does not publish a JAR. The Windows CI job creates the distributable JAR and verifies that it contains `META-INF/native/windows-x86_64/direct_renderer.dll`; a JAR built manually on Linux does not include the Windows backend and must not be used as the DX12 release artifact.
 
 The native DLL links Windows SDK libraries (`d3d11`, `d3d12`, `dxgi`, and `d3dcompiler`). D3D11On12 is used only to expose/copy the D3D12 color target for WGL interop; terrain geometry and extension passes are recorded and rendered by native D3D12.
 
 ## Renderer and capabilities
 
-- Terrain section meshes are captured from vanilla compilation and uploaded into D3D12 vertex/index buffers. The active native pipelines cover the `solid`, `cutout_mipped`, and `cutout` layers.
-- Opaque and cutout command lists use cached PSOs, a shared root signature, an atlas descriptor heap, and a 64-slot shader-indexed descriptor table. A D3D12 pipeline library caches PSOs in memory for the active renderer lifetime.
+- Terrain section meshes are captured from vanilla compilation and uploaded into D3D12 vertex/index buffers. Each packed vertex occupies 16 bytes (uint16 position, RGBA8 color, and unorm16 UVs); source indices are expanded to 32-bit indices. The active native pipelines cover the `solid`, `cutout_mipped`, and `cutout` layers.
+- Opaque and cutout command lists use two native D3D12 PSOs, a shared root signature, an atlas SRV descriptor heap, and a 64-slot shader-indexed descriptor table. A D3D12 pipeline library caches PSOs in memory for the active renderer lifetime.
 - Opaque and cutout command lists can be recorded concurrently; the renderer falls back to one recording thread if worker creation fails. D3D12 render-pass commands are used when command-list v4 is available, otherwise equivalent explicit target binding and barriers are used.
-- Terrain atlas and section data are copied from upload heaps. Color/depth and atlas transitions are explicit. Atlas BC7 compression is configurable and lossy.
+- Terrain atlas and section data are copied from upload heaps. Color/depth and atlas transitions are explicit. Atlas BC7 compression is configurable, enabled by default (`compressBlockAtlas=true`), and lossy; it is used where the texture dimensions support BC7.
 - The D3D12 output is imported into OpenGL via `WGL_NV_DX_interop2`. When `GL_EXT_semaphore_win32` imports both shared timeline fences, the GPU orders D3D12 writes and OpenGL reads without a frame-by-frame CPU fence wait. If a D3D12 frame slot is still busy, Direct skips the overlay for that frame instead of blocking the render thread; vanilla rendering remains visible. A native watchdog CPU-signals a stalled ready fence only to release the OpenGL semaphore wait; it marks the frame invalid, which Java checks before drawing the imported texture. Unsupported semaphore paths use bounded CPU waits and `glFinish`. After a renderer/device error, Direct falls back to vanilla and retries initialization after a short cooldown.
 - On initialization, the public API reports the adapter name, hardware/software adapter status, descriptor tier, render-pass command support, pipeline-library availability, semaphore status, and WGL support. The in-game status overlay shows whether Direct, CPU fallback, or vanilla rendering is active.
 
-The current renderer captures only the `solid`, `cutout_mipped`, and `cutout` terrain layers into D3D12. Vanilla still renders those layers and supplies the depth buffer; Direct composites its terrain color at the same stage, then block entities, entities, translucent terrain, particles, weather, the hand, and GUI/HUD continue through OpenGL. Passes can sample color but cannot sample the depth attachment yet. There is no Iris support.
+The current renderer captures only the `solid`, `cutout_mipped`, and `cutout` terrain layers into D3D12. Vanilla continues to render those layers by default and supplies the depth buffer; the experimental `replaceVanillaTerrain` option can suppress the corresponding vanilla draws only after capture is stable and the captured geometry is compatible. Direct composites its terrain color at the same stage, then block entities, entities, translucent terrain, particles, weather, the hand, and GUI/HUD continue through OpenGL. Passes can sample color but cannot sample the depth attachment yet. There is no Iris support.
 
 ## Configuration
 
 Open Minecraft's mod configuration screen and select **Direct DX12**. The client options are:
 
-- `enableDx12Preview` — enable Direct's native D3D12 terrain rendering (off by default).
-- `compressBlockAtlas` — use BC7 for the D3D12 atlas where dimensions permit.
+- `enableDx12Preview` — enable Direct's native D3D12 terrain overlay (off by default; experimental).
+- `compressBlockAtlas` — compress the D3D12 block atlas with BC7 (on by default).
 - `showRendererStatus` — show Direct's backend status in the HUD.
 
 ## Extension API

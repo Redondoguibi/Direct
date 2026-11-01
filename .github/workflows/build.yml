@@ -42,6 +42,22 @@ jobs:
         uses: gradle/actions/setup-gradle@v4
       - name: Build mod and run native smoke test
         run: .\gradlew.bat build test javadoc nativeSmokeTest
+      - name: Verify native DLL is packaged in the mod JAR
+        shell: pwsh
+        run: |
+          $jar = Get-ChildItem "build/libs/direct-*.jar" | Where-Object { $_.Name -notlike "*-javadoc.jar" } | Select-Object -First 1
+          if ($null -eq $jar) {
+            throw "The Windows build did not produce the Direct mod JAR."
+          }
+          $entries = & jar tf $jar.FullName
+          if ($LASTEXITCODE -ne 0) {
+            throw "Could not inspect the generated mod JAR."
+          }
+          $nativeEntry = "META-INF/native/windows-x86_64/direct_renderer.dll"
+          if ($entries -notcontains $nativeEntry) {
+            throw "The generated JAR is missing $nativeEntry."
+          }
+          Write-Host "Verified native renderer in $($jar.Name)."
       - name: Upload mod and API documentation
         uses: actions/upload-artifact@v4
         with:

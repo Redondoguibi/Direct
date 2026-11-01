@@ -3,9 +3,9 @@ package com.redondoguibi.direct.mixin;
 import java.util.List;
 
 import org.spongepowered.asm.mixin.Mixin;
-import org.spongepowered.asm.mixin.injection.At;
-import org.spongepowered.asm.mixin.injection.Inject;
-import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
+
+import com.llamalad7.mixinextras.injector.wrapmethod.WrapMethod;
+import com.llamalad7.mixinextras.injector.wrapoperation.Operation;
 
 import com.mojang.blaze3d.vertex.VertexSorting;
 import com.redondoguibi.direct.TerrainMeshStore;
@@ -23,19 +23,20 @@ abstract class SectionCompilerMixin {
             + "Lcom/mojang/blaze3d/vertex/VertexSorting;Lnet/minecraft/client/renderer/SectionBufferBuilderPack;"
             + "Ljava/util/List;)Lnet/minecraft/client/renderer/chunk/SectionCompiler$Results;";
 
-    @Inject(method = COMPILE, at = @At("HEAD"))
-    private void direct$beginCapture(SectionPos sectionPos, RenderChunkRegion region, VertexSorting sorting,
-            SectionBufferBuilderPack bufferPack,
+    @WrapMethod(method = COMPILE)
+    private SectionCompiler.Results direct$captureTerrain(SectionPos sectionPos, RenderChunkRegion region,
+            VertexSorting sorting, SectionBufferBuilderPack bufferPack,
             List<AddSectionGeometryEvent.AdditionalSectionRenderer> additionalRenderers,
-            CallbackInfoReturnable<SectionCompiler.Results> callback) {
+            Operation<SectionCompiler.Results> original) {
         TerrainMeshStore.beginCapture(sectionPos);
-    }
-
-    @Inject(method = COMPILE, at = @At("RETURN"))
-    private void direct$captureTerrain(SectionPos sectionPos, RenderChunkRegion region, VertexSorting sorting,
-            SectionBufferBuilderPack bufferPack,
-            List<AddSectionGeometryEvent.AdditionalSectionRenderer> additionalRenderers,
-            CallbackInfoReturnable<SectionCompiler.Results> callback) {
-        TerrainMeshStore.capture(sectionPos, callback.getReturnValue());
+        try {
+            SectionCompiler.Results results = original.call(sectionPos, region, sorting, bufferPack,
+                    additionalRenderers);
+            TerrainMeshStore.capture(sectionPos, results);
+            return results;
+        } finally {
+            // Also runs when vanilla compilation throws before returning Results.
+            TerrainMeshStore.finishCaptureForCurrentThread();
+        }
     }
 }

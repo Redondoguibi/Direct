@@ -31,6 +31,7 @@ public final class TerrainMeshStore {
     // Coalesce pending work by section; guarded by LOCK with VERSIONS and generation.
     private static final ArrayDeque<Long> PENDING_KEYS = new ArrayDeque<>();
     private static final Map<Long, SectionMesh> PENDING = new HashMap<>();
+    // Retains invalidation versions only while that section has captures in flight; the last finish evicts it.
     private static final Long2LongOpenHashMap VERSIONS = new Long2LongOpenHashMap(); // guarded by LOCK
     private static final Map<Long, Integer> IN_FLIGHT = new HashMap<>();
     private static final ThreadLocal<CaptureToken> CAPTURE_TOKEN = ThreadLocal.withInitial(CaptureToken::new);
@@ -217,6 +218,14 @@ public final class TerrainMeshStore {
         return captureFaulted;
     }
 
+    /** Closes a capture if SectionCompiler.compile exits exceptionally before its return hook. */
+    public static void finishCaptureForCurrentThread() {
+        CaptureToken token = CAPTURE_TOKEN.get();
+        if (token.active) {
+            finishCapture(token);
+        }
+    }
+
     public static void clearCaptureFault() {
         captureFaulted = false;
     }
@@ -306,13 +315,17 @@ public final class TerrainMeshStore {
         int positionOffset = format.getOffset(VertexFormatElement.POSITION);
         int colorOffset = format.getOffset(VertexFormatElement.COLOR);
         int uvOffset = format.getOffset(VertexFormatElement.UV0);
+        ByteBuffer indexBuffer = mesh.indexBuffer();
+        boolean validIndices = indexBuffer == null
+                ? TerrainIndexPacker.hasValidSequentialQuadIndices(drawState.vertexCount(), drawState.indexCount())
+                : (long) drawState.indexCount() * indexSize <= indexBuffer.remaining();
         return stride > 0 && positionOffset >= 0 && colorOffset >= 0 && uvOffset >= 0
                 && positionOffset + 3 * Float.BYTES <= stride
                 && colorOffset + Integer.BYTES <= stride
                 && uvOffset + 2 * Float.BYTES <= stride
                 && (indexSize == Short.BYTES || indexSize == Integer.BYTES)
                 && (long) drawState.vertexCount() * stride <= mesh.vertexBuffer().remaining()
-                && (long) drawState.indexCount() * indexSize <= mesh.indexBuffer().remaining();
+                && validIndices;
     }
 
     private static void packVertices(ByteBuffer destination, ByteBuffer source, MeshData.DrawState drawState) {
@@ -359,6 +372,10 @@ public final class TerrainMeshStore {
             int vertexBase) {
         int indexCount = drawState.indexCount();
         int indexSize = drawState.indexType().bytes;
+        if (source == null) {
+            TerrainIndexPacker.packSequentialQuadIndices(destination, indexCount, vertexBase);
+            return;
+        }
         if (destination.isDirect() && source.isDirect()) {
             long src = MemoryUtil.memAddress(source) + source.position();
             long dest = MemoryUtil.memAddress(destination) + destination.position();
