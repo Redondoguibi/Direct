@@ -16,7 +16,9 @@ final class NativeDx12 {
 
     static native long[] initializeInterop(int width, int height);
 
-    static native boolean renderInterop(float[] viewProjection, float cameraX, float cameraY, float cameraZ,
+    static native long resizeInterop(int width, int height);
+
+    static native boolean renderInterop(float[] viewProjection, double cameraX, double cameraY, double cameraZ,
             float renderDistance, long frameIndex, boolean useGpuSynchronization);
 
     static native void waitInteropFence(long value);
@@ -26,9 +28,9 @@ final class NativeDx12 {
     static native boolean hasInteropGpuSyncFault();
 
     static native void updateTerrainSection(long key, int sectionX, int sectionY, int sectionZ,
-            ByteBuffer vertices, int vertexCount, ByteBuffer indices, int indexCount);
+            ByteBuffer vertices, int vertexCount, ByteBuffer indices, int[] layerIndexCounts);
 
-    static native void updateTerrainAtlas(ByteBuffer pixels, int width, int height);
+    static native void updateTerrainAtlas(ByteBuffer[] mipLevels, int width, int height);
 
     static native void removeTerrainSection(long key);
 

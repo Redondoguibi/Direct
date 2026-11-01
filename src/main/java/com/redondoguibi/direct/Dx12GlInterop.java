@@ -2,34 +2,33 @@ package com.redondoguibi.direct;
 
 import java.io.IOException;
 import java.nio.ByteBuffer;
+import java.util.ArrayList;
+import java.util.List;
 
-import net.minecraft.client.Minecraft;
 import net.minecraft.client.Camera;
+import net.minecraft.client.Minecraft;
 import net.minecraft.client.multiplayer.ClientLevel;
 import net.minecraft.world.inventory.InventoryMenu;
 import net.minecraft.world.phys.Vec3;
 
 import org.joml.Matrix4f;
-import org.joml.Quaternionf;
+import org.lwjgl.opengl.EXTSemaphore;
+import org.lwjgl.opengl.EXTSemaphoreWin32;
 import org.lwjgl.opengl.GL;
 import org.lwjgl.opengl.GL11;
 import org.lwjgl.opengl.GL12;
 import org.lwjgl.opengl.GL13;
+import org.lwjgl.opengl.GL14;
 import org.lwjgl.opengl.GL15;
 import org.lwjgl.opengl.GL20;
 import org.lwjgl.opengl.GL30;
-import org.lwjgl.opengl.EXTSemaphore;
-import org.lwjgl.opengl.EXTSemaphoreWin32;
 import org.lwjgl.opengl.WGLCapabilities;
 import org.lwjgl.opengl.WGLNVDXInterop;
 import org.lwjgl.system.MemoryStack;
 
-
 public final class Dx12GlInterop {
-    private static final int GL_TEXTURE0 = GL13.GL_TEXTURE0;
-    private static final int[] NO_SEMAPHORE_BUFFERS = new int[0];
-    private static final int[] NO_SEMAPHORE_TEXTURES = new int[0];
-    private static final int[] NO_SEMAPHORE_LAYOUTS = new int[0];
+    private static final int[] NO_OBJECTS = new int[0];
+    private static final int MAX_ATLAS_LEVELS = 16;
     private static final String VERTEX_SHADER = """
             #version 150
             out vec2 texCoord;
@@ -49,6 +48,18 @@ public final class Dx12GlInterop {
             }
             """;
 
+    // Converte clip GL (y para cima, z em [-w, w]) para clip D3D (z em [0, w]); o flip em Y alinha as linhas.
+    private static final Matrix4f CLIP_CORRECTION = new Matrix4f().m11(-1.0f).m22(0.5f).m32(0.5f);
+    private static final Matrix4f CAPTURED_VIEW = new Matrix4f();
+    private static final Matrix4f CAPTURED_PROJECTION = new Matrix4f();
+    private static final Matrix4f VIEW_PROJECTION = new Matrix4f();
+    private static final float[] MATRIX = new float[16];
+
+    private static boolean matricesCaptured;
+    private static double cameraX;
+    private static double cameraY;
+    private static double cameraZ;
+
     private static boolean initialized;
     private static boolean disabled;
     private static boolean reportedUnsupported;
@@ -66,6 +77,7 @@ public final class Dx12GlInterop {
     private static int texture;
     private static int vertexArray;
     private static int program;
+    private static int sourceTextureUniform = -1;
     private static int interopSemaphore;
     private static int glDoneSemaphore;
     private static int blockAtlasId = -1;
@@ -73,17 +85,26 @@ public final class Dx12GlInterop {
     private Dx12GlInterop() {
     }
 
+    /** Chamado pelo LevelRendererMixin com as matrizes reais do frame. */
+    public static void captureLevelMatrices(Camera camera, Matrix4f viewRotation, Matrix4f projection) {
+        CAPTURED_VIEW.set(viewRotation);
+        CAPTURED_PROJECTION.set(projection);
+        Vec3 position = camera.getPosition();
+        cameraX = position.x;
+        cameraY = position.y;
+        cameraZ = position.z;
+        matricesCaptured = true;
+    }
+
     public static void renderBeforeGui() {
         if (!reportedHook) {
             Direct.LOGGER.info("DX12/OpenGL interop pre-GUI render hook reached.");
             reportedHook = true;
         }
+        boolean captured = matricesCaptured;
+        matricesCaptured = false;
         if (!ClientConfig.ENABLE_DX12.get()) {
-            if (terrainCaptureEnabled) {
-                TerrainMeshStore.setCaptureEnabled(false);
-                TerrainMeshStore.clear();
-                terrainCaptureEnabled = false;
-            }
+            disableTerrainCapture();
             shutdown();
             disabled = false;
             return;
@@ -97,20 +118,14 @@ public final class Dx12GlInterop {
             if (capabilities == null || !capabilities.WGL_NV_DX_interop2) {
                 if (!reportedUnsupported) {
                     Direct.LOGGER.error("WGL_NV_DX_interop2 is unavailable on the active OpenGL driver; "
-                            + "DX12/OpenGL interop was not attempted and vanilla rendering remains active.");
+                            + "vanilla rendering remains active.");
                     reportedUnsupported = true;
                 }
                 disabled = true;
-                TerrainMeshStore.setCaptureEnabled(false);
-                if (terrainCaptureEnabled) {
-                    TerrainMeshStore.clear();
-                    terrainCaptureEnabled = false;
-                }
+                disableTerrainCapture();
                 return;
             }
 
-            int currentWidth = Minecraft.getInstance().getWindow().getWidth();
-            int currentHeight = Minecraft.getInstance().getWindow().getHeight();
             Minecraft minecraft = Minecraft.getInstance();
             if (!terrainCaptureEnabled) {
                 TerrainMeshStore.setCaptureEnabled(true);
@@ -125,69 +140,51 @@ public final class Dx12GlInterop {
                 }
                 renderedLevel = minecraft.level;
             }
+            if (minecraft.level == null || !captured) {
+                return;
+            }
+            int currentWidth = minecraft.getWindow().getWidth();
+            int currentHeight = minecraft.getWindow().getHeight();
             if (currentWidth <= 0 || currentHeight <= 0) {
                 return;
             }
             if (!initialized) {
                 initialize(currentWidth, currentHeight);
-                TerrainMeshStore.resendAll();
                 blockAtlasDirty = true;
-                Direct.LOGGER.info("DX12 offscreen texture is copied to a D3D11 import texture for "
-                        + "WGL_NV_DX_interop2.");
             } else if (currentWidth != width || currentHeight != height) {
-                shutdown();
-                initialize(currentWidth, currentHeight);
-                TerrainMeshStore.resendAll();
-                blockAtlasDirty = true;
+                resize(currentWidth, currentHeight);
             }
 
-            if (!gpuSemaphoreInterop && frameIndex > 0) {
-                waitForPreviousGlUse();
-            }
             TerrainMeshStore.uploadPending();
             uploadBlockAtlasIfNeeded(minecraft);
-            Camera camera = minecraft.gameRenderer.getMainCamera();
-            Vec3 cameraPosition = camera.getPosition();
-            Matrix4f view = new Matrix4f().rotation(camera.rotation().conjugate(new Quaternionf()))
-                    .translate((float) -cameraPosition.x, (float) -cameraPosition.y, (float) -cameraPosition.z);
-            Matrix4f clipCorrection = new Matrix4f().identity().m11(-1.0f).m22(0.5f).m32(0.5f);
-            Matrix4f viewProjection = clipCorrection
-                    .mul(minecraft.gameRenderer.getProjectionMatrix(minecraft.options.fov().get()))
-                    .mul(view);
-            float[] matrix = new float[16];
-            viewProjection.get(matrix);
-            if (frameIndex == Long.MAX_VALUE) {
+
+            CLIP_CORRECTION.mul(CAPTURED_PROJECTION, VIEW_PROJECTION).mul(CAPTURED_VIEW);
+            VIEW_PROJECTION.get(MATRIX);
+            if (frameIndex == Long.MAX_VALUE - 1) {
                 throw new IllegalStateException("DX12/OpenGL interop fence timeline has exhausted its frame values.");
             }
             long dxReadyValue = frameIndex + 1;
-            boolean nativeGpuSynchronization = NativeDx12.renderInterop(matrix, (float) cameraPosition.x,
-                    (float) cameraPosition.y, (float) cameraPosition.z,
-                    minecraft.options.renderDistance().get() * 16.0f, frameIndex, gpuSemaphoreInterop);
-            if (gpuSemaphoreInterop && !nativeGpuSynchronization) {
+            boolean nativeGpu = NativeDx12.renderInterop(MATRIX, cameraX, cameraY, cameraZ,
+                    minecraft.options.getEffectiveRenderDistance() * 16.0f, frameIndex, gpuSemaphoreInterop);
+            if (gpuSemaphoreInterop && !nativeGpu) {
                 disableGpuSemaphore("The native command queue could not enqueue a GPU-side fence wait; "
                         + "using CPU fence waits.");
             }
-            boolean frameUsesGpuSemaphore = gpuSemaphoreInterop && nativeGpuSynchronization;
+            boolean frameUsesGpuSemaphore = gpuSemaphoreInterop && nativeGpu;
             if (frameUsesGpuSemaphore && !waitForDx12Frame(dxReadyValue)) {
                 NativeDx12.waitInteropFence(dxReadyValue);
-                disableGpuSemaphore("OpenGL rejected the D3D12 timeline semaphore wait; "
-                        + "using CPU fence waits.");
+                disableGpuSemaphore("OpenGL rejected the D3D12 timeline semaphore wait; using CPU fence waits.");
                 frameUsesGpuSemaphore = false;
             }
             if (NativeDx12.hasInteropGpuSyncFault()) {
-                disableGpuSemaphore("The D3D12 fence watchdog detected a timeout/device failure; "
-                        + "a CPU signal was attempted and synchronization fell back to the CPU path.");
+                throw new IllegalStateException("The D3D12 fence missed its deadline or the device was removed.");
             }
             drawImportedTexture(frameUsesGpuSemaphore, frameIndex);
             frameIndex++;
         } catch (IOException | IllegalStateException | UnsatisfiedLinkError exception) {
             Direct.LOGGER.error("DX12/OpenGL interop failed; retaining vanilla rendering.", exception);
             shutdown();
-            TerrainMeshStore.setCaptureEnabled(false);
-            if (terrainCaptureEnabled) {
-                TerrainMeshStore.clear();
-                terrainCaptureEnabled = false;
-            }
+            disableTerrainCapture();
             disabled = true;
         }
     }
@@ -205,17 +202,10 @@ public final class Dx12GlInterop {
             glDoneSemaphore = 0;
         }
         gpuSemaphoreInterop = false;
-        if (interopDevice != 0 && interopObject != 0) {
-            WGLNVDXInterop.wglDXUnregisterObjectNV(interopDevice, interopObject);
-            interopObject = 0;
-        }
+        unregisterTexture();
         if (interopDevice != 0) {
             WGLNVDXInterop.wglDXCloseDeviceNV(interopDevice);
             interopDevice = 0;
-        }
-        if (texture != 0) {
-            GL11.glDeleteTextures(texture);
-            texture = 0;
         }
         if (vertexArray != 0) {
             GL30.glDeleteVertexArrays(vertexArray);
@@ -224,6 +214,7 @@ public final class Dx12GlInterop {
         if (program != 0) {
             GL20.glDeleteProgram(program);
             program = 0;
+            sourceTextureUniform = -1;
         }
         if (initialized) {
             NativeDx12.shutdownInterop();
@@ -232,64 +223,57 @@ public final class Dx12GlInterop {
         width = 0;
         height = 0;
         frameIndex = 0;
+        blockAtlasId = -1;
     }
 
     public static void blockAtlasUpdated() {
         blockAtlasDirty = true;
     }
 
-    private static void uploadBlockAtlasIfNeeded(Minecraft minecraft) {
-        int atlasTexture = minecraft.getTextureManager()
-                .getTexture(InventoryMenu.BLOCK_ATLAS).getId();
-        if (atlasTexture != blockAtlasId) {
-            blockAtlasId = atlasTexture;
-            blockAtlasDirty = true;
-        }
-        if (!blockAtlasDirty) {
-            return;
-        }
-
-        int previousTexture = GL11.glGetInteger(GL11.GL_TEXTURE_BINDING_2D);
-        int previousPackBuffer = GL11.glGetInteger(GL30.GL_PIXEL_PACK_BUFFER_BINDING);
-        int previousPackAlignment = GL11.glGetInteger(GL11.GL_PACK_ALIGNMENT);
-        GL15.glBindBuffer(GL30.GL_PIXEL_PACK_BUFFER, 0);
-        GL11.glBindTexture(GL11.GL_TEXTURE_2D, atlasTexture);
-        try {
-            int atlasWidth = GL11.glGetTexLevelParameteri(GL11.GL_TEXTURE_2D, 0, GL11.GL_TEXTURE_WIDTH);
-            int atlasHeight = GL11.glGetTexLevelParameteri(GL11.GL_TEXTURE_2D, 0, GL11.GL_TEXTURE_HEIGHT);
-            if (atlasWidth <= 0 || atlasHeight <= 0) {
-                return;
-            }
-            long byteCount = (long) atlasWidth * atlasHeight * 4;
-            if (byteCount > Integer.MAX_VALUE) {
-                throw new IllegalStateException("Minecraft block atlas exceeds the supported DX12 upload size.");
-            }
-            ByteBuffer pixels = ByteBuffer.allocateDirect((int) byteCount);
-            GL11.glPixelStorei(GL11.GL_PACK_ALIGNMENT, 1);
-            GL11.glGetTexImage(GL11.GL_TEXTURE_2D, 0, GL11.GL_RGBA, GL11.GL_UNSIGNED_BYTE, pixels);
-            NativeDx12.updateTerrainAtlas(pixels, atlasWidth, atlasHeight);
-            blockAtlasDirty = false;
-        } finally {
-            GL11.glPixelStorei(GL11.GL_PACK_ALIGNMENT, previousPackAlignment);
-            GL15.glBindBuffer(GL30.GL_PIXEL_PACK_BUFFER, previousPackBuffer);
-            GL11.glBindTexture(GL11.GL_TEXTURE_2D, previousTexture);
+    private static void disableTerrainCapture() {
+        TerrainMeshStore.setCaptureEnabled(false);
+        if (terrainCaptureEnabled) {
+            TerrainMeshStore.clear();
+            terrainCaptureEnabled = false;
         }
     }
 
     private static void initialize(int frameWidth, int frameHeight) throws IOException {
-        NativeRenderer.loadNativeLibrary();
+        NativeLibrary.load();
         long[] handles = NativeDx12.initializeInterop(frameWidth, frameHeight);
         if (handles == null || handles.length != 4 || handles[0] == 0 || handles[1] == 0) {
-            throw new IllegalStateException("DX12 did not expose its D3D11 device and import texture.");
+            throw new IllegalStateException("DX12 did not expose its D3D11 device and shared texture.");
         }
         initialized = true;
         interopDevice = WGLNVDXInterop.wglDXOpenDeviceNV(handles[0]);
         if (interopDevice == 0) {
             throw new IllegalStateException("WGL_NV_DX_interop2 could not open the D3D11On12 device.");
         }
+        registerTexture(handles[1]);
+        initializeGpuSemaphore(handles[2], handles[3]);
+        program = createProgram();
+        sourceTextureUniform = GL20.glGetUniformLocation(program, "sourceTexture");
+        vertexArray = GL30.glGenVertexArrays();
+        width = frameWidth;
+        height = frameHeight;
+        frameIndex = 0;
+    }
 
+    private static void resize(int frameWidth, int frameHeight) {
+        GL11.glFinish();
+        unregisterTexture();
+        long sharedTexture = NativeDx12.resizeInterop(frameWidth, frameHeight);
+        if (sharedTexture == 0) {
+            throw new IllegalStateException("DX12/OpenGL interop resize did not return a shared texture.");
+        }
+        registerTexture(sharedTexture);
+        width = frameWidth;
+        height = frameHeight;
+    }
+
+    private static void registerTexture(long sharedTexture) {
         int previousActiveTexture = GL11.glGetInteger(GL13.GL_ACTIVE_TEXTURE);
-        GL13.glActiveTexture(GL_TEXTURE0);
+        GL13.glActiveTexture(GL13.GL_TEXTURE0);
         int previousTexture = GL11.glGetInteger(GL11.GL_TEXTURE_BINDING_2D);
         try {
             texture = GL11.glGenTextures();
@@ -298,25 +282,76 @@ public final class Dx12GlInterop {
             GL11.glTexParameteri(GL11.GL_TEXTURE_2D, GL11.GL_TEXTURE_MAG_FILTER, GL11.GL_NEAREST);
             GL11.glTexParameteri(GL11.GL_TEXTURE_2D, GL11.GL_TEXTURE_WRAP_S, GL12.GL_CLAMP_TO_EDGE);
             GL11.glTexParameteri(GL11.GL_TEXTURE_2D, GL11.GL_TEXTURE_WRAP_T, GL12.GL_CLAMP_TO_EDGE);
-            interopObject = WGLNVDXInterop.wglDXRegisterObjectNV(interopDevice, handles[1], texture,
+            interopObject = WGLNVDXInterop.wglDXRegisterObjectNV(interopDevice, sharedTexture, texture,
                     GL11.GL_TEXTURE_2D, WGLNVDXInterop.WGL_ACCESS_READ_ONLY_NV);
         } finally {
             GL11.glBindTexture(GL11.GL_TEXTURE_2D, previousTexture);
             GL13.glActiveTexture(previousActiveTexture);
         }
         if (interopObject == 0) {
-            throw new IllegalStateException("WGL_NV_DX_interop2 could not register the D3D11 import texture.");
+            throw new IllegalStateException("WGL_NV_DX_interop2 could not register the shared D3D11 texture.");
         }
-        initializeGpuSemaphore(handles[2], handles[3]);
-        program = createProgram();
-        vertexArray = GL30.glGenVertexArrays();
-        width = frameWidth;
-        height = frameHeight;
-        frameIndex = 0;
     }
 
-    private static void waitForPreviousGlUse() {
-        GL11.glFinish();
+    private static void unregisterTexture() {
+        if (interopDevice != 0 && interopObject != 0) {
+            WGLNVDXInterop.wglDXUnregisterObjectNV(interopDevice, interopObject);
+        }
+        interopObject = 0;
+        if (texture != 0) {
+            GL11.glDeleteTextures(texture);
+            texture = 0;
+        }
+    }
+
+    private static void uploadBlockAtlasIfNeeded(Minecraft minecraft) {
+        int atlasTexture = minecraft.getTextureManager().getTexture(InventoryMenu.BLOCK_ATLAS).getId();
+        if (atlasTexture != blockAtlasId) {
+            blockAtlasId = atlasTexture;
+            blockAtlasDirty = true;
+        }
+        if (!blockAtlasDirty) {
+            return;
+        }
+        int previousActiveTexture = GL11.glGetInteger(GL13.GL_ACTIVE_TEXTURE);
+        GL13.glActiveTexture(GL13.GL_TEXTURE0);
+        int previousTexture = GL11.glGetInteger(GL11.GL_TEXTURE_BINDING_2D);
+        int previousPackBuffer = GL11.glGetInteger(GL30.GL_PIXEL_PACK_BUFFER_BINDING);
+        int previousPackAlignment = GL11.glGetInteger(GL11.GL_PACK_ALIGNMENT);
+        try {
+            GL15.glBindBuffer(GL30.GL_PIXEL_PACK_BUFFER, 0);
+            GL11.glBindTexture(GL11.GL_TEXTURE_2D, atlasTexture);
+            GL11.glPixelStorei(GL11.GL_PACK_ALIGNMENT, 1);
+            int baseWidth = GL11.glGetTexLevelParameteri(GL11.GL_TEXTURE_2D, 0, GL11.GL_TEXTURE_WIDTH);
+            int baseHeight = GL11.glGetTexLevelParameteri(GL11.GL_TEXTURE_2D, 0, GL11.GL_TEXTURE_HEIGHT);
+            if (baseWidth <= 0 || baseHeight <= 0) {
+                return;
+            }
+            int maxLevel = Math.min(GL11.glGetTexParameteri(GL11.GL_TEXTURE_2D, GL12.GL_TEXTURE_MAX_LEVEL),
+                    MAX_ATLAS_LEVELS - 1);
+            List<ByteBuffer> levels = new ArrayList<>();
+            for (int level = 0; level <= maxLevel; level++) {
+                int levelWidth = GL11.glGetTexLevelParameteri(GL11.GL_TEXTURE_2D, level, GL11.GL_TEXTURE_WIDTH);
+                int levelHeight = GL11.glGetTexLevelParameteri(GL11.GL_TEXTURE_2D, level, GL11.GL_TEXTURE_HEIGHT);
+                if (levelWidth != Math.max(1, baseWidth >> level) || levelHeight != Math.max(1, baseHeight >> level)) {
+                    break;
+                }
+                long byteCount = (long) levelWidth * levelHeight * 4;
+                if (byteCount > Integer.MAX_VALUE) {
+                    throw new IllegalStateException("Minecraft block atlas exceeds the supported DX12 upload size.");
+                }
+                ByteBuffer pixels = ByteBuffer.allocateDirect((int) byteCount);
+                GL11.glGetTexImage(GL11.GL_TEXTURE_2D, level, GL11.GL_RGBA, GL11.GL_UNSIGNED_BYTE, pixels);
+                levels.add(pixels);
+            }
+            NativeDx12.updateTerrainAtlas(levels.toArray(ByteBuffer[]::new), baseWidth, baseHeight);
+            blockAtlasDirty = false;
+        } finally {
+            GL11.glPixelStorei(GL11.GL_PACK_ALIGNMENT, previousPackAlignment);
+            GL15.glBindBuffer(GL30.GL_PIXEL_PACK_BUFFER, previousPackBuffer);
+            GL11.glBindTexture(GL11.GL_TEXTURE_2D, previousTexture);
+            GL13.glActiveTexture(previousActiveTexture);
+        }
     }
 
     private static void drawImportedTexture(boolean useGpuSemaphore, long frame) {
@@ -325,7 +360,7 @@ public final class Dx12GlInterop {
         int previousActiveTexture = GL11.glGetInteger(GL13.GL_ACTIVE_TEXTURE);
         int[] previousViewport = new int[4];
         GL11.glGetIntegerv(GL11.GL_VIEWPORT, previousViewport);
-        GL13.glActiveTexture(GL_TEXTURE0);
+        GL13.glActiveTexture(GL13.GL_TEXTURE0);
         int previousTexture = GL11.glGetInteger(GL11.GL_TEXTURE_BINDING_2D);
         boolean depthEnabled = GL11.glIsEnabled(GL11.GL_DEPTH_TEST);
         boolean blendEnabled = GL11.glIsEnabled(GL11.GL_BLEND);
@@ -333,22 +368,32 @@ public final class Dx12GlInterop {
         boolean scissorEnabled = GL11.glIsEnabled(GL11.GL_SCISSOR_TEST);
         boolean stencilEnabled = GL11.glIsEnabled(GL11.GL_STENCIL_TEST);
         boolean depthMask = GL11.glGetBoolean(GL11.GL_DEPTH_WRITEMASK);
+        int blendSrcRgb = GL11.glGetInteger(GL14.GL_BLEND_SRC_RGB);
+        int blendDstRgb = GL11.glGetInteger(GL14.GL_BLEND_DST_RGB);
+        int blendSrcAlpha = GL11.glGetInteger(GL14.GL_BLEND_SRC_ALPHA);
+        int blendDstAlpha = GL11.glGetInteger(GL14.GL_BLEND_DST_ALPHA);
+        int blendEquationRgb = GL11.glGetInteger(GL20.GL_BLEND_EQUATION_RGB);
+        int blendEquationAlpha = GL11.glGetInteger(GL20.GL_BLEND_EQUATION_ALPHA);
         boolean[] previousColorMask = new boolean[4];
 
         try (MemoryStack stack = MemoryStack.stackPush()) {
             ByteBuffer colorMask = stack.malloc(4);
             GL11.glGetBooleanv(GL11.GL_COLOR_WRITEMASK, colorMask);
-            for (int component = 0; component < previousColorMask.length; component++) {
+            for (int component = 0; component < 4; component++) {
                 previousColorMask[component] = colorMask.get(component) != 0;
             }
             var objects = stack.mallocPointer(1);
-            objects.put(interopObject).flip();
+            objects.put(0, interopObject);
             if (!WGLNVDXInterop.wglDXLockObjectsNV(interopDevice, objects)) {
-                throw new IllegalStateException("WGL_NV_DX_interop2 could not lock the import texture for OpenGL.");
+                throw new IllegalStateException("WGL_NV_DX_interop2 could not lock the shared texture.");
             }
+            boolean drawn = false;
             try {
                 GL11.glDisable(GL11.GL_DEPTH_TEST);
-                GL11.glDisable(GL11.GL_BLEND);
+                GL11.glEnable(GL11.GL_BLEND);
+                GL20.glBlendEquationSeparate(GL14.GL_FUNC_ADD, GL14.GL_FUNC_ADD);
+                GL14.glBlendFuncSeparate(GL11.GL_SRC_ALPHA, GL11.GL_ONE_MINUS_SRC_ALPHA,
+                        GL11.GL_ONE, GL11.GL_ONE_MINUS_SRC_ALPHA);
                 GL11.glDisable(GL11.GL_CULL_FACE);
                 GL11.glDisable(GL11.GL_SCISSOR_TEST);
                 GL11.glDisable(GL11.GL_STENCIL_TEST);
@@ -358,14 +403,17 @@ public final class Dx12GlInterop {
                 GL20.glUseProgram(program);
                 GL30.glBindVertexArray(vertexArray);
                 GL11.glBindTexture(GL11.GL_TEXTURE_2D, texture);
-                GL20.glUniform1i(GL20.glGetUniformLocation(program, "sourceTexture"), 0);
+                GL20.glUniform1i(sourceTextureUniform, 0);
                 GL11.glDrawArrays(GL11.GL_TRIANGLES, 0, 3);
-                GL11.glFlush();
+                drawn = true;
             } finally {
-                objects.clear();
-                objects.put(interopObject).flip();
-                if (!WGLNVDXInterop.wglDXUnlockObjectsNV(interopDevice, objects)) {
-                    throw new IllegalStateException("WGL_NV_DX_interop2 could not unlock the import texture.");
+                objects.put(0, interopObject);
+                boolean unlocked = WGLNVDXInterop.wglDXUnlockObjectsNV(interopDevice, objects);
+                if (!unlocked) {
+                    if (drawn) {
+                        throw new IllegalStateException("WGL_NV_DX_interop2 could not unlock the shared texture.");
+                    }
+                    Direct.LOGGER.error("WGL_NV_DX_interop2 unlock also failed after a draw error.");
                 }
             }
         } finally {
@@ -375,20 +423,21 @@ public final class Dx12GlInterop {
             GL13.glActiveTexture(previousActiveTexture);
             GL11.glViewport(previousViewport[0], previousViewport[1], previousViewport[2], previousViewport[3]);
             GL11.glDepthMask(depthMask);
-            GL11.glColorMask(previousColorMask[0], previousColorMask[1],
-                    previousColorMask[2], previousColorMask[3]);
+            GL11.glColorMask(previousColorMask[0], previousColorMask[1], previousColorMask[2], previousColorMask[3]);
+            GL20.glBlendEquationSeparate(blendEquationRgb, blendEquationAlpha);
+            GL14.glBlendFuncSeparate(blendSrcRgb, blendDstRgb, blendSrcAlpha, blendDstAlpha);
             setEnabled(GL11.GL_DEPTH_TEST, depthEnabled);
             setEnabled(GL11.GL_BLEND, blendEnabled);
             setEnabled(GL11.GL_CULL_FACE, cullEnabled);
             setEnabled(GL11.GL_SCISSOR_TEST, scissorEnabled);
             setEnabled(GL11.GL_STENCIL_TEST, stencilEnabled);
         }
-        boolean semaphoreSignalQueued = useGpuSemaphore && signalGlDoneFence(frame + 1);
-        if (useGpuSemaphore && !semaphoreSignalQueued) {
-            disableGpuSemaphore("OpenGL rejected the D3D12 timeline semaphore signal; "
-                    + "using CPU fence waits.");
+
+        boolean signalQueued = useGpuSemaphore && signalGlDoneFence(frame + 1);
+        if (useGpuSemaphore && !signalQueued) {
+            disableGpuSemaphore("OpenGL rejected the D3D12 timeline semaphore signal; using CPU fence waits.");
         }
-        if (!semaphoreSignalQueued) {
+        if (!signalQueued) {
             GL11.glFinish();
             NativeDx12.signalInteropFence(frame + 1);
         }
@@ -396,13 +445,12 @@ public final class Dx12GlInterop {
 
     private static void initializeGpuSemaphore(long sharedReadyFenceHandle, long sharedGlDoneFenceHandle) {
         var capabilities = GL.getCapabilities();
-        if (sharedReadyFenceHandle == 0 || sharedGlDoneFenceHandle == 0 || !capabilities.GL_EXT_semaphore
-                || !capabilities.GL_EXT_semaphore_win32) {
-            disableGpuSemaphore("The driver does not expose a shared D3D12 fence semaphore; "
-                    + "using CPU fence waits.");
+        if (sharedReadyFenceHandle == 0 || sharedGlDoneFenceHandle == 0
+                || !capabilities.GL_EXT_semaphore || !capabilities.GL_EXT_semaphore_win32) {
+            disableGpuSemaphore("The driver does not expose a shared D3D12 fence semaphore; using CPU fence waits.");
             return;
         }
-
+        drainGlErrors();
         int readySemaphore = EXTSemaphore.glGenSemaphoresEXT();
         int doneSemaphore = EXTSemaphore.glGenSemaphoresEXT();
         EXTSemaphoreWin32.glImportSemaphoreWin32HandleEXT(readySemaphore,
@@ -420,25 +468,23 @@ public final class Dx12GlInterop {
         interopSemaphore = readySemaphore;
         glDoneSemaphore = doneSemaphore;
         gpuSemaphoreInterop = true;
-        Direct.LOGGER.info("Using a shared D3D12 timeline fence for asynchronous GPU synchronization "
-                + "between D3D12 and OpenGL.");
+        Direct.LOGGER.info("Using a shared D3D12 timeline fence for GPU synchronization between D3D12 and OpenGL.");
     }
 
     private static boolean waitForDx12Frame(long value) {
+        drainGlErrors();
         try (MemoryStack stack = MemoryStack.stackPush()) {
             setSemaphoreFenceValue(stack, interopSemaphore, value);
-            EXTSemaphore.glWaitSemaphoreEXT(interopSemaphore,
-                    NO_SEMAPHORE_BUFFERS, NO_SEMAPHORE_TEXTURES, NO_SEMAPHORE_LAYOUTS);
-            GL11.glFlush();
+            EXTSemaphore.glWaitSemaphoreEXT(interopSemaphore, NO_OBJECTS, NO_OBJECTS, NO_OBJECTS);
         }
         return GL11.glGetError() == GL11.GL_NO_ERROR;
     }
 
     private static boolean signalGlDoneFence(long value) {
+        drainGlErrors();
         try (MemoryStack stack = MemoryStack.stackPush()) {
             setSemaphoreFenceValue(stack, glDoneSemaphore, value);
-            EXTSemaphore.glSignalSemaphoreEXT(glDoneSemaphore,
-                    NO_SEMAPHORE_BUFFERS, NO_SEMAPHORE_TEXTURES, NO_SEMAPHORE_LAYOUTS);
+            EXTSemaphore.glSignalSemaphoreEXT(glDoneSemaphore, NO_OBJECTS, NO_OBJECTS, NO_OBJECTS);
             GL11.glFlush();
         }
         return GL11.glGetError() == GL11.GL_NO_ERROR;
@@ -447,8 +493,13 @@ public final class Dx12GlInterop {
     private static void setSemaphoreFenceValue(MemoryStack stack, int semaphore, long value) {
         var fenceValue = stack.mallocLong(1);
         fenceValue.put(0, value);
-        EXTSemaphore.glSemaphoreParameterui64vEXT(semaphore,
-                EXTSemaphoreWin32.GL_D3D12_FENCE_VALUE_EXT, fenceValue);
+        EXTSemaphore.glSemaphoreParameterui64vEXT(semaphore, EXTSemaphoreWin32.GL_D3D12_FENCE_VALUE_EXT, fenceValue);
+    }
+
+    private static void drainGlErrors() {
+        for (int attempt = 0; attempt < 64 && GL11.glGetError() != GL11.GL_NO_ERROR; attempt++) {
+            // descarta erros antigos do Minecraft para não culpar o semáforo
+        }
     }
 
     private static void disableGpuSemaphore(String reason) {
@@ -501,5 +552,4 @@ public final class Dx12GlInterop {
             GL11.glDisable(capability);
         }
     }
-
 }

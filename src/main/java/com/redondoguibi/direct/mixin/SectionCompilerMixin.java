@@ -18,10 +18,20 @@ import net.neoforged.neoforge.client.event.AddSectionGeometryEvent;
 
 @Mixin(SectionCompiler.class)
 abstract class SectionCompilerMixin {
-    @Inject(method = "compile(Lnet/minecraft/core/SectionPos;Lnet/minecraft/client/renderer/chunk/RenderChunkRegion;"
+    private static final String COMPILE = "compile(Lnet/minecraft/core/SectionPos;"
+            + "Lnet/minecraft/client/renderer/chunk/RenderChunkRegion;"
             + "Lcom/mojang/blaze3d/vertex/VertexSorting;Lnet/minecraft/client/renderer/SectionBufferBuilderPack;"
-            + "Ljava/util/List;)Lnet/minecraft/client/renderer/chunk/SectionCompiler$Results;",
-            at = @At("RETURN"))
+            + "Ljava/util/List;)Lnet/minecraft/client/renderer/chunk/SectionCompiler$Results;";
+
+    @Inject(method = COMPILE, at = @At("HEAD"))
+    private void direct$beginCapture(SectionPos sectionPos, RenderChunkRegion region, VertexSorting sorting,
+            SectionBufferBuilderPack bufferPack,
+            List<AddSectionGeometryEvent.AdditionalSectionRenderer> additionalRenderers,
+            CallbackInfoReturnable<SectionCompiler.Results> callback) {
+        TerrainMeshStore.beginCapture(sectionPos);
+    }
+
+    @Inject(method = COMPILE, at = @At("RETURN"))
     private void direct$captureTerrain(SectionPos sectionPos, RenderChunkRegion region, VertexSorting sorting,
             SectionBufferBuilderPack bufferPack,
             List<AddSectionGeometryEvent.AdditionalSectionRenderer> additionalRenderers,

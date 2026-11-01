@@ -8,6 +8,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.util.ArrayList;
+import java.util.Locale;
 import java.util.Map;
 import java.util.regex.Pattern;
 
@@ -21,12 +22,10 @@ import net.minecraft.client.Minecraft;
 import net.neoforged.fml.loading.FMLPaths;
 
 import org.lwjgl.glfw.GLFWNativeWin32;
-import org.lwjgl.opengl.GL;
 import org.lwjgl.opengl.GL11;
 import org.lwjgl.opengl.GL15;
 import org.lwjgl.opengl.GL30;
 import org.lwjgl.opengl.GL32;
-import org.lwjgl.opengl.WGLCapabilities;
 
 public final class NativeRenderer {
     private static final int MAX_PASSES = 8;
@@ -57,42 +56,39 @@ public final class NativeRenderer {
     }
 
     public static boolean renderIfEnabled(long glfwWindow) {
-        if (!ClientConfig.ENABLE_DX12.get()) {
-            shutdown();
+        if (!ClientConfig.shaderPresentActive()) {
+            if (initialized || pixelBuffers[0] != 0) {
+                shutdown();
+            }
+            disabled = false;
             return false;
         }
         if (disabled) {
             return false;
         }
-        String operatingSystem = System.getProperty("os.name", "").toLowerCase();
-        String architecture = System.getProperty("os.arch", "").toLowerCase();
-        if (!operatingSystem.contains("win")
-                || !architecture.equals("amd64") && !architecture.equals("x86_64")) {
+        if (!isWindowsX64()) {
             if (!reportedUnsupportedPlatform) {
-                Direct.LOGGER.error("The DirectX 12 preview requires Windows x86-64; vanilla presentation remains active.");
+                Direct.LOGGER.error("The DirectX 12 shader present requires Windows x86-64; "
+                        + "vanilla presentation remains active.");
                 reportedUnsupportedPlatform = true;
             }
             return false;
         }
 
         try {
-            WGLCapabilities wglCapabilities = GL.getCapabilitiesWGL();
-            if (wglCapabilities == null || !wglCapabilities.WGL_NV_DX_interop2) {
-                Direct.LOGGER.error("WGL_NV_DX_interop2 is unavailable on the active OpenGL driver; "
-                        + "DX12/OpenGL interop was not attempted and vanilla rendering remains active.");
-                disabled = true;
-                return false;
-            }
-
             Minecraft minecraft = Minecraft.getInstance();
             int currentWidth = minecraft.getWindow().getWidth();
             int currentHeight = minecraft.getWindow().getHeight();
             if (currentWidth <= 0 || currentHeight <= 0) {
                 return false;
             }
+            long byteCount = (long) currentWidth * currentHeight * 4;
+            if (byteCount > Integer.MAX_VALUE) {
+                throw new IllegalArgumentException("Framebuffer is too large for the DX12 frame bridge.");
+            }
 
             if (!initialized) {
-                loadNativeLibrary();
+                NativeLibrary.load();
                 activePack = loadShaderPack(ClientConfig.SHADER_PACK.get());
                 long hwnd = GLFWNativeWin32.glfwGetWin32Window(glfwWindow);
                 if (hwnd == 0) {
@@ -103,18 +99,13 @@ public final class NativeRenderer {
                 height = currentHeight;
                 startedAtNanos = System.nanoTime();
                 initialized = true;
-                Direct.LOGGER.info("DirectX 12 preview initialized with shader pack '{}'.", activePack.name());
+                Direct.LOGGER.info("DirectX 12 shader present initialized with pack '{}'.", activePack.name());
             } else if (currentWidth != width || currentHeight != height) {
                 NativeDx12.resize(currentWidth, currentHeight);
                 width = currentWidth;
                 height = currentHeight;
                 releasePixelBuffers();
                 hasPresentedDx12 = false;
-            }
-
-            long byteCount = (long) currentWidth * currentHeight * 4;
-            if (byteCount > Integer.MAX_VALUE) {
-                throw new IllegalArgumentException("Framebuffer is too large for the DX12 frame bridge.");
             }
             if (pixelBuffers[0] == 0) {
                 allocatePixelBuffers(byteCount);
@@ -130,15 +121,14 @@ public final class NativeRenderer {
                     reportedFirstDx12Frame = true;
                 }
             }
-
             int writableBuffer = findFreeBuffer();
             if (writableBuffer >= 0) {
                 captureCurrentFrame(writableBuffer, currentWidth, currentHeight);
             }
-            return readyBuffer >= 0 || hasPresentedDx12;
+            return hasPresentedDx12;
         } catch (IOException | JsonParseException | IllegalArgumentException | IllegalStateException
                  | UnsatisfiedLinkError exception) {
-            Direct.LOGGER.error("DirectX 12 preview failed; falling back to vanilla OpenGL presentation.", exception);
+            Direct.LOGGER.error("DirectX 12 shader present failed; falling back to OpenGL presentation.", exception);
             shutdown();
             disabled = true;
             return false;
@@ -154,9 +144,14 @@ public final class NativeRenderer {
         height = 0;
         activePack = null;
         releasePixelBuffers();
-        captureSequence = 0;
         hasPresentedDx12 = false;
         reportedFirstDx12Frame = false;
+    }
+
+    private static boolean isWindowsX64() {
+        String os = System.getProperty("os.name", "").toLowerCase(Locale.ROOT);
+        String arch = System.getProperty("os.arch", "").toLowerCase(Locale.ROOT);
+        return os.contains("win") && (arch.equals("amd64") || arch.equals("x86_64"));
     }
 
     private static void pollCaptureFences() {
@@ -176,15 +171,15 @@ public final class NativeRenderer {
     }
 
     private static int findOldestReadyBuffer() {
-        int oldestBuffer = -1;
+        int oldest = -1;
         long oldestSequence = Long.MAX_VALUE;
         for (int index = 0; index < CAPTURE_BUFFER_COUNT; index++) {
             if (captureStates[index] == CAPTURE_READY && captureOrders[index] < oldestSequence) {
-                oldestBuffer = index;
+                oldest = index;
                 oldestSequence = captureOrders[index];
             }
         }
-        return oldestBuffer;
+        return oldest;
     }
 
     private static int findFreeBuffer() {
@@ -198,11 +193,16 @@ public final class NativeRenderer {
     }
 
     private static void captureCurrentFrame(int bufferIndex, int frameWidth, int frameHeight) {
-        int previousPixelPackBuffer = GL11.glGetInteger(GL30.GL_PIXEL_PACK_BUFFER_BINDING);
+        int previousPackBuffer = GL11.glGetInteger(GL30.GL_PIXEL_PACK_BUFFER_BINDING);
+        int previousReadFramebuffer = GL11.glGetInteger(GL30.GL_READ_FRAMEBUFFER_BINDING);
+        int previousReadBuffer = GL11.glGetInteger(GL11.GL_READ_BUFFER);
+        int previousPackAlignment = GL11.glGetInteger(GL11.GL_PACK_ALIGNMENT);
         try {
+            GL30.glBindFramebuffer(GL30.GL_READ_FRAMEBUFFER, 0);
+            GL11.glReadBuffer(GL11.GL_BACK);
+            GL11.glPixelStorei(GL11.GL_PACK_ALIGNMENT, 4);
             GL15.glBindBuffer(GL30.GL_PIXEL_PACK_BUFFER, pixelBuffers[bufferIndex]);
-            GL11.glReadPixels(0, 0, frameWidth, frameHeight, GL11.GL_RGBA,
-                    GL11.GL_UNSIGNED_BYTE, 0L);
+            GL11.glReadPixels(0, 0, frameWidth, frameHeight, GL11.GL_RGBA, GL11.GL_UNSIGNED_BYTE, 0L);
             long fence = GL32.glFenceSync(GL32.GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
             if (fence == 0) {
                 throw new IllegalStateException("OpenGL failed to create a frame-capture fence.");
@@ -212,39 +212,38 @@ public final class NativeRenderer {
             captureTimes[bufferIndex] = (System.nanoTime() - startedAtNanos) / 1_000_000_000.0f;
             captureOrders[bufferIndex] = captureSequence++;
         } finally {
-            GL15.glBindBuffer(GL30.GL_PIXEL_PACK_BUFFER, previousPixelPackBuffer);
+            GL15.glBindBuffer(GL30.GL_PIXEL_PACK_BUFFER, previousPackBuffer);
+            GL11.glPixelStorei(GL11.GL_PACK_ALIGNMENT, previousPackAlignment);
+            GL30.glBindFramebuffer(GL30.GL_READ_FRAMEBUFFER, previousReadFramebuffer);
+            GL11.glReadBuffer(previousReadBuffer);
         }
     }
 
-    private static void renderCapturedFrame(int bufferIndex, long byteCount,
-            int frameWidth, int frameHeight) {
-        int previousPixelPackBuffer = GL11.glGetInteger(GL30.GL_PIXEL_PACK_BUFFER_BINDING);
+    private static void renderCapturedFrame(int bufferIndex, long byteCount, int frameWidth, int frameHeight) {
+        int previousPackBuffer = GL11.glGetInteger(GL30.GL_PIXEL_PACK_BUFFER_BINDING);
         GL15.glBindBuffer(GL30.GL_PIXEL_PACK_BUFFER, pixelBuffers[bufferIndex]);
-        ByteBuffer capturedPixels;
         boolean mapped = false;
         try {
-            capturedPixels = GL30.glMapBufferRange(GL30.GL_PIXEL_PACK_BUFFER,
-                    0, byteCount, GL30.GL_MAP_READ_BIT);
-            if (capturedPixels == null) {
+            ByteBuffer pixels = GL30.glMapBufferRange(GL30.GL_PIXEL_PACK_BUFFER, 0, byteCount, GL30.GL_MAP_READ_BIT);
+            if (pixels == null) {
                 throw new IllegalStateException("OpenGL could not map a completed pixel-pack buffer.");
             }
             mapped = true;
-            NativeDx12.render(captureTimes[bufferIndex], frameWidth, frameHeight,
-                    activePack.uniforms(), capturedPixels);
+            NativeDx12.render(captureTimes[bufferIndex], frameWidth, frameHeight, activePack.uniforms(), pixels);
         } finally {
-            boolean captureValid = !mapped || GL15.glUnmapBuffer(GL30.GL_PIXEL_PACK_BUFFER);
-            GL15.glBindBuffer(GL30.GL_PIXEL_PACK_BUFFER, previousPixelPackBuffer);
+            boolean valid = !mapped || GL15.glUnmapBuffer(GL30.GL_PIXEL_PACK_BUFFER);
+            GL15.glBindBuffer(GL30.GL_PIXEL_PACK_BUFFER, previousPackBuffer);
             captureStates[bufferIndex] = CAPTURE_FREE;
-            if (!captureValid) {
+            if (!valid) {
                 throw new IllegalStateException("OpenGL invalidated the mapped frame capture.");
             }
         }
     }
 
     private static void allocatePixelBuffers(long byteCount) {
-        int previousPixelPackBuffer = GL11.glGetInteger(GL30.GL_PIXEL_PACK_BUFFER_BINDING);
+        int previousPackBuffer = GL11.glGetInteger(GL30.GL_PIXEL_PACK_BUFFER_BINDING);
         try {
-            for (int index = 0; index < pixelBuffers.length; index++) {
+            for (int index = 0; index < CAPTURE_BUFFER_COUNT; index++) {
                 pixelBuffers[index] = GL15.glGenBuffers();
                 if (pixelBuffers[index] == 0) {
                     throw new IllegalStateException("OpenGL could not allocate a frame-capture buffer.");
@@ -253,22 +252,16 @@ public final class NativeRenderer {
                 GL15.glBufferData(GL30.GL_PIXEL_PACK_BUFFER, byteCount, GL15.GL_STREAM_READ);
             }
         } finally {
-            GL15.glBindBuffer(GL30.GL_PIXEL_PACK_BUFFER, previousPixelPackBuffer);
+            GL15.glBindBuffer(GL30.GL_PIXEL_PACK_BUFFER, previousPackBuffer);
         }
     }
 
     private static void releasePixelBuffers() {
-        boolean hasBuffers = false;
-        for (int pixelBuffer : pixelBuffers) {
-            hasBuffers |= pixelBuffer != 0;
-        }
-        if (hasBuffers) {
-            GL15.glDeleteBuffers(pixelBuffers);
-            for (int index = 0; index < pixelBuffers.length; index++) {
+        for (int index = 0; index < CAPTURE_BUFFER_COUNT; index++) {
+            if (pixelBuffers[index] != 0) {
+                GL15.glDeleteBuffers(pixelBuffers[index]);
                 pixelBuffers[index] = 0;
             }
-        }
-        for (int index = 0; index < CAPTURE_BUFFER_COUNT; index++) {
             if (captureFences[index] != 0) {
                 GL32.glDeleteSync(captureFences[index]);
                 captureFences[index] = 0;
@@ -280,24 +273,10 @@ public final class NativeRenderer {
         captureSequence = 0;
     }
 
-    static void loadNativeLibrary() throws IOException {
-        String resource = "/META-INF/native/windows-x86_64/direct_renderer.dll";
-        Path extractedLibrary = Files.createTempFile("direct-renderer-", ".dll");
-        extractedLibrary.toFile().deleteOnExit();
-        try (InputStream input = NativeRenderer.class.getResourceAsStream(resource)) {
-            if (input == null) {
-                throw new IOException("Native renderer not found at " + resource
-                        + "; build the mod with the Windows C++ toolchain.");
-            }
-            Files.copy(input, extractedLibrary, StandardCopyOption.REPLACE_EXISTING);
-        }
-        System.load(extractedLibrary.toAbsolutePath().toString());
-    }
-
     private static ShaderPack loadShaderPack(String name) throws IOException {
-        Path shaderpacks = FMLPaths.CONFIGDIR.get().resolve("direct").resolve("shaderpacks");
+        Path shaderpacks = FMLPaths.CONFIGDIR.get().resolve("direct").resolve("shaderpacks").normalize();
         Path packRoot = shaderpacks.resolve(name).normalize();
-        if (!packRoot.startsWith(shaderpacks.normalize())) {
+        if (!packRoot.startsWith(shaderpacks)) {
             throw new IllegalArgumentException("Invalid shader pack folder name: " + name);
         }
         if (!Files.isDirectory(packRoot)) {
@@ -307,65 +286,91 @@ public final class NativeRenderer {
             installDefaultPack(packRoot);
         }
 
-        JsonObject manifest;
+        JsonElement root;
         try (var reader = Files.newBufferedReader(packRoot.resolve("pack.json"), StandardCharsets.UTF_8)) {
-            manifest = JsonParser.parseReader(reader).getAsJsonObject();
+            root = JsonParser.parseReader(reader);
         }
-        if (!manifest.has("format") || manifest.get("format").getAsInt() != 1) {
+        JsonObject manifest = requireObject(root, "pack.json");
+        if (!isNumber(manifest.get("format")) || manifest.get("format").getAsInt() != 1) {
             throw new IllegalArgumentException("Unsupported or missing shader pack format version.");
         }
-        JsonArray passes = manifest.getAsJsonArray("passes");
-        if (passes == null || passes.isEmpty() || passes.size() > MAX_PASSES) {
+        JsonElement passesElement = manifest.get("passes");
+        if (passesElement == null || !passesElement.isJsonArray()) {
+            throw new IllegalArgumentException("Shader pack 'passes' must be an array.");
+        }
+        JsonArray passes = passesElement.getAsJsonArray();
+        if (passes.isEmpty() || passes.size() > MAX_PASSES) {
             throw new IllegalArgumentException("A shader pack must define between 1 and " + MAX_PASSES + " passes.");
         }
 
-        ArrayList<String> shaderSources = new ArrayList<>();
+        ArrayList<String> sources = new ArrayList<>();
         ArrayList<float[]> passUniforms = new ArrayList<>();
         for (JsonElement element : passes) {
-            JsonObject pass = element.getAsJsonObject();
-            String shaderPath = pass.get("shader").getAsString();
+            JsonObject pass = requireObject(element, "pass");
+            JsonElement shaderElement = pass.get("shader");
+            if (shaderElement == null || !shaderElement.isJsonPrimitive()
+                    || !shaderElement.getAsJsonPrimitive().isString()) {
+                throw new IllegalArgumentException("Each pass needs a 'shader' path string.");
+            }
+            String shaderPath = shaderElement.getAsString();
             Path shader = packRoot.resolve(shaderPath).normalize();
             if (!shader.startsWith(packRoot) || !Files.isRegularFile(shader)) {
                 throw new IllegalArgumentException("Shader path is invalid or missing: " + shaderPath);
             }
-
             String source = Files.readString(shader, StandardCharsets.UTF_8);
+            JsonObject uniforms = pass.has("uniforms") ? requireObject(pass.get("uniforms"), "uniforms")
+                    : new JsonObject();
+            if (uniforms.size() > MAX_UNIFORMS) {
+                throw new IllegalArgumentException("A pass may define at most " + MAX_UNIFORMS + " uniforms.");
+            }
             float[] values = new float[MAX_UNIFORMS * 4];
             StringBuilder aliases = new StringBuilder();
-            JsonObject uniforms = pass.has("uniforms") ? pass.getAsJsonObject("uniforms") : new JsonObject();
             int slot = 0;
             for (Map.Entry<String, JsonElement> entry : uniforms.entrySet()) {
                 String uniformName = entry.getKey();
                 if (!UNIFORM_NAME.matcher(uniformName).matches()
-                        || "u_Frame".equals(uniformName) || "u_User".equals(uniformName)) {
+                        || uniformName.startsWith("u_Frame") || uniformName.startsWith("u_User")
+                        || uniformName.startsWith("u_Scene")) {
                     throw new IllegalArgumentException("Invalid or reserved uniform name: " + uniformName);
                 }
-                if (slot >= MAX_UNIFORMS) {
-                    throw new IllegalArgumentException("A pass may define at most " + MAX_UNIFORMS + " uniforms.");
-                }
-                JsonArray vector = entry.getValue().getAsJsonArray();
-                if (vector.size() != 4) {
+                JsonElement vectorElement = entry.getValue();
+                if (!vectorElement.isJsonArray() || vectorElement.getAsJsonArray().size() != 4) {
                     throw new IllegalArgumentException("Uniform '" + uniformName + "' must contain four numbers.");
                 }
+                JsonArray vector = vectorElement.getAsJsonArray();
                 for (int component = 0; component < 4; component++) {
+                    if (!isNumber(vector.get(component))) {
+                        throw new IllegalArgumentException("Uniform '" + uniformName + "' must contain four numbers.");
+                    }
                     float value = vector.get(component).getAsFloat();
                     if (!Float.isFinite(value)) {
                         throw new IllegalArgumentException("Uniform '" + uniformName + "' contains a non-finite value.");
                     }
                     values[slot * 4 + component] = value;
                 }
-                aliases.append("#define ").append(uniformName).append(" u_User[")
-                        .append(slot).append("]\n");
+                aliases.append("#define ").append(uniformName).append(" u_User[").append(slot).append("]\n");
                 slot++;
             }
-            shaderSources.add("Texture2D u_Scene : register(t0);\n"
+            sources.add("Texture2D u_Scene : register(t0);\n"
                     + "SamplerState u_SceneSampler : register(s0);\n"
                     + "cbuffer DirectUniforms : register(b0) { float4 u_Frame; float4 u_User[16]; };\n"
-                    + aliases + source);
+                    + aliases + "#line 1\n" + source);
             passUniforms.add(values);
         }
-        return new ShaderPack(manifest.has("name") ? manifest.get("name").getAsString() : name,
-                shaderSources.toArray(String[]::new), passUniforms.toArray(float[][]::new));
+        String packName = manifest.has("name") && manifest.get("name").isJsonPrimitive()
+                ? manifest.get("name").getAsString() : name;
+        return new ShaderPack(packName, sources.toArray(String[]::new), passUniforms.toArray(float[][]::new));
+    }
+
+    private static JsonObject requireObject(JsonElement element, String what) {
+        if (element == null || !element.isJsonObject()) {
+            throw new IllegalArgumentException("Shader pack '" + what + "' must be a JSON object.");
+        }
+        return element.getAsJsonObject();
+    }
+
+    private static boolean isNumber(JsonElement element) {
+        return element != null && element.isJsonPrimitive() && element.getAsJsonPrimitive().isNumber();
     }
 
     private static void installDefaultPack(Path packRoot) throws IOException {
