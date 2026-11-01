@@ -4,6 +4,7 @@
 #include <d3d11on12.h>
 #include <d3d12.h>
 #include <d3dcompiler.h>
+#include <dxgi1_4.h>
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -15,6 +16,7 @@
 #include <functional>
 #include <limits>
 #include <mutex>
+#include <string>
 #include <system_error>
 #include <thread>
 #include <unordered_map>
@@ -31,6 +33,9 @@ constexpr UINT kLayerCount = 3;
 constexpr UINT kFramesInFlight = 3;
 constexpr UINT kAtlasSlots = 64;
 constexpr UINT kDrawConstantCount = 5;
+constexpr UINT kMaxExtensionPasses = 8;
+constexpr UINT kPassUniformFloatCount = 60;
+constexpr UINT kPassConstantCount = 64;
 constexpr jsize kMaxAtlasLevels = 16;
 constexpr float kSectionRadius = 13.8564f; // sqrt(3) * 8
 constexpr float kClearColor[4] = {0.0f, 0.0f, 0.0f, 0.0f};
@@ -38,6 +43,16 @@ constexpr DXGI_FORMAT kColorFormat = DXGI_FORMAT_R8G8B8A8_UNORM;
 constexpr DXGI_FORMAT kDepthFormat = DXGI_FORMAT_D32_FLOAT;
 // Ordem das camadas: solid, cutout_mipped, cutout (confirmar nos .fsh vanilla).
 constexpr float kLayerAlphaCutoff[kLayerCount] = {-1.0f, 0.5f, 0.1f};
+
+constexpr char kExtensionVertexShader[] = R"(
+struct VertexOutput { float4 position : SV_Position; };
+VertexOutput vsMain(uint vertexId : SV_VertexID) {
+    float2 position = float2((vertexId << 1) & 2, vertexId & 2);
+    VertexOutput output;
+    output.position = float4(position * float2(2.0, -2.0) + float2(-1.0, 1.0), 0.0, 1.0);
+    return output;
+}
+)";
 
 // Vértice de 16 bytes: posição uint16 (1/1024 de bloco, origem -16), cor RGBA8, UV unorm16.
 constexpr char kTerrainShader[] = R"(
@@ -89,7 +104,13 @@ struct FrameSlot {
     ID3D12CommandAllocator* upload;
     ID3D12CommandAllocator* opaque;
     ID3D12CommandAllocator* cutout;
+    ID3D12CommandAllocator* extension;
     UINT64 fenceValue;
+};
+
+struct ExtensionPass {
+    std::string source;
+    ID3D12PipelineState* pipeline;
 };
 
 struct Plane {
@@ -126,6 +147,10 @@ struct InteropRenderer {
     UINT64 watchedFenceValue;
     bool stopWatchdog;
     std::atomic<bool> gpuSyncFault;
+    std::string adapterName;
+    UINT featureFlags;
+    ID3D12Device1* device1;
+    ID3D12PipelineLibrary* pipelineLibrary;
     // D3D11On12 só faz a ponte para o WGL: uma cópia por frame para a textura importada.
     ID3D11Device* d3d11Device;
     ID3D11DeviceContext* d3d11Context;
@@ -140,13 +165,20 @@ struct InteropRenderer {
     ID3D12DescriptorHeap* srvHeap;
     UINT srvIncrement;
     ID3D12RootSignature* rootSignature;
+    ID3D12RootSignature* extensionRootSignature;
     ID3D12PipelineState* opaquePipeline;
     ID3D12PipelineState* cutoutPipeline;
+    std::vector<ExtensionPass> extensionPasses;
+    ID3D12DescriptorHeap* extensionRtvHeap;
+    ID3D12DescriptorHeap* extensionSrvHeap;
+    UINT extensionSrvIncrement;
+    ID3D12Resource* extensionTargets[kMaxExtensionPasses];
     FrameSlot slots[kFramesInFlight];
     UINT slotIndex;
     ID3D12GraphicsCommandList* uploadList;
     ID3D12GraphicsCommandList* opaqueList;
     ID3D12GraphicsCommandList* cutoutList;
+    ID3D12GraphicsCommandList* extensionList;
     ID3D12GraphicsCommandList4* opaquePassList;
     ID3D12GraphicsCommandList4* cutoutPassList;
     bool uploadOpen;
@@ -190,6 +222,51 @@ void closeHandle(HANDLE& handle) {
     }
 }
 
+void inspectAdapter(InteropRenderer* renderer) {
+    renderer->adapterName = "unknown";
+    renderer->featureFlags = renderer->pipelineLibrary != nullptr ? 8u : 0u;
+    IDXGIFactory1* factory = nullptr;
+    if (SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) {
+        const LUID deviceLuid = renderer->device->GetAdapterLuid();
+        for (UINT index = 0;; ++index) {
+            IDXGIAdapter1* adapter = nullptr;
+            if (factory->EnumAdapters1(index, &adapter) == DXGI_ERROR_NOT_FOUND) {
+                break;
+            }
+            if (adapter == nullptr) {
+                continue;
+            }
+            DXGI_ADAPTER_DESC1 description = {};
+            if (SUCCEEDED(adapter->GetDesc1(&description))
+                    && description.AdapterLuid.HighPart == deviceLuid.HighPart
+                    && description.AdapterLuid.LowPart == deviceLuid.LowPart) {
+                char name[256] = {};
+                WideCharToMultiByte(CP_UTF8, 0, description.Description, -1, name,
+                        static_cast<int>(sizeof(name)), nullptr, nullptr);
+                renderer->adapterName = name;
+                if ((description.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) == 0) {
+                    renderer->featureFlags |= 1u;
+                }
+                adapter->Release();
+                break;
+            }
+            adapter->Release();
+        }
+        factory->Release();
+    }
+
+    D3D12_FEATURE_DATA_D3D12_OPTIONS options = {};
+    if (SUCCEEDED(renderer->device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS,
+            &options, sizeof(options))) && options.ResourceBindingTier >= D3D12_RESOURCE_BINDING_TIER_2) {
+        renderer->featureFlags |= 2u;
+    }
+    ID3D12GraphicsCommandList4* commandList4 = nullptr;
+    if (SUCCEEDED(renderer->opaqueList->QueryInterface(IID_PPV_ARGS(&commandList4)))) {
+        renderer->featureFlags |= 4u;
+        commandList4->Release();
+    }
+}
+
 bool createSharedFence(ID3D12Device* device, ID3D12Fence** fence, HANDLE* sharedHandle) {
     *sharedHandle = nullptr;
     if (SUCCEEDED(device->CreateFence(0, D3D12_FENCE_FLAG_SHARED, IID_PPV_ARGS(fence)))) {
@@ -201,7 +278,7 @@ bool createSharedFence(ID3D12Device* device, ID3D12Fence** fence, HANDLE* shared
     return SUCCEEDED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(fence)));
 }
 
-// Espera com timeout. NUNCA sinaliza pela CPU: um timeout é tratado como falha.
+// Espera com timeout; timeout e device removal são propagados ao Java para voltar ao vanilla.
 bool waitFence(InteropRenderer* renderer, ID3D12Fence* fence, UINT64 value) {
     UINT64 completed = fence->GetCompletedValue();
     if (completed == kFenceError) {
@@ -221,7 +298,7 @@ bool waitFence(InteropRenderer* renderer, ID3D12Fence* fence, UINT64 value) {
     return completed != kFenceError && completed >= value;
 }
 
-// Só detecta problema. Prazo por valor alvo; sem Signal() pela CPU.
+// glWaitSemaphoreEXT não tem timeout: um valor perdido precisa ser liberado para evitar travar o GL.
 void fenceWatchdog(InteropRenderer* renderer) {
     std::unique_lock<std::mutex> lock(renderer->watchdogMutex);
     for (;;) {
@@ -270,6 +347,10 @@ void fenceWatchdog(InteropRenderer* renderer) {
         }
         if (!completed) {
             renderer->gpuSyncFault.store(true);
+            if (SUCCEEDED(renderer->fence->Signal(target))) {
+                OutputDebugStringA("Direct: watchdog CPU-signaled a stalled D3D12 interop fence; "
+                        "the current frame is invalid and vanilla fallback will be used.\n");
+            }
         }
         if (renderer->watchedFenceValue == target) {
             renderer->watchedFenceValue = 0;
@@ -399,11 +480,23 @@ void retireTerrainSections(InteropRenderer* renderer) {
     renderer->sections.clear();
 }
 
+void releaseExtensionResources(InteropRenderer* renderer) {
+    for (ID3D12Resource*& target : renderer->extensionTargets) {
+        release(target);
+    }
+    release(renderer->extensionSrvHeap);
+    release(renderer->extensionRtvHeap);
+    renderer->extensionSrvIncrement = 0;
+}
+
+bool createExtensionResources(InteropRenderer* renderer, JNIEnv* env);
+
 void releaseSizeResources(InteropRenderer* renderer) {
     release(renderer->wrappedColor);
     if (renderer->d3d11Context != nullptr) {
         renderer->d3d11Context->Flush();
     }
+    releaseExtensionResources(renderer);
     release(renderer->depthTarget);
     release(renderer->colorTarget);
     release(renderer->interopTexture);
@@ -464,7 +557,7 @@ bool createSizeResources(InteropRenderer* renderer, JNIEnv* env) {
         throwJava(env, "DX12 terrain target could not be wrapped for the OpenGL bridge.");
         return false;
     }
-    return true;
+    return createExtensionResources(renderer, env);
 }
 
 void destroyInteropRenderer(InteropRenderer* renderer) {
@@ -513,19 +606,28 @@ void destroyInteropRenderer(InteropRenderer* renderer) {
     releaseAllRetired(renderer);
     releaseSizeResources(renderer);
     release(renderer->atlas);
+    release(renderer->extensionList);
     release(renderer->cutoutPassList);
     release(renderer->opaquePassList);
     release(renderer->cutoutList);
     release(renderer->opaqueList);
     release(renderer->uploadList);
     for (FrameSlot& slot : renderer->slots) {
+        release(slot.extension);
         release(slot.cutout);
         release(slot.opaque);
         release(slot.upload);
     }
+    for (ExtensionPass& pass : renderer->extensionPasses) {
+        release(pass.pipeline);
+    }
+    renderer->extensionPasses.clear();
+    release(renderer->extensionRootSignature);
     release(renderer->cutoutPipeline);
     release(renderer->opaquePipeline);
     release(renderer->rootSignature);
+    release(renderer->pipelineLibrary);
+    release(renderer->device1);
     release(renderer->srvHeap);
     release(renderer->dsvHeap);
     release(renderer->rtvHeap);
@@ -608,6 +710,21 @@ bool createRootSignature(InteropRenderer* renderer) {
     return SUCCEEDED(result);
 }
 
+HRESULT createCachedPipeline(InteropRenderer* renderer, LPCWSTR name,
+        const D3D12_GRAPHICS_PIPELINE_STATE_DESC& description, ID3D12PipelineState** pipeline) {
+    if (renderer->pipelineLibrary != nullptr
+            && SUCCEEDED(renderer->pipelineLibrary->LoadGraphicsPipeline(name, &description,
+                    IID_PPV_ARGS(pipeline)))) {
+        return S_OK;
+    }
+    const HRESULT result = renderer->device->CreateGraphicsPipelineState(
+            &description, IID_PPV_ARGS(pipeline));
+    if (SUCCEEDED(result) && renderer->pipelineLibrary != nullptr) {
+        renderer->pipelineLibrary->StorePipeline(name, *pipeline);
+    }
+    return result;
+}
+
 // PSOs criados uma única vez na inicialização: opaco (sem clip) e cutout (clip por root constant).
 bool createTerrainPipelines(InteropRenderer* renderer, JNIEnv* env) {
     if (!createRootSignature(renderer)) {
@@ -658,12 +775,12 @@ bool createTerrainPipelines(InteropRenderer* renderer, JNIEnv* env) {
     description.DSVFormat = kDepthFormat;
     description.SampleDesc.Count = 1;
     description.PS = {opaqueBytecode->GetBufferPointer(), opaqueBytecode->GetBufferSize()};
-    HRESULT result = renderer->device->CreateGraphicsPipelineState(&description,
-            IID_PPV_ARGS(&renderer->opaquePipeline));
+    HRESULT result = createCachedPipeline(renderer, L"direct.terrain.opaque.v1", description,
+            &renderer->opaquePipeline);
     if (SUCCEEDED(result)) {
         description.PS = {cutoutBytecode->GetBufferPointer(), cutoutBytecode->GetBufferSize()};
-        result = renderer->device->CreateGraphicsPipelineState(&description,
-                IID_PPV_ARGS(&renderer->cutoutPipeline));
+        result = createCachedPipeline(renderer, L"direct.terrain.cutout.v1", description,
+                &renderer->cutoutPipeline);
     }
     release(vertexBytecode);
     release(opaqueBytecode);
@@ -673,6 +790,190 @@ bool createTerrainPipelines(InteropRenderer* renderer, JNIEnv* env) {
         return false;
     }
     return true;
+}
+
+bool createExtensionRootSignature(InteropRenderer* renderer) {
+    D3D12_DESCRIPTOR_RANGE inputRange = {};
+    inputRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+    inputRange.NumDescriptors = 1;
+    inputRange.BaseShaderRegister = 0;
+    inputRange.OffsetInDescriptorsFromTableStart = 0;
+    D3D12_ROOT_PARAMETER parameters[2] = {};
+    parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    parameters[0].Constants.ShaderRegister = 0;
+    parameters[0].Constants.Num32BitValues = kPassConstantCount;
+    parameters[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    parameters[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    parameters[1].DescriptorTable.NumDescriptorRanges = 1;
+    parameters[1].DescriptorTable.pDescriptorRanges = &inputRange;
+    parameters[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    D3D12_STATIC_SAMPLER_DESC sampler = {};
+    sampler.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+    sampler.AddressU = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+    sampler.AddressV = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+    sampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+    sampler.ComparisonFunc = D3D12_COMPARISON_FUNC_NEVER;
+    sampler.MaxLOD = D3D12_FLOAT32_MAX;
+    sampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    D3D12_ROOT_SIGNATURE_DESC description = {};
+    description.NumParameters = ARRAYSIZE(parameters);
+    description.pParameters = parameters;
+    description.NumStaticSamplers = 1;
+    description.pStaticSamplers = &sampler;
+    ID3DBlob* serialized = nullptr;
+    ID3DBlob* errors = nullptr;
+    HRESULT result = D3D12SerializeRootSignature(&description, D3D_ROOT_SIGNATURE_VERSION_1,
+            &serialized, &errors);
+    if (SUCCEEDED(result)) {
+        result = renderer->device->CreateRootSignature(0, serialized->GetBufferPointer(),
+                serialized->GetBufferSize(), IID_PPV_ARGS(&renderer->extensionRootSignature));
+    }
+    if (errors != nullptr) {
+        OutputDebugStringA(static_cast<const char*>(errors->GetBufferPointer()));
+    }
+    release(errors);
+    release(serialized);
+    return SUCCEEDED(result);
+}
+
+bool createExtensionResources(InteropRenderer* renderer, JNIEnv* env) {
+    const UINT passCount = static_cast<UINT>(renderer->extensionPasses.size());
+    if (passCount == 0) {
+        return true;
+    }
+    const D3D12_DESCRIPTOR_HEAP_DESC rtv = {
+        D3D12_DESCRIPTOR_HEAP_TYPE_RTV, passCount, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0
+    };
+    const D3D12_DESCRIPTOR_HEAP_DESC srv = {
+        D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, passCount, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0
+    };
+    if (FAILED(renderer->device->CreateDescriptorHeap(&rtv, IID_PPV_ARGS(&renderer->extensionRtvHeap)))
+            || FAILED(renderer->device->CreateDescriptorHeap(&srv, IID_PPV_ARGS(&renderer->extensionSrvHeap)))) {
+        throwJava(env, "Direct extension pass descriptor heaps could not be created.");
+        return false;
+    }
+    renderer->extensionSrvIncrement = renderer->device->GetDescriptorHandleIncrementSize(
+            D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    const D3D12_RESOURCE_DESC description = {
+        D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, renderer->width, renderer->height, 1, 1,
+        kColorFormat, {1, 0}, D3D12_TEXTURE_LAYOUT_UNKNOWN, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET
+    };
+    D3D12_HEAP_PROPERTIES heap = {};
+    heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+    D3D12_CLEAR_VALUE clear = {};
+    clear.Format = kColorFormat;
+    std::memcpy(clear.Color, kClearColor, sizeof(kClearColor));
+    D3D12_CPU_DESCRIPTOR_HANDLE rtvHandle = renderer->extensionRtvHeap->GetCPUDescriptorHandleForHeapStart();
+    D3D12_CPU_DESCRIPTOR_HANDLE srvHandle = renderer->extensionSrvHeap->GetCPUDescriptorHandleForHeapStart();
+    const UINT rtvIncrement = renderer->device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+    for (UINT index = 0; index < passCount; ++index) {
+        if (FAILED(renderer->device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &description,
+                D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, &clear,
+                IID_PPV_ARGS(&renderer->extensionTargets[index])))) {
+            throwJava(env, "Direct extension pass render target creation failed.");
+            return false;
+        }
+        renderer->device->CreateRenderTargetView(renderer->extensionTargets[index], nullptr, rtvHandle);
+        ID3D12Resource* input = index == 0 ? renderer->colorTarget : renderer->extensionTargets[index - 1];
+        D3D12_SHADER_RESOURCE_VIEW_DESC view = {};
+        view.Format = kColorFormat;
+        view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        view.Texture2D.MipLevels = 1;
+        renderer->device->CreateShaderResourceView(input, &view, srvHandle);
+        rtvHandle.ptr += rtvIncrement;
+        srvHandle.ptr += renderer->extensionSrvIncrement;
+    }
+    return true;
+}
+
+bool configureExtensionPasses(InteropRenderer* renderer, const std::vector<std::string>& sources,
+        JNIEnv* env) {
+    if (sources.size() > kMaxExtensionPasses) {
+        throwJava(env, "Direct supports at most eight extension render passes.");
+        return false;
+    }
+    releaseExtensionResources(renderer);
+    for (ExtensionPass& pass : renderer->extensionPasses) {
+        release(pass.pipeline);
+    }
+    renderer->extensionPasses.clear();
+    release(renderer->extensionRootSignature);
+    if (sources.empty()) {
+        return true;
+    }
+    if (!createExtensionRootSignature(renderer)) {
+        throwJava(env, "Direct extension pass root signature creation failed.");
+        return false;
+    }
+    ID3DBlob* vertex = nullptr;
+    ID3DBlob* errors = nullptr;
+    const HRESULT vertexResult = D3DCompile(kExtensionVertexShader, sizeof(kExtensionVertexShader) - 1,
+            nullptr, nullptr, nullptr, "vsMain", "vs_5_1",
+            D3DCOMPILE_ENABLE_STRICTNESS | D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &vertex, &errors);
+    if (errors != nullptr) {
+        OutputDebugStringA(static_cast<const char*>(errors->GetBufferPointer()));
+    }
+    release(errors);
+    if (FAILED(vertexResult)) {
+        throwJava(env, "Direct extension pass vertex shader compilation failed.");
+        return false;
+    }
+
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC description = {};
+    description.pRootSignature = renderer->extensionRootSignature;
+    description.VS = {vertex->GetBufferPointer(), vertex->GetBufferSize()};
+    description.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+    description.BlendState.RenderTarget[0].SrcBlend = D3D12_BLEND_ONE;
+    description.BlendState.RenderTarget[0].DestBlend = D3D12_BLEND_ZERO;
+    description.BlendState.RenderTarget[0].BlendOp = D3D12_BLEND_OP_ADD;
+    description.BlendState.RenderTarget[0].SrcBlendAlpha = D3D12_BLEND_ONE;
+    description.BlendState.RenderTarget[0].DestBlendAlpha = D3D12_BLEND_ZERO;
+    description.BlendState.RenderTarget[0].BlendOpAlpha = D3D12_BLEND_OP_ADD;
+    description.BlendState.RenderTarget[0].LogicOp = D3D12_LOGIC_OP_NOOP;
+    description.SampleMask = UINT_MAX;
+    description.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+    description.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+    description.RasterizerState.DepthClipEnable = TRUE;
+    description.DepthStencilState.DepthEnable = FALSE;
+    description.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
+    description.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+    description.InputLayout = {nullptr, 0};
+    description.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    description.NumRenderTargets = 1;
+    description.RTVFormats[0] = kColorFormat;
+    description.SampleDesc.Count = 1;
+
+    for (const std::string& source : sources) {
+        ID3DBlob* pixel = nullptr;
+        errors = nullptr;
+        const HRESULT compileResult = D3DCompile(source.data(), source.size(), nullptr, nullptr, nullptr,
+                "main", "ps_5_1", D3DCOMPILE_ENABLE_STRICTNESS | D3DCOMPILE_OPTIMIZATION_LEVEL3,
+                0, &pixel, &errors);
+        if (errors != nullptr) {
+            OutputDebugStringA(static_cast<const char*>(errors->GetBufferPointer()));
+        }
+        release(errors);
+        if (FAILED(compileResult)) {
+            release(vertex);
+            throwJava(env, "Direct extension pass pixel shader compilation failed; inspect the native debug output.");
+            return false;
+        }
+        description.PS = {pixel->GetBufferPointer(), pixel->GetBufferSize()};
+        const std::wstring name = L"direct.extension."
+                + std::to_wstring(std::hash<std::string>{}(source)) + L".v1";
+        ID3D12PipelineState* pipeline = nullptr;
+        const HRESULT pipelineResult = createCachedPipeline(renderer, name.c_str(), description, &pipeline);
+        release(pixel);
+        if (FAILED(pipelineResult)) {
+            release(vertex);
+            throwJava(env, "Direct extension pass pipeline state creation failed.");
+            return false;
+        }
+        renderer->extensionPasses.push_back({source, pipeline});
+    }
+    release(vertex);
+    return createExtensionResources(renderer, env);
 }
 
 bool createDescriptorHeaps(InteropRenderer* renderer) {
@@ -708,7 +1009,9 @@ bool createCommandObjects(InteropRenderer* renderer) {
                 || FAILED(renderer->device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
                     IID_PPV_ARGS(&slot.opaque)))
                 || FAILED(renderer->device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
-                    IID_PPV_ARGS(&slot.cutout)))) {
+                    IID_PPV_ARGS(&slot.cutout)))
+                || FAILED(renderer->device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+                    IID_PPV_ARGS(&slot.extension)))) {
             return false;
         }
     }
@@ -719,9 +1022,12 @@ bool createCommandObjects(InteropRenderer* renderer) {
                 nullptr, IID_PPV_ARGS(&renderer->opaqueList)))
             || FAILED(renderer->device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, first.cutout,
                 nullptr, IID_PPV_ARGS(&renderer->cutoutList)))
+            || FAILED(renderer->device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, first.extension,
+                nullptr, IID_PPV_ARGS(&renderer->extensionList)))
             || FAILED(renderer->uploadList->Close())
             || FAILED(renderer->opaqueList->Close())
-            || FAILED(renderer->cutoutList->Close())) {
+            || FAILED(renderer->cutoutList->Close())
+            || FAILED(renderer->extensionList->Close())) {
         return false;
     }
     // Render passes exigem ID3D12GraphicsCommandList4 (Windows 10 1809+); sem ela usa OMSetRenderTargets.
@@ -753,6 +1059,12 @@ bool initializeInteropRenderer(InteropRenderer* renderer, jint width, jint heigh
         throwJava(env, "DX12/OpenGL interop could not create a Direct3D 12 device.");
         return false;
     }
+    if (SUCCEEDED(renderer->device->QueryInterface(IID_PPV_ARGS(&renderer->device1)))) {
+        if (SUCCEEDED(renderer->device1->CreatePipelineLibrary(nullptr, 0,
+                IID_PPV_ARGS(&renderer->pipelineLibrary)))) {
+            renderer->featureFlags |= 8u;
+        }
+    }
     D3D12_COMMAND_QUEUE_DESC queueDescription = {};
     queueDescription.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
     if (FAILED(renderer->device->CreateCommandQueue(&queueDescription, IID_PPV_ARGS(&renderer->queue)))) {
@@ -772,6 +1084,7 @@ bool initializeInteropRenderer(InteropRenderer* renderer, jint width, jint heigh
         throwJava(env, "DX12 terrain descriptor heaps or command lists could not be created.");
         return false;
     }
+    inspectAdapter(renderer);
     if (!createTerrainPipelines(renderer, env) || !createSizeResources(renderer, env)) {
         return false;
     }
@@ -1000,9 +1313,74 @@ void copyToInteropTexture(InteropRenderer* renderer) {
     renderer->d3d11Context->Flush();
 }
 
+bool recordExtensionPasses(InteropRenderer* renderer, FrameSlot& slot, UINT64 frameIndex,
+        float elapsedSeconds, const float* uniforms) {
+    if (renderer->extensionPasses.empty()) {
+        return true;
+    }
+    if (FAILED(slot.extension->Reset()) || FAILED(renderer->extensionList->Reset(slot.extension, nullptr))) {
+        return false;
+    }
+    ID3D12GraphicsCommandList* list = renderer->extensionList;
+    ID3D12DescriptorHeap* heaps[] = {renderer->extensionSrvHeap};
+    list->SetDescriptorHeaps(1, heaps);
+    list->SetGraphicsRootSignature(renderer->extensionRootSignature);
+    const D3D12_VIEWPORT viewport = {0.0f, 0.0f, static_cast<float>(renderer->width),
+            static_cast<float>(renderer->height), 0.0f, 1.0f};
+    const D3D12_RECT scissor = {0, 0, static_cast<LONG>(renderer->width), static_cast<LONG>(renderer->height)};
+    list->RSSetViewports(1, &viewport);
+    list->RSSetScissorRects(1, &scissor);
+    list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    const D3D12_RESOURCE_BARRIER colorForSampling = transition(renderer->colorTarget,
+            D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    list->ResourceBarrier(1, &colorForSampling);
+    D3D12_CPU_DESCRIPTOR_HANDLE rtv = renderer->extensionRtvHeap->GetCPUDescriptorHandleForHeapStart();
+    const UINT rtvIncrement = renderer->device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+    D3D12_GPU_DESCRIPTOR_HANDLE input = renderer->extensionSrvHeap->GetGPUDescriptorHandleForHeapStart();
+    for (UINT index = 0; index < renderer->extensionPasses.size(); ++index) {
+        ID3D12Resource* output = renderer->extensionTargets[index];
+        const D3D12_RESOURCE_BARRIER toRenderTarget = transition(output,
+                D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+        list->ResourceBarrier(1, &toRenderTarget);
+        list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+        list->SetPipelineState(renderer->extensionPasses[index].pipeline);
+        list->SetGraphicsRootDescriptorTable(1, input);
+        float constants[kPassConstantCount] = {};
+        constants[0] = elapsedSeconds;
+        constants[1] = static_cast<float>(renderer->width);
+        constants[2] = static_cast<float>(renderer->height);
+        constants[3] = static_cast<float>(frameIndex);
+        std::memcpy(constants + 4, uniforms + index * kPassUniformFloatCount,
+                kPassUniformFloatCount * sizeof(float));
+        list->SetGraphicsRoot32BitConstants(0, kPassConstantCount, constants, 0);
+        list->DrawInstanced(3, 1, 0, 0);
+        const D3D12_RESOURCE_BARRIER toShaderResource = transition(output,
+                D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        list->ResourceBarrier(1, &toShaderResource);
+        rtv.ptr += rtvIncrement;
+        input.ptr += renderer->extensionSrvIncrement;
+    }
+
+    ID3D12Resource* finalPass = renderer->extensionTargets[renderer->extensionPasses.size() - 1];
+    const D3D12_RESOURCE_BARRIER toCopy[] = {
+        transition(renderer->colorTarget, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                D3D12_RESOURCE_STATE_COPY_DEST),
+        transition(finalPass, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_SOURCE)
+    };
+    list->ResourceBarrier(ARRAYSIZE(toCopy), toCopy);
+    list->CopyResource(renderer->colorTarget, finalPass);
+    const D3D12_RESOURCE_BARRIER restore[] = {
+        transition(renderer->colorTarget, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_RENDER_TARGET),
+        transition(finalPass, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE)
+    };
+    list->ResourceBarrier(ARRAYSIZE(restore), restore);
+    return SUCCEEDED(list->Close());
+}
+
 bool renderInteropFrame(InteropRenderer* renderer, const float* viewProjection,
         double cameraX, double cameraY, double cameraZ, float renderDistance,
-        UINT64 frameIndex, bool useGpuSynchronization, JNIEnv* env, bool* gpuSynchronizationUsed) {
+        UINT64 frameIndex, float elapsedSeconds, const float* passUniforms,
+        bool useGpuSynchronization, JNIEnv* env, bool* gpuSynchronizationUsed) {
     if (frameIndex >= kFenceError - 1) {
         throwJava(env, "DX12/OpenGL interop fence timeline has exhausted its frame values.");
         return false;
@@ -1046,6 +1424,14 @@ bool renderInteropFrame(InteropRenderer* renderer, const float* viewProjection,
     // Ambas as listas na mesma submissão: o render pass suspenso no opaco é retomado pelo cutout.
     ID3D12CommandList* lists[] = {renderer->opaqueList, renderer->cutoutList};
     renderer->queue->ExecuteCommandLists(drawTerrain ? 2 : 1, lists);
+    if (!recordExtensionPasses(renderer, slot, frameIndex, elapsedSeconds, passUniforms)) {
+        throwJava(env, "Direct extension pass command list could not be recorded.");
+        return false;
+    }
+    if (!renderer->extensionPasses.empty()) {
+        ID3D12CommandList* extensionLists[] = {renderer->extensionList};
+        renderer->queue->ExecuteCommandLists(1, extensionLists);
+    }
     copyToInteropTexture(renderer);
 
     HRESULT signalResult;
@@ -1221,15 +1607,68 @@ Java_com_redondoguibi_direct_NativeDx12_resizeInterop(JNIEnv* env, jclass, jint 
     return static_cast<jlong>(reinterpret_cast<intptr_t>(renderer->interopTexture));
 }
 
+extern "C" JNIEXPORT void JNICALL
+Java_com_redondoguibi_direct_NativeDx12_configureRenderPasses(JNIEnv* env, jclass, jobjectArray sources) {
+    InteropRenderer* renderer = g_interopRenderer;
+    const jsize count = sources != nullptr ? env->GetArrayLength(sources) : 0;
+    if (renderer == nullptr || count > static_cast<jsize>(kMaxExtensionPasses)) {
+        throwJava(env, "Direct extension pass configuration is invalid.");
+        return;
+    }
+    if (!waitFence(renderer, renderer->fence, renderer->lastSignaledValue)) {
+        throwJava(env, "DX12 timed out before reconfiguring extension render passes.");
+        return;
+    }
+    std::vector<std::string> passSources;
+    passSources.reserve(static_cast<size_t>(count));
+    for (jsize index = 0; index < count; ++index) {
+        auto source = static_cast<jstring>(env->GetObjectArrayElement(sources, index));
+        if (source == nullptr) {
+            throwJava(env, "Direct extension pass shader source must not be null.");
+            return;
+        }
+        const char* text = env->GetStringUTFChars(source, nullptr);
+        if (text == nullptr) {
+            env->DeleteLocalRef(source);
+            return;
+        }
+        passSources.emplace_back(text);
+        env->ReleaseStringUTFChars(source, text);
+        env->DeleteLocalRef(source);
+        if (env->ExceptionCheck()) {
+            return;
+        }
+    }
+    configureExtensionPasses(renderer, passSources, env);
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_redondoguibi_direct_NativeDx12_interopAdapterName(JNIEnv* env, jclass) {
+    if (g_interopRenderer == nullptr) {
+        return nullptr;
+    }
+    return env->NewStringUTF(g_interopRenderer->adapterName.c_str());
+}
+
+extern "C" JNIEXPORT jint JNICALL
+Java_com_redondoguibi_direct_NativeDx12_interopFeatureFlags(JNIEnv*, jclass) {
+    return g_interopRenderer != nullptr ? static_cast<jint>(g_interopRenderer->featureFlags) : 0;
+}
+
 extern "C" JNIEXPORT jboolean JNICALL
 Java_com_redondoguibi_direct_NativeDx12_renderInterop(JNIEnv* env, jclass, jfloatArray matrix,
         jdouble cameraX, jdouble cameraY, jdouble cameraZ, jfloat renderDistance,
-        jlong frameIndex, jboolean useGpuSynchronization) {
+        jlong frameIndex, jfloat elapsedSeconds, jfloatArray passUniforms,
+        jboolean useGpuSynchronization) {
     if (g_interopRenderer == nullptr) {
         throwJava(env, "DX12/OpenGL interop is not initialized.");
         return JNI_FALSE;
     }
-    if (matrix == nullptr || env->GetArrayLength(matrix) != 16 || frameIndex < 0) {
+    const jsize expectedUniforms = static_cast<jsize>(
+            g_interopRenderer->extensionPasses.size() * kPassUniformFloatCount);
+    if (matrix == nullptr || env->GetArrayLength(matrix) != 16 || frameIndex < 0
+            || (expectedUniforms > 0 && (passUniforms == nullptr
+                || env->GetArrayLength(passUniforms) != expectedUniforms))) {
         throwJava(env, "DX12 terrain rendering received an invalid matrix or frame index.");
         return JNI_FALSE;
     }
@@ -1238,9 +1677,18 @@ Java_com_redondoguibi_direct_NativeDx12_renderInterop(JNIEnv* env, jclass, jfloa
     if (env->ExceptionCheck()) {
         return JNI_FALSE;
     }
+    std::vector<float> uniformValues(static_cast<size_t>(expectedUniforms));
+    if (expectedUniforms > 0) {
+        env->GetFloatArrayRegion(passUniforms, 0, expectedUniforms, uniformValues.data());
+        if (env->ExceptionCheck()) {
+            return JNI_FALSE;
+        }
+    }
     bool gpuUsed = false;
     if (!renderInteropFrame(g_interopRenderer, values, cameraX, cameraY, cameraZ, renderDistance,
-            static_cast<UINT64>(frameIndex), useGpuSynchronization == JNI_TRUE, env, &gpuUsed)) {
+            static_cast<UINT64>(frameIndex), elapsedSeconds,
+            uniformValues.empty() ? nullptr : uniformValues.data(),
+            useGpuSynchronization == JNI_TRUE, env, &gpuUsed)) {
         return JNI_FALSE;
     }
     return gpuUsed ? JNI_TRUE : JNI_FALSE;

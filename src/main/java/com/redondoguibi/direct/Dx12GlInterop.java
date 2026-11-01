@@ -26,6 +26,12 @@ import org.lwjgl.opengl.WGLCapabilities;
 import org.lwjgl.opengl.WGLNVDXInterop;
 import org.lwjgl.system.MemoryStack;
 
+import com.redondoguibi.direct.api.DirectFrameContext;
+import com.redondoguibi.direct.api.DirectFrameRenderEvent;
+import com.redondoguibi.direct.api.DirectRenderApi;
+import com.redondoguibi.direct.api.DirectRenderCapabilities;
+import com.redondoguibi.direct.api.DirectRenderPass;
+
 public final class Dx12GlInterop {
     private static final int[] NO_OBJECTS = new int[0];
     private static final int MAX_ATLAS_LEVELS = 16;
@@ -74,6 +80,7 @@ public final class Dx12GlInterop {
     private static long interopDevice;
     private static long interopObject;
     private static long frameIndex;
+    private static long startedAtNanos;
     private static int texture;
     private static int vertexArray;
     private static int program;
@@ -96,9 +103,9 @@ public final class Dx12GlInterop {
         matricesCaptured = true;
     }
 
-    public static void renderBeforeGui() {
+    public static void renderTerrainOverlay() {
         if (!reportedHook) {
-            Direct.LOGGER.info("DX12/OpenGL interop pre-GUI render hook reached.");
+            Direct.LOGGER.info("DX12/OpenGL interop terrain composite hook reached.");
             reportedHook = true;
         }
         boolean captured = matricesCaptured;
@@ -107,6 +114,7 @@ public final class Dx12GlInterop {
             disableTerrainCapture();
             shutdown();
             disabled = false;
+            DirectStatusOverlay.setStatus("Vanilla (disabled in config)");
             return;
         }
         if (disabled) {
@@ -121,6 +129,8 @@ public final class Dx12GlInterop {
                             + "vanilla rendering remains active.");
                     reportedUnsupported = true;
                 }
+                DirectRenderApi.updateCapabilities(DirectRenderCapabilities.unavailable());
+                DirectStatusOverlay.setStatus("Vanilla (WGL interop unavailable)");
                 disabled = true;
                 disableTerrainCapture();
                 return;
@@ -164,8 +174,28 @@ public final class Dx12GlInterop {
                 throw new IllegalStateException("DX12/OpenGL interop fence timeline has exhausted its frame values.");
             }
             long dxReadyValue = frameIndex + 1;
+            float elapsedSeconds = (System.nanoTime() - startedAtNanos) / 1_000_000_000.0f;
+            DirectFrameContext frameContext = DirectRenderApi.frame(frameIndex, currentWidth, currentHeight,
+                    elapsedSeconds, minecraft.options.getEffectiveRenderDistance() * 16.0f);
+            DirectRenderEventBridge.postFrame(new DirectFrameRenderEvent(
+                    DirectFrameRenderEvent.Stage.BEFORE_PASSES, frameContext));
+            List<DirectRenderPass> passes = DirectRenderApi.snapshot();
+            if (DirectRenderApi.consumeDirty()) {
+                NativeDx12.configureRenderPasses(passes.stream()
+                        .map(DirectRenderPass::pixelShaderSource).toArray(String[]::new));
+            }
+            float[] passUniforms = new float[passes.size() * DirectRenderApi.MAX_UNIFORM_FLOATS];
+            for (int index = 0; index < passes.size(); index++) {
+                DirectRenderPass pass = passes.get(index);
+                DirectFrameContext passContext = DirectRenderApi.frame(frameIndex, currentWidth, currentHeight,
+                        elapsedSeconds, minecraft.options.getEffectiveRenderDistance() * 16.0f,
+                        pass.id(), index);
+                float[] values = DirectRenderApi.uniformValues(pass, passContext);
+                System.arraycopy(values, 0, passUniforms, index * DirectRenderApi.MAX_UNIFORM_FLOATS, values.length);
+            }
             boolean nativeGpu = NativeDx12.renderInterop(MATRIX, cameraX, cameraY, cameraZ,
-                    minecraft.options.getEffectiveRenderDistance() * 16.0f, frameIndex, gpuSemaphoreInterop);
+                    minecraft.options.getEffectiveRenderDistance() * 16.0f, frameIndex,
+                    elapsedSeconds, passUniforms, gpuSemaphoreInterop);
             if (gpuSemaphoreInterop && !nativeGpu) {
                 disableGpuSemaphore("The native command queue could not enqueue a GPU-side fence wait; "
                         + "using CPU fence waits.");
@@ -180,11 +210,16 @@ public final class Dx12GlInterop {
                 throw new IllegalStateException("The D3D12 fence missed its deadline or the device was removed.");
             }
             drawImportedTexture(frameUsesGpuSemaphore, frameIndex);
+            DirectRenderEventBridge.postFrame(new DirectFrameRenderEvent(
+                    DirectFrameRenderEvent.Stage.AFTER_PASSES, frameContext));
             frameIndex++;
-        } catch (IOException | IllegalStateException | UnsatisfiedLinkError exception) {
+            DirectStatusOverlay.setStatus(gpuSemaphoreInterop ? "D3D12 / GPU sync" : "D3D12 / CPU fallback");
+        } catch (IOException | RuntimeException | UnsatisfiedLinkError exception) {
             Direct.LOGGER.error("DX12/OpenGL interop failed; retaining vanilla rendering.", exception);
             shutdown();
             disableTerrainCapture();
+            DirectRenderApi.updateCapabilities(DirectRenderCapabilities.unavailable());
+            DirectStatusOverlay.setStatus("Vanilla (renderer error)");
             disabled = true;
         }
     }
@@ -220,9 +255,11 @@ public final class Dx12GlInterop {
             NativeDx12.shutdownInterop();
             initialized = false;
         }
+        DirectRenderApi.updateCapabilities(DirectRenderCapabilities.unavailable());
         width = 0;
         height = 0;
         frameIndex = 0;
+        startedAtNanos = 0;
         blockAtlasId = -1;
     }
 
@@ -251,12 +288,20 @@ public final class Dx12GlInterop {
         }
         registerTexture(handles[1]);
         initializeGpuSemaphore(handles[2], handles[3]);
+        String adapterName = NativeDx12.interopAdapterName();
+        int featureFlags = NativeDx12.interopFeatureFlags();
+        DirectRenderApi.updateCapabilities(new DirectRenderCapabilities("Direct3D 12",
+                adapterName == null || adapterName.isBlank() ? "unknown" : adapterName,
+                (featureFlags & 1) != 0, true, true, (featureFlags & 2) != 0, (featureFlags & 4) != 0,
+                (featureFlags & 8) != 0, gpuSemaphoreInterop, true, false));
+        DirectStatusOverlay.setStatus("D3D12 / initializing");
         program = createProgram();
         sourceTextureUniform = GL20.glGetUniformLocation(program, "sourceTexture");
         vertexArray = GL30.glGenVertexArrays();
         width = frameWidth;
         height = frameHeight;
         frameIndex = 0;
+        startedAtNanos = System.nanoTime();
     }
 
     private static void resize(int frameWidth, int frameHeight) {

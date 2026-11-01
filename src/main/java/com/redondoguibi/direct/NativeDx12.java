@@ -6,20 +6,19 @@ final class NativeDx12 {
     private NativeDx12() {
     }
 
-    static native void initialize(long hwnd, int width, int height, String[] shaders);
-
-    static native void resize(int width, int height);
-
-    static native void render(float timeSeconds, int width, int height, float[][] uniforms, ByteBuffer rgba);
-
-    static native void shutdown();
-
     static native long[] initializeInterop(int width, int height);
 
     static native long resizeInterop(int width, int height);
 
+    static native void configureRenderPasses(String[] pixelShaderSources);
+
     static native boolean renderInterop(float[] viewProjection, double cameraX, double cameraY, double cameraZ,
-            float renderDistance, long frameIndex, boolean useGpuSynchronization);
+            float renderDistance, long frameIndex, float elapsedSeconds, float[] passUniforms,
+            boolean useGpuSynchronization);
+
+    static native String interopAdapterName();
+
+    static native int interopFeatureFlags();
 
     static native void waitInteropFence(long value);
 

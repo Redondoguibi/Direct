@@ -3,10 +3,8 @@
   "package": "com.redondoguibi.direct.mixin",
   "compatibilityLevel": "JAVA_21",
   "client": [
-    "GuiMixin",
     "LevelRendererMixin",
     "RenderSectionMixin",
-    "RenderSystemMixin",
     "SectionCompilerMixin",
     "TextureAtlasMixin",
     "WindowMixin"
