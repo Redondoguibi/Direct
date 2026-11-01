@@ -52,12 +52,14 @@ public final class Dx12GlInterop {
             in vec2 texCoord;
             out vec4 color;
             void main() {
-                color = texture(sourceTexture, texCoord);
+                // D3D textures use a top-left row origin; flip V when sampling in the GL compositor.
+                color = texture(sourceTexture, vec2(texCoord.x, 1.0 - texCoord.y));
             }
             """;
 
-    // Converte clip GL (y para cima, z em [-w, w]) para clip D3D (z em [0, w]); o flip em Y alinha as linhas.
-    private static final Matrix4f CLIP_CORRECTION = new Matrix4f().m11(-1.0f).m22(0.5f).m32(0.5f);
+    // GL e D3D projetam NDC +Y para o topo da viewport; apenas o intervalo Z precisa de conversão.
+    // O winding CW do D3D é configurado no PSO para o sistema de coordenadas da viewport.
+    private static final Matrix4f CLIP_CORRECTION = new Matrix4f().m22(0.5f).m32(0.5f);
     private static final Matrix4f CAPTURED_VIEW = new Matrix4f();
     private static final Matrix4f CAPTURED_PROJECTION = new Matrix4f();
     private static final Matrix4f VIEW_PROJECTION = new Matrix4f();
@@ -104,6 +106,12 @@ public final class Dx12GlInterop {
     private Dx12GlInterop() {
     }
 
+    private static final class UnsupportedGpuSemaphoreException extends IllegalStateException {
+        private UnsupportedGpuSemaphoreException(String message) {
+            super(message);
+        }
+    }
+
     /** Chamado pelo LevelRendererMixin com as matrizes reais do frame. */
     public static void captureLevelMatrices(Camera camera, Matrix4f viewRotation, Matrix4f projection) {
         CAPTURED_VIEW.set(viewRotation);
@@ -113,6 +121,14 @@ public final class Dx12GlInterop {
         cameraY = position.y;
         cameraZ = position.z;
         matricesCaptured = true;
+    }
+
+    /**
+     * Replacement mode draws Direct before vanilla's base terrain layers so they can be skipped.
+     * Preview mode draws after all three layers to avoid vanilla overwriting the Direct composite.
+     */
+    public static boolean shouldCompositeBeforeVanilla() {
+        return ClientConfig.REPLACE_VANILLA_TERRAIN.get();
     }
 
     public static void renderTerrainOverlay() {
@@ -277,12 +293,16 @@ public final class Dx12GlInterop {
             retryAfterNanos = 0;
             DirectStatusOverlay.setStatus(frameUsesGpuSemaphore ? "D3D12 / GPU sync" : "D3D12 / CPU fallback");
         } catch (IOException | RuntimeException | UnsatisfiedLinkError exception) {
+            boolean unsupportedGpuSemaphore = exception instanceof UnsupportedGpuSemaphoreException;
             Direct.LOGGER.error("DX12/OpenGL interop failed; retaining vanilla rendering.", exception);
             shutdown();
             disableTerrainCapture();
             DirectRenderApi.updateCapabilities(DirectRenderCapabilities.unavailable());
-            retryAfterNanos = System.nanoTime() + RETRY_DELAY_NANOS;
-            DirectStatusOverlay.setStatus("Vanilla (retrying after renderer error)");
+            disabled = unsupportedGpuSemaphore;
+            retryAfterNanos = unsupportedGpuSemaphore ? 0 : System.nanoTime() + RETRY_DELAY_NANOS;
+            DirectStatusOverlay.setStatus(unsupportedGpuSemaphore
+                    ? "Vanilla (D3D12 fence import unsupported)"
+                    : "Vanilla (retrying after renderer error)");
         }
     }
 
@@ -369,7 +389,9 @@ public final class Dx12GlInterop {
             throw new IllegalStateException("WGL_NV_DX_interop2 could not open the D3D11On12 device.");
         }
         registerTexture(handles[1]);
-        initializeGpuSemaphore(handles[2], handles[3]);
+        if (ClientConfig.USE_GPU_SEMAPHORE_SYNC.get()) {
+            initializeGpuSemaphore(handles[2], handles[3]);
+        }
         String adapterName = NativeDx12.interopAdapterName();
         int featureFlags = NativeDx12.interopFeatureFlags();
         DirectRenderApi.updateCapabilities(new DirectRenderCapabilities("Direct3D 12",
@@ -640,9 +662,11 @@ public final class Dx12GlInterop {
         if (error != GL11.GL_NO_ERROR) {
             EXTSemaphore.glDeleteSemaphoresEXT(readySemaphore);
             EXTSemaphore.glDeleteSemaphoresEXT(doneSemaphore);
-            disableGpuSemaphore("Could not import the shared D3D12 fence into OpenGL (GL error 0x"
-                    + Integer.toHexString(error) + "); using CPU fence waits.");
-            return;
+            String reason = "The OpenGL driver rejected the shared D3D12 fence import (GL error 0x"
+                    + Integer.toHexString(error) + "). The native renderer is unsafe on this driver; "
+                    + "Direct will keep vanilla rendering active for this session.";
+            disableGpuSemaphore(reason);
+            throw new UnsupportedGpuSemaphoreException(reason);
         }
         interopSemaphore = readySemaphore;
         glDoneSemaphore = doneSemaphore;

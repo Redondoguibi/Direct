@@ -32,15 +32,33 @@ abstract class LevelRendererMixin {
         Dx12GlInterop.captureLevelMatrices(camera, frustumMatrix, projectionMatrix);
     }
 
+    // Replacement mode must draw Direct before vanilla's first base layer, so those layers can be skipped.
     @Inject(method = "renderLevel",
             at = @At(value = "INVOKE",
                     target = "Lnet/minecraft/client/renderer/LevelRenderer;renderSectionLayer("
                             + "Lnet/minecraft/client/renderer/RenderType;DDDLorg/joml/Matrix4f;"
                             + "Lorg/joml/Matrix4f;)V",
                     ordinal = 0, shift = At.Shift.BEFORE))
-    private void direct$compositeTerrain(DeltaTracker deltaTracker, boolean renderBlockOutline, Camera camera,
-            GameRenderer gameRenderer, LightTexture lightTexture, Matrix4f frustumMatrix,
+    private void direct$compositeBeforeVanillaReplacement(DeltaTracker deltaTracker, boolean renderBlockOutline,
+            Camera camera, GameRenderer gameRenderer, LightTexture lightTexture, Matrix4f frustumMatrix,
             Matrix4f projectionMatrix, CallbackInfo callback) {
-        Dx12GlInterop.renderTerrainOverlay();
+        if (Dx12GlInterop.shouldCompositeBeforeVanilla()) {
+            Dx12GlInterop.renderTerrainOverlay();
+        }
+    }
+
+    // Preview mode keeps vanilla solid/cutout layers; composite Direct after the third (cutout) layer.
+    @Inject(method = "renderLevel",
+            at = @At(value = "INVOKE",
+                    target = "Lnet/minecraft/client/renderer/LevelRenderer;renderSectionLayer("
+                            + "Lnet/minecraft/client/renderer/RenderType;DDDLorg/joml/Matrix4f;"
+                            + "Lorg/joml/Matrix4f;)V",
+                    ordinal = 2, shift = At.Shift.AFTER))
+    private void direct$compositeAfterVanillaBaseLayers(DeltaTracker deltaTracker, boolean renderBlockOutline,
+            Camera camera, GameRenderer gameRenderer, LightTexture lightTexture, Matrix4f frustumMatrix,
+            Matrix4f projectionMatrix, CallbackInfo callback) {
+        if (!Dx12GlInterop.shouldCompositeBeforeVanilla()) {
+            Dx12GlInterop.renderTerrainOverlay();
+        }
     }
 }

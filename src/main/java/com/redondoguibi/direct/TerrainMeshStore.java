@@ -7,8 +7,6 @@ import java.util.HashMap;
 import java.util.Map;
 
 import com.mojang.blaze3d.systems.RenderSystem;
-import org.lwjgl.system.MemoryUtil;
-
 import com.mojang.blaze3d.vertex.DefaultVertexFormat;
 import com.mojang.blaze3d.vertex.MeshData;
 import com.mojang.blaze3d.vertex.VertexFormat;
@@ -24,8 +22,6 @@ import net.minecraft.core.SectionPos;
 public final class TerrainMeshStore {
     // Precisa bater com o input layout nativo: posição uint16 x4, cor RGBA8, UV unorm16 x2.
     private static final int OUTPUT_VERTEX_SIZE = 16;
-    private static final float POSITION_SCALE = 1024.0f;
-    private static final float POSITION_ORIGIN = -16.0f;
     private static final int LAYER_COUNT = 3;
     private static final Object LOCK = new Object();
     // Coalesce pending work by section; guarded by LOCK with VERSIONS and generation.
@@ -282,16 +278,6 @@ public final class TerrainMeshStore {
         }
     }
 
-    /** Posição local da seção em [-16, 48) com precisão de 1/1024 de bloco. */
-    private static short packPosition(float value) {
-        int packed = Math.round((value - POSITION_ORIGIN) * POSITION_SCALE);
-        return (short) Math.max(0, Math.min(0xFFFF, packed));
-    }
-
-    private static short packUnorm16(float value) {
-        return (short) Math.round(Math.max(0.0f, Math.min(1.0f, value)) * 0xFFFF);
-    }
-
     private static RenderType[] supportedLayers() {
         RenderType[] cached = layers;
         if (cached == null) {
@@ -319,7 +305,8 @@ public final class TerrainMeshStore {
         boolean validIndices = indexBuffer == null
                 ? TerrainIndexPacker.hasValidSequentialQuadIndices(drawState.vertexCount(), drawState.indexCount())
                 : (long) drawState.indexCount() * indexSize <= indexBuffer.remaining();
-        return stride > 0 && positionOffset >= 0 && colorOffset >= 0 && uvOffset >= 0
+        return drawState.vertexCount() >= 0 && drawState.indexCount() >= 0
+                && stride > 0 && positionOffset >= 0 && colorOffset >= 0 && uvOffset >= 0
                 && positionOffset + 3 * Float.BYTES <= stride
                 && colorOffset + Integer.BYTES <= stride
                 && uvOffset + 2 * Float.BYTES <= stride
@@ -330,42 +317,9 @@ public final class TerrainMeshStore {
 
     private static void packVertices(ByteBuffer destination, ByteBuffer source, MeshData.DrawState drawState) {
         VertexFormat format = drawState.format();
-        int stride = format.getVertexSize();
-        int positionOffset = format.getOffset(VertexFormatElement.POSITION);
-        int colorOffset = format.getOffset(VertexFormatElement.COLOR);
-        int uvOffset = format.getOffset(VertexFormatElement.UV0);
-        int vertexCount = drawState.vertexCount();
-        if (destination.isDirect() && source.isDirect()) {
-            long src = MemoryUtil.memAddress(source) + source.position();
-            long dest = MemoryUtil.memAddress(destination) + destination.position();
-            for (int vertex = 0; vertex < vertexCount; vertex++) {
-                long offset = src + (long) vertex * stride;
-                MemoryUtil.memPutShort(dest, packPosition(MemoryUtil.memGetFloat(offset + positionOffset)));
-                MemoryUtil.memPutShort(dest + 2,
-                        packPosition(MemoryUtil.memGetFloat(offset + positionOffset + Float.BYTES)));
-                MemoryUtil.memPutShort(dest + 4,
-                        packPosition(MemoryUtil.memGetFloat(offset + positionOffset + 2 * Float.BYTES)));
-                MemoryUtil.memPutShort(dest + 6, (short) 0);
-                MemoryUtil.memPutInt(dest + 8, MemoryUtil.memGetInt(offset + colorOffset));
-                MemoryUtil.memPutShort(dest + 12, packUnorm16(MemoryUtil.memGetFloat(offset + uvOffset)));
-                MemoryUtil.memPutShort(dest + 14,
-                        packUnorm16(MemoryUtil.memGetFloat(offset + uvOffset + Float.BYTES)));
-                dest += OUTPUT_VERTEX_SIZE;
-            }
-            destination.position(destination.position() + vertexCount * OUTPUT_VERTEX_SIZE);
-            return;
-        }
-        ByteBuffer sourceVertices = source.duplicate().order(ByteOrder.nativeOrder());
-        for (int vertex = 0; vertex < vertexCount; vertex++) {
-            int offset = sourceVertices.position() + vertex * stride;
-            destination.putShort(packPosition(sourceVertices.getFloat(offset + positionOffset)));
-            destination.putShort(packPosition(sourceVertices.getFloat(offset + positionOffset + Float.BYTES)));
-            destination.putShort(packPosition(sourceVertices.getFloat(offset + positionOffset + 2 * Float.BYTES)));
-            destination.putShort((short) 0);
-            destination.putInt(sourceVertices.getInt(offset + colorOffset));
-            destination.putShort(packUnorm16(sourceVertices.getFloat(offset + uvOffset)));
-            destination.putShort(packUnorm16(sourceVertices.getFloat(offset + uvOffset + Float.BYTES)));
-        }
+        TerrainBufferPacker.packVertices(destination, source, drawState.vertexCount(), format.getVertexSize(),
+                format.getOffset(VertexFormatElement.POSITION), format.getOffset(VertexFormatElement.COLOR),
+                format.getOffset(VertexFormatElement.UV0));
     }
 
     private static void packIndices(ByteBuffer destination, ByteBuffer source, MeshData.DrawState drawState,
@@ -376,33 +330,7 @@ public final class TerrainMeshStore {
             TerrainIndexPacker.packSequentialQuadIndices(destination, indexCount, vertexBase);
             return;
         }
-        if (destination.isDirect() && source.isDirect()) {
-            long src = MemoryUtil.memAddress(source) + source.position();
-            long dest = MemoryUtil.memAddress(destination) + destination.position();
-            if (indexSize == Short.BYTES) {
-                for (int index = 0; index < indexCount; index++) {
-                    MemoryUtil.memPutInt(dest, Short.toUnsignedInt(MemoryUtil.memGetShort(src)) + vertexBase);
-                    src += Short.BYTES;
-                    dest += Integer.BYTES;
-                }
-            } else {
-                for (int index = 0; index < indexCount; index++) {
-                    MemoryUtil.memPutInt(dest, MemoryUtil.memGetInt(src) + vertexBase);
-                    src += Integer.BYTES;
-                    dest += Integer.BYTES;
-                }
-            }
-            destination.position(destination.position() + indexCount * Integer.BYTES);
-            return;
-        }
-        ByteBuffer sourceIndices = source.duplicate().order(ByteOrder.nativeOrder());
-        for (int index = 0; index < indexCount; index++) {
-            int sourceIndex = sourceIndices.position() + index * indexSize;
-            int value = indexSize == Short.BYTES
-                    ? Short.toUnsignedInt(sourceIndices.getShort(sourceIndex))
-                    : sourceIndices.getInt(sourceIndex);
-            destination.putInt(value + vertexBase);
-        }
+        TerrainBufferPacker.packIndices(destination, source, indexCount, indexSize, vertexBase);
     }
 
     private static void publish(long captureGeneration, long captureVersion, SectionMesh mesh) {

@@ -70,7 +70,8 @@ VertexOutput vsMain(VertexInput input) {
     float3 local = float3(input.position.xyz) * (1.0 / 1024.0) - 16.0;
     output.position = mul(viewProjection, float4(local + sectionOffset, 1.0));
     output.color = input.color;
-    output.uv = input.uv;
+    // OpenGL glGetTexImage returns atlas rows from bottom to top; D3D12 samples from the top row.
+    output.uv = float2(input.uv.x, 1.0 - input.uv.y);
     return output;
 }
 float4 psMain(VertexOutput input) : SV_Target {
@@ -959,7 +960,7 @@ bool createTerrainPipelines(InteropRenderer* renderer, JNIEnv* env) {
     description.BlendState.RenderTarget[0].BlendOpAlpha = D3D12_BLEND_OP_ADD;
     description.BlendState.RenderTarget[0].LogicOp = D3D12_LOGIC_OP_NOOP;
     description.SampleMask = UINT_MAX;
-    // GL usa CCW como frente; o flip em Y da matriz de correção transforma isso em CW no D3D.
+    // Preserve the original terrain winding convention used by the D3D12 pipeline.
     description.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
     description.RasterizerState.CullMode = D3D12_CULL_MODE_BACK;
     description.RasterizerState.FrontCounterClockwise = FALSE;
