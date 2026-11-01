@@ -10,7 +10,8 @@ final class NativeDx12 {
     private NativeDx12() {
     }
 
-    static native long[] initializeInterop(int width, int height);
+    static native long[] initializeInterop(int width, int height, boolean parallelSectionRecording,
+            int uploadRingBufferMiB, int terrainArenaPageMiB, int maxTerrainArenaMiB);
 
     static native long resizeInterop(int width, int height);
 
@@ -18,7 +19,7 @@ final class NativeDx12 {
 
     static native int renderInterop(float[] viewProjection, double cameraX, double cameraY, double cameraZ,
             float renderDistance, long frameIndex, float elapsedSeconds, float[] passUniforms,
-            boolean useGpuSynchronization);
+            boolean useGpuSynchronization, boolean useExecuteIndirect);
 
     static native String interopAdapterName();
 
@@ -35,7 +36,8 @@ final class NativeDx12 {
     static native void updateTerrainSection(long key, int sectionX, int sectionY, int sectionZ,
             ByteBuffer vertices, int vertexCount, ByteBuffer indices, int[] layerIndexCounts);
 
-    static native void updateTerrainAtlas(ByteBuffer[] mipLevels, int width, int height, boolean compressBc7);
+    static native void updateTerrainAtlas(ByteBuffer[] mipLevels, int width, int height, boolean compressBc7,
+            int bc7EncoderThreads);
 
     static native void removeTerrainSection(long key);
 

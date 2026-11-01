@@ -18,11 +18,20 @@ public final class DirectRenderApi implements DirectRenderService {
     public static final int MAX_PASSES = 8;
     /** Number of packed float components reserved for each pass's HLSL uniform buffer. */
     public static final int MAX_UNIFORM_FLOATS = 60;
+
+    /**
+     * Immutable, versioned snapshot used to keep Java and native pass configuration in sync.
+     *
+     * @param revision monotonically increasing pass-set revision
+     * @param passes immutable passes in execution order
+     */
+    public record PassSnapshot(long revision, List<DirectRenderPass> passes) {
+    }
     private static final Pattern PASS_ID = Pattern.compile("[a-z0-9_.-]{1,96}");
     private static final DirectRenderApi INSTANCE = new DirectRenderApi();
     private final ConcurrentHashMap<String, DirectRenderPass> passes = new ConcurrentHashMap<>();
     private final AtomicBoolean dirty = new AtomicBoolean(true);
-    private volatile List<DirectRenderPass> orderedPasses = List.of();
+    private volatile PassSnapshot passSnapshot = new PassSnapshot(0L, List.of());
     private volatile DirectRenderCapabilities capabilities = DirectRenderCapabilities.unavailable();
 
     private DirectRenderApi() {
@@ -43,7 +52,16 @@ public final class DirectRenderApi implements DirectRenderService {
      * @return registered passes
      */
     public static List<DirectRenderPass> snapshot() {
-        return INSTANCE.passes();
+        return INSTANCE.passSnapshot.passes();
+    }
+
+    /**
+     * Returns the pass list and its revision as one atomic immutable snapshot.
+     *
+     * @return atomic immutable pass snapshot
+     */
+    public static PassSnapshot snapshotState() {
+        return INSTANCE.passSnapshot;
     }
 
     /**
@@ -57,7 +75,10 @@ public final class DirectRenderApi implements DirectRenderService {
 
     /** Marks the current pass set for native pipeline reconfiguration. */
     public static void markDirty() {
-        INSTANCE.dirty.set(true);
+        synchronized (INSTANCE) {
+            INSTANCE.refreshOrderedPasses();
+            INSTANCE.dirty.set(true);
+        }
     }
 
     /**
@@ -194,12 +215,13 @@ public final class DirectRenderApi implements DirectRenderService {
 
     @Override
     public List<DirectRenderPass> passes() {
-        return orderedPasses;
+        return passSnapshot.passes();
     }
 
     private void refreshOrderedPasses() {
-        ArrayList<DirectRenderPass> snapshot = new ArrayList<>(passes.values());
-        snapshot.sort(Comparator.comparingInt(DirectRenderPass::order).thenComparing(DirectRenderPass::id));
-        orderedPasses = List.copyOf(snapshot);
+        ArrayList<DirectRenderPass> ordered = new ArrayList<>(passes.values());
+        ordered.sort(Comparator.comparingInt(DirectRenderPass::order).thenComparing(DirectRenderPass::id));
+        PassSnapshot current = passSnapshot;
+        passSnapshot = new PassSnapshot(current.revision() + 1L, List.copyOf(ordered));
     }
 }

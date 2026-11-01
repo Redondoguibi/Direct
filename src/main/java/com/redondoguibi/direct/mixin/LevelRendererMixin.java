@@ -13,9 +13,18 @@ import net.minecraft.client.DeltaTracker;
 import net.minecraft.client.renderer.GameRenderer;
 import net.minecraft.client.renderer.LevelRenderer;
 import net.minecraft.client.renderer.LightTexture;
+import net.minecraft.client.renderer.RenderType;
 
 @Mixin(LevelRenderer.class)
 abstract class LevelRendererMixin {
+    @Inject(method = "renderSectionLayer", at = @At("HEAD"), cancellable = true)
+    private void direct$replaceVanillaBaseLayers(RenderType renderType, double x, double y, double z,
+            Matrix4f frustumMatrix, Matrix4f projectionMatrix, CallbackInfo callback) {
+        if (Dx12GlInterop.shouldSkipVanillaLayer(renderType)) {
+            callback.cancel();
+        }
+    }
+
     @Inject(method = "renderLevel", at = @At("HEAD"))
     private void direct$captureMatrices(DeltaTracker deltaTracker, boolean renderBlockOutline, Camera camera,
             GameRenderer gameRenderer, LightTexture lightTexture, Matrix4f frustumMatrix,
@@ -28,7 +37,7 @@ abstract class LevelRendererMixin {
                     target = "Lnet/minecraft/client/renderer/LevelRenderer;renderSectionLayer("
                             + "Lnet/minecraft/client/renderer/RenderType;DDDLorg/joml/Matrix4f;"
                             + "Lorg/joml/Matrix4f;)V",
-                    ordinal = 2, shift = At.Shift.AFTER))
+                    ordinal = 0, shift = At.Shift.BEFORE))
     private void direct$compositeTerrain(DeltaTracker deltaTracker, boolean renderBlockOutline, Camera camera,
             GameRenderer gameRenderer, LightTexture lightTexture, Matrix4f frustumMatrix,
             Matrix4f projectionMatrix, CallbackInfo callback) {

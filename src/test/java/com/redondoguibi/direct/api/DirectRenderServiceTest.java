@@ -51,6 +51,22 @@ class DirectRenderServiceTest {
     }
 
     @Test
+    void passSnapshotPublishesTheListAndRevisionTogether() {
+        DirectRenderApi.PassSnapshot before = DirectRenderApi.snapshotState();
+        DirectRenderPass registered = pass("example.snapshot", 0);
+
+        service.registerPass(registered);
+
+        DirectRenderApi.PassSnapshot after = DirectRenderApi.snapshotState();
+        assertTrue(after.revision() > before.revision());
+        assertTrue(after.passes().stream().anyMatch(candidate -> candidate.id().equals("example.snapshot")));
+        assertEquals(after.passes(), DirectRenderApi.snapshot());
+
+        assertTrue(service.unregisterPass("example.snapshot"));
+        assertTrue(DirectRenderApi.snapshotState().revision() > after.revision());
+    }
+
+    @Test
     void rejectsInvalidIdsAndTooManyUniforms() {
         assertThrows(IllegalArgumentException.class, () -> service.registerPass(pass("../escape", 0)));
         DirectRenderPass invalidUniforms = new DirectRenderPass() {

@@ -1,5 +1,6 @@
 #include <windows.h>
 #include <d3d12.h>
+#include <d3dcompiler.h>
 #include <dxgi1_4.h>
 #include <cstdio>
 
@@ -11,6 +12,10 @@ int main() {
     ID3D12CommandAllocator* allocator = nullptr;
     ID3D12GraphicsCommandList* commandList = nullptr;
     ID3D12Fence* fence = nullptr;
+    ID3D12RootSignature* rootSignature = nullptr;
+    ID3D12CommandSignature* indirectSignature = nullptr;
+    ID3DBlob* serializedRootSignature = nullptr;
+    ID3DBlob* serializationErrors = nullptr;
     HANDLE event = nullptr;
     int result = 1;
 
@@ -34,6 +39,57 @@ int main() {
             goto cleanup;
         }
     }
+    {
+        D3D12_DESCRIPTOR_RANGE atlasRange = {};
+        atlasRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+        atlasRange.NumDescriptors = 64;
+        atlasRange.BaseShaderRegister = 0;
+        atlasRange.OffsetInDescriptorsFromTableStart = 0;
+
+        D3D12_ROOT_PARAMETER parameters[3] = {};
+        parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+        parameters[0].Constants.ShaderRegister = 0;
+        parameters[0].Constants.Num32BitValues = 16;
+        parameters[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
+        parameters[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+        parameters[1].Constants.ShaderRegister = 1;
+        parameters[1].Constants.Num32BitValues = 5;
+        parameters[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+        parameters[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        parameters[2].DescriptorTable.NumDescriptorRanges = 1;
+        parameters[2].DescriptorTable.pDescriptorRanges = &atlasRange;
+
+        D3D12_ROOT_SIGNATURE_DESC rootDescription = {};
+        rootDescription.NumParameters = ARRAYSIZE(parameters);
+        rootDescription.pParameters = parameters;
+        rootDescription.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
+        if (FAILED(D3D12SerializeRootSignature(&rootDescription, D3D_ROOT_SIGNATURE_VERSION_1,
+                    &serializedRootSignature, &serializationErrors))
+                || FAILED(device->CreateRootSignature(0, serializedRootSignature->GetBufferPointer(),
+                    serializedRootSignature->GetBufferSize(), IID_PPV_ARGS(&rootSignature)))) {
+            std::fprintf(stderr, "D3D12 terrain root signature creation failed.\\n");
+            goto cleanup;
+        }
+
+        D3D12_INDIRECT_ARGUMENT_DESC arguments[4] = {};
+        arguments[0].Type = D3D12_INDIRECT_ARGUMENT_TYPE_VERTEX_BUFFER_VIEW;
+        arguments[0].VertexBuffer.Slot = 0;
+        arguments[1].Type = D3D12_INDIRECT_ARGUMENT_TYPE_INDEX_BUFFER_VIEW;
+        arguments[2].Type = D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT;
+        arguments[2].Constant.RootParameterIndex = 1;
+        arguments[2].Constant.DestOffsetIn32BitValues = 0;
+        arguments[2].Constant.Num32BitValuesToSet = 5;
+        arguments[3].Type = D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED;
+        D3D12_COMMAND_SIGNATURE_DESC commandDescription = {};
+        commandDescription.ByteStride = 72;
+        commandDescription.NumArgumentDescs = ARRAYSIZE(arguments);
+        commandDescription.pArgumentDescs = arguments;
+        if (FAILED(device->CreateCommandSignature(&commandDescription, rootSignature,
+                IID_PPV_ARGS(&indirectSignature)))) {
+            std::fprintf(stderr, "D3D12 ExecuteIndirect command signature creation failed.\\n");
+            goto cleanup;
+        }
+    }
     event = CreateEvent(nullptr, FALSE, FALSE, nullptr);
     if (event == nullptr || FAILED(queue->Signal(fence, 1))
             || FAILED(fence->SetEventOnCompletion(1, event))
@@ -42,10 +98,14 @@ int main() {
         std::fprintf(stderr, "D3D12 queue/fence smoke synchronization failed.\n");
         goto cleanup;
     }
-    std::puts("D3D12 WARP device, direct command list, queue, and fence passed.");
+    std::puts("D3D12 WARP device, root signature, ExecuteIndirect signature, command list, queue, and fence passed.");
     result = 0;
 
 cleanup:
+    if (serializationErrors != nullptr) serializationErrors->Release();
+    if (serializedRootSignature != nullptr) serializedRootSignature->Release();
+    if (indirectSignature != nullptr) indirectSignature->Release();
+    if (rootSignature != nullptr) rootSignature->Release();
     if (event != nullptr) {
         CloseHandle(event);
     }

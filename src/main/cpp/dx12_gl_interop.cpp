@@ -14,6 +14,8 @@
 #include <cstring>
 #include <deque>
 #include <limits>
+#include <map>
+#include <iterator>
 #include <mutex>
 #include <string>
 #include <system_error>
@@ -40,6 +42,8 @@ constexpr float kSectionRadius = 13.8564f; // sqrt(3) * 8
 constexpr float kClearColor[4] = {0.0f, 0.0f, 0.0f, 0.0f};
 constexpr DXGI_FORMAT kColorFormat = DXGI_FORMAT_R8G8B8A8_UNORM;
 constexpr DXGI_FORMAT kDepthFormat = DXGI_FORMAT_D32_FLOAT;
+constexpr D3D12_RESOURCE_STATES kTerrainBufferState = D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER
+        | D3D12_RESOURCE_STATE_INDEX_BUFFER;
 // Ordem das camadas: solid, cutout_mipped, cutout (confirmar nos .fsh vanilla).
 constexpr float kLayerAlphaCutoff[kLayerCount] = {-1.0f, 0.5f, 0.1f};
 
@@ -78,13 +82,24 @@ float4 psMain(VertexOutput input) : SV_Target {
 }
 )";
 
+struct ArenaPage {
+    ID3D12Resource* resource;
+    UINT64 capacity;
+    D3D12_RESOURCE_STATES state;
+    bool uploadQueued;
+    std::map<UINT64, UINT64> freeRanges;
+};
+
 struct TerrainSection {
+    jlong key;
     int x;
     int y;
     int z;
     UINT layerIndexCounts[kLayerCount];
     UINT layerStart[kLayerCount];
-    ID3D12Resource* buffer;
+    ArenaPage* page;
+    UINT64 allocationOffset;
+    UINT64 allocationSize;
     D3D12_VERTEX_BUFFER_VIEW vertexView;
     D3D12_INDEX_BUFFER_VIEW indexView;
 };
@@ -94,9 +109,24 @@ struct VisibleSection {
     float offset[3];
 };
 
+struct TerrainIndirectCommand {
+    D3D12_VERTEX_BUFFER_VIEW vertexView;
+    D3D12_INDEX_BUFFER_VIEW indexView;
+    UINT constants[kDrawConstantCount];
+    D3D12_DRAW_INDEXED_ARGUMENTS draw;
+};
+static_assert(sizeof(TerrainIndirectCommand) == 72);
+
 struct RetiredResource {
     UINT64 fenceValue;
     ID3D12Resource* resource;
+};
+
+struct RetiredAllocation {
+    UINT64 fenceValue;
+    ArenaPage* page;
+    UINT64 offset;
+    UINT64 bytes;
 };
 
 struct FrameSlot {
@@ -104,6 +134,15 @@ struct FrameSlot {
     ID3D12CommandAllocator* opaque;
     ID3D12CommandAllocator* cutout;
     ID3D12CommandAllocator* extension;
+    ID3D12Resource* uploadBuffer;
+    uint8_t* uploadMapped;
+    UINT64 uploadCapacity;
+    UINT64 uploadOffset;
+    UINT64 opaqueIndirectOffset;
+    UINT64 cutoutIndirectOffset;
+    UINT opaqueIndirectCount;
+    UINT cutoutIndirectCount;
+    bool indirectReady;
     UINT64 fenceValue;
 };
 
@@ -166,6 +205,7 @@ struct InteropRenderer {
     ID3D12DescriptorHeap* srvHeap;
     UINT srvIncrement;
     ID3D12RootSignature* rootSignature;
+    ID3D12CommandSignature* terrainCommandSignature;
     ID3D12RootSignature* extensionRootSignature;
     ID3D12PipelineState* opaquePipeline;
     ID3D12PipelineState* cutoutPipeline;
@@ -174,7 +214,7 @@ struct InteropRenderer {
     ID3D12DescriptorHeap* extensionSrvHeap;
     UINT extensionSrvIncrement;
     UINT extensionRtvIncrement;
-    ID3D12Resource* extensionTargets[kMaxExtensionPasses];
+    ID3D12Resource* extensionTargets[2];
     FrameSlot slots[kFramesInFlight];
     UINT slotIndex;
     ID3D12GraphicsCommandList* uploadList;
@@ -185,8 +225,15 @@ struct InteropRenderer {
     ID3D12GraphicsCommandList4* cutoutPassList;
     bool uploadOpen;
     std::vector<D3D12_RESOURCE_BARRIER> uploadBarriers;
+    std::vector<ArenaPage*> uploadPages;
     std::vector<ID3D12Resource*> pendingRetire;
+    std::vector<RetiredAllocation> pendingRetireAllocations;
     std::deque<RetiredResource> retired;
+    std::deque<RetiredAllocation> retiredAllocations;
+    std::vector<ArenaPage*> arenaPages;
+    UINT64 terrainArenaBytes;
+    UINT64 terrainArenaPageBytes;
+    UINT64 maxTerrainArenaBytes;
     ID3D12Resource* atlas;
     UINT atlasIndex;
     UINT nextAtlasSlot;
@@ -195,6 +242,7 @@ struct InteropRenderer {
     RecordWorker worker;
     bool workerRunning;
     std::unordered_map<jlong, TerrainSection*> sections;
+    std::unordered_map<jlong, size_t> sectionIndices;
     std::vector<TerrainSection*> sectionList;
 };
 
@@ -427,6 +475,95 @@ bool createBuffer(InteropRenderer* renderer, D3D12_HEAP_TYPE heapType, UINT64 by
     return SUCCEEDED(renderer->device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &description,
             state, nullptr, IID_PPV_ARGS(buffer)));
 }
+UINT64 alignUp(UINT64 value, UINT64 alignment) {
+    return (value + alignment - 1) & ~(alignment - 1);
+}
+
+bool tryAllocateArenaRange(ArenaPage* page, UINT64 bytes, UINT64* offset) {
+    for (auto it = page->freeRanges.begin(); it != page->freeRanges.end(); ++it) {
+        const UINT64 rangeStart = it->first;
+        const UINT64 rangeBytes = it->second;
+        const UINT64 alignedStart = alignUp(rangeStart, 256);
+        const UINT64 prefixBytes = alignedStart - rangeStart;
+        if (prefixBytes > rangeBytes || bytes > rangeBytes - prefixBytes) {
+            continue;
+        }
+        const UINT64 suffixStart = alignedStart + bytes;
+        const UINT64 suffixBytes = rangeBytes - prefixBytes - bytes;
+        page->freeRanges.erase(it);
+        if (prefixBytes != 0) {
+            page->freeRanges.emplace(rangeStart, prefixBytes);
+        }
+        if (suffixBytes != 0) {
+            page->freeRanges.emplace(suffixStart, suffixBytes);
+        }
+        *offset = alignedStart;
+        return true;
+    }
+    return false;
+}
+
+bool allocateArenaRange(InteropRenderer* renderer, UINT64 requestedBytes, ArenaPage** pageOut,
+        UINT64* offsetOut, UINT64* allocationBytesOut) {
+    if (requestedBytes == 0 || requestedBytes > (std::numeric_limits<UINT64>::max() - 255)) {
+        return false;
+    }
+    const UINT64 allocationBytes = alignUp(requestedBytes, 256);
+    for (ArenaPage* page : renderer->arenaPages) {
+        if (tryAllocateArenaRange(page, allocationBytes, offsetOut)) {
+            *pageOut = page;
+            *allocationBytesOut = allocationBytes;
+            return true;
+        }
+    }
+
+    const UINT64 pageBytes = (std::max)(renderer->terrainArenaPageBytes,
+            alignUp(allocationBytes, 64 * 1024));
+    if (pageBytes > renderer->maxTerrainArenaBytes
+            || renderer->terrainArenaBytes > renderer->maxTerrainArenaBytes - pageBytes) {
+        return false;
+    }
+
+    ArenaPage* page = new ArenaPage{};
+    page->capacity = pageBytes;
+    page->state = D3D12_RESOURCE_STATE_COMMON;
+    if (!createBuffer(renderer, D3D12_HEAP_TYPE_DEFAULT, pageBytes, D3D12_RESOURCE_STATE_COMMON,
+            &page->resource)) {
+        delete page;
+        return false;
+    }
+    page->freeRanges.emplace(0, pageBytes);
+    renderer->arenaPages.push_back(page);
+    renderer->terrainArenaBytes += pageBytes;
+    if (!tryAllocateArenaRange(page, allocationBytes, offsetOut)) {
+        return false;
+    }
+    *pageOut = page;
+    *allocationBytesOut = allocationBytes;
+    return true;
+}
+
+void freeArenaRange(ArenaPage* page, UINT64 offset, UINT64 bytes) {
+    if (page == nullptr || bytes == 0) {
+        return;
+    }
+    auto next = page->freeRanges.lower_bound(offset);
+    if (next != page->freeRanges.begin()) {
+        auto previous = std::prev(next);
+        if (previous->first + previous->second == offset) {
+            offset = previous->first;
+            bytes += previous->second;
+            page->freeRanges.erase(previous);
+        }
+    }
+    next = page->freeRanges.lower_bound(offset);
+    if (next != page->freeRanges.end() && offset + bytes == next->first) {
+        bytes += next->second;
+        page->freeRanges.erase(next);
+    }
+    page->freeRanges.emplace(offset, bytes);
+}
+
 
 // Recursos só são liberados depois que o frame que os submete por último termina na GPU.
 void retire(InteropRenderer* renderer, ID3D12Resource* resource) {
@@ -441,6 +578,12 @@ void releaseCompleted(InteropRenderer* renderer) {
             && renderer->retired.front().fenceValue <= completed) {
         renderer->retired.front().resource->Release();
         renderer->retired.pop_front();
+    }
+    while (!renderer->retiredAllocations.empty() && completed != kFenceError
+            && renderer->retiredAllocations.front().fenceValue <= completed) {
+        const RetiredAllocation allocation = renderer->retiredAllocations.front();
+        freeArenaRange(allocation.page, allocation.offset, allocation.bytes);
+        renderer->retiredAllocations.pop_front();
     }
 }
 
@@ -467,6 +610,8 @@ void releaseAllRetired(InteropRenderer* renderer) {
         resource->Release();
     }
     renderer->pendingRetire.clear();
+    renderer->retiredAllocations.clear();
+    renderer->pendingRetireAllocations.clear();
 }
 
 // Abre (uma vez por frame) a lista de upload usando o alocador do slot do próximo frame.
@@ -480,18 +625,35 @@ bool ensureUploadOpen(InteropRenderer* renderer) {
             || FAILED(renderer->uploadList->Reset(slot.upload, nullptr))) {
         return false;
     }
+    slot.uploadOffset = 0;
     renderer->uploadOpen = true;
     return true;
 }
 
+bool reserveUploadRange(InteropRenderer* renderer, UINT64 bytes, UINT64 alignment, UINT64* offsetOut) {
+    if (!ensureUploadOpen(renderer)) {
+        return false;
+    }
+    FrameSlot& slot = renderer->slots[renderer->slotIndex];
+    const UINT64 offset = alignUp(slot.uploadOffset, alignment);
+    if (offset > slot.uploadCapacity || bytes > slot.uploadCapacity - offset) {
+        return false;
+    }
+    slot.uploadOffset = offset + bytes;
+    *offsetOut = offset;
+    return true;
+}
+
 void deleteSection(TerrainSection* section) {
-    release(section->buffer);
     delete section;
 }
 
 void retireSection(InteropRenderer* renderer, TerrainSection* section) {
-    retire(renderer, section->buffer);
-    section->buffer = nullptr;
+    if (section->page != nullptr && section->allocationSize != 0) {
+        renderer->pendingRetireAllocations.push_back(
+                {0, section->page, section->allocationOffset, section->allocationSize});
+    }
+    section->page = nullptr;
     delete section;
 }
 
@@ -500,6 +662,7 @@ void retireTerrainSections(InteropRenderer* renderer) {
         retireSection(renderer, entry.second);
     }
     renderer->sections.clear();
+    renderer->sectionIndices.clear();
     renderer->sectionList.clear();
 }
 
@@ -636,16 +799,29 @@ void destroyInteropRenderer(InteropRenderer* renderer) {
     release(renderer->opaqueList);
     release(renderer->uploadList);
     for (FrameSlot& slot : renderer->slots) {
+        if (slot.uploadBuffer != nullptr && slot.uploadMapped != nullptr) {
+            const D3D12_RANGE writtenRange = {0, static_cast<SIZE_T>(slot.uploadCapacity)};
+            slot.uploadBuffer->Unmap(0, &writtenRange);
+            slot.uploadMapped = nullptr;
+        }
+        release(slot.uploadBuffer);
         release(slot.extension);
         release(slot.cutout);
         release(slot.opaque);
         release(slot.upload);
     }
+    for (ArenaPage* page : renderer->arenaPages) {
+        release(page->resource);
+        delete page;
+    }
+    renderer->arenaPages.clear();
+    renderer->terrainArenaBytes = 0;
     for (ExtensionPass& pass : renderer->extensionPasses) {
         release(pass.pipeline);
     }
     renderer->extensionPasses.clear();
     release(renderer->extensionRootSignature);
+    release(renderer->terrainCommandSignature);
     release(renderer->cutoutPipeline);
     release(renderer->opaquePipeline);
     release(renderer->rootSignature);
@@ -815,6 +991,31 @@ bool createTerrainPipelines(InteropRenderer* renderer, JNIEnv* env) {
     return true;
 }
 
+bool createTerrainCommandSignature(InteropRenderer* renderer) {
+    D3D12_INDIRECT_ARGUMENT_DESC arguments[4] = {};
+    arguments[0].Type = D3D12_INDIRECT_ARGUMENT_TYPE_VERTEX_BUFFER_VIEW;
+    arguments[0].VertexBuffer.Slot = 0;
+    arguments[1].Type = D3D12_INDIRECT_ARGUMENT_TYPE_INDEX_BUFFER_VIEW;
+    arguments[2].Type = D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT;
+    arguments[2].Constant.RootParameterIndex = 1;
+    arguments[2].Constant.DestOffsetIn32BitValues = 0;
+    arguments[2].Constant.Num32BitValuesToSet = kDrawConstantCount;
+    arguments[3].Type = D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED;
+
+    D3D12_COMMAND_SIGNATURE_DESC description = {};
+    description.ByteStride = sizeof(TerrainIndirectCommand);
+    description.NumArgumentDescs = ARRAYSIZE(arguments);
+    description.pArgumentDescs = arguments;
+    const HRESULT result = renderer->device->CreateCommandSignature(&description, renderer->rootSignature,
+            IID_PPV_ARGS(&renderer->terrainCommandSignature));
+    if (FAILED(result)) {
+        OutputDebugStringA("Direct: ExecuteIndirect command signature is unavailable; using direct draw recording.\n");
+        release(renderer->terrainCommandSignature);
+        return false;
+    }
+    return true;
+}
+
 bool createExtensionRootSignature(InteropRenderer* renderer) {
     D3D12_DESCRIPTOR_RANGE inputRange = {};
     inputRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
@@ -864,11 +1065,16 @@ bool createExtensionResources(InteropRenderer* renderer, JNIEnv* env) {
     if (passCount == 0) {
         return true;
     }
+
+    // A chain of up to eight passes needs only two alternating intermediate color targets.
+    constexpr UINT targetCount = 2;
     const D3D12_DESCRIPTOR_HEAP_DESC rtv = {
-        D3D12_DESCRIPTOR_HEAP_TYPE_RTV, passCount, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0
+        D3D12_DESCRIPTOR_HEAP_TYPE_RTV, targetCount, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0
     };
+    // Slot 0 samples the terrain color; slots 1 and 2 sample the two ping-pong targets.
     const D3D12_DESCRIPTOR_HEAP_DESC srv = {
-        D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, passCount, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0
+        D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, targetCount + 1,
+        D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0
     };
     if (FAILED(renderer->device->CreateDescriptorHeap(&rtv, IID_PPV_ARGS(&renderer->extensionRtvHeap)))
             || FAILED(renderer->device->CreateDescriptorHeap(&srv, IID_PPV_ARGS(&renderer->extensionSrvHeap)))) {
@@ -888,23 +1094,26 @@ bool createExtensionResources(InteropRenderer* renderer, JNIEnv* env) {
     D3D12_CLEAR_VALUE clear = {};
     clear.Format = kColorFormat;
     std::memcpy(clear.Color, kClearColor, sizeof(kClearColor));
+
     D3D12_CPU_DESCRIPTOR_HANDLE rtvHandle = renderer->extensionRtvHeap->GetCPUDescriptorHandleForHeapStart();
     D3D12_CPU_DESCRIPTOR_HANDLE srvHandle = renderer->extensionSrvHeap->GetCPUDescriptorHandleForHeapStart();
-    for (UINT index = 0; index < passCount; ++index) {
+    D3D12_SHADER_RESOURCE_VIEW_DESC view = {};
+    view.Format = kColorFormat;
+    view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    view.Texture2D.MipLevels = 1;
+
+    renderer->device->CreateShaderResourceView(renderer->colorTarget, &view, srvHandle);
+    srvHandle.ptr += renderer->extensionSrvIncrement;
+    for (UINT index = 0; index < targetCount; ++index) {
         if (FAILED(renderer->device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &description,
                 D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, &clear,
                 IID_PPV_ARGS(&renderer->extensionTargets[index])))) {
-            throwJava(env, "Direct extension pass render target creation failed.");
+            throwJava(env, "Direct extension ping-pong render target creation failed.");
             return false;
         }
         renderer->device->CreateRenderTargetView(renderer->extensionTargets[index], nullptr, rtvHandle);
-        ID3D12Resource* input = index == 0 ? renderer->colorTarget : renderer->extensionTargets[index - 1];
-        D3D12_SHADER_RESOURCE_VIEW_DESC view = {};
-        view.Format = kColorFormat;
-        view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-        view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-        view.Texture2D.MipLevels = 1;
-        renderer->device->CreateShaderResourceView(input, &view, srvHandle);
+        renderer->device->CreateShaderResourceView(renderer->extensionTargets[index], &view, srvHandle);
         rtvHandle.ptr += renderer->extensionRtvIncrement;
         srvHandle.ptr += renderer->extensionSrvIncrement;
     }
@@ -1062,6 +1271,26 @@ bool createCommandObjects(InteropRenderer* renderer) {
     }
     return true;
 }
+bool createUploadRingBuffers(InteropRenderer* renderer, UINT64 capacity, JNIEnv* env) {
+    const D3D12_RANGE noRead = {0, 0};
+    for (FrameSlot& slot : renderer->slots) {
+        if (!createBuffer(renderer, D3D12_HEAP_TYPE_UPLOAD, capacity,
+                D3D12_RESOURCE_STATE_GENERIC_READ, &slot.uploadBuffer)) {
+            throwJava(env, "Direct could not allocate a persistent D3D12 upload-ring buffer.");
+            return false;
+        }
+        void* mapped = nullptr;
+        if (FAILED(slot.uploadBuffer->Map(0, &noRead, &mapped))) {
+            throwJava(env, "Direct could not map a persistent D3D12 upload-ring buffer.");
+            return false;
+        }
+        slot.uploadMapped = static_cast<uint8_t*>(mapped);
+        slot.uploadCapacity = capacity;
+        slot.uploadOffset = 0;
+    }
+    return true;
+}
+
 
 void startRecordWorker(InteropRenderer* renderer) {
     try {
@@ -1072,16 +1301,27 @@ void startRecordWorker(InteropRenderer* renderer) {
     }
 }
 
-bool initializeInteropRenderer(InteropRenderer* renderer, jint width, jint height, JNIEnv* env) {
+bool initializeInteropRenderer(InteropRenderer* renderer, jint width, jint height,
+        bool parallelSectionRecording, jint uploadRingBufferMiB, jint terrainArenaPageMiB,
+        jint maxTerrainArenaMiB, JNIEnv* env) {
     if (width <= 0 || height <= 0) {
         throwJava(env, "DX12/OpenGL interop requires a non-zero framebuffer size.");
         return false;
     }
     renderer->width = static_cast<UINT>(width);
     renderer->height = static_cast<UINT>(height);
+    const UINT64 mebibyte = 1024ULL * 1024ULL;
+    renderer->maxTerrainArenaBytes = static_cast<UINT64>((std::clamp)(maxTerrainArenaMiB, 64, 4096)) * mebibyte;
+    renderer->terrainArenaPageBytes = (std::min)(
+            static_cast<UINT64>((std::clamp)(terrainArenaPageMiB, 8, 256)) * mebibyte,
+            renderer->maxTerrainArenaBytes);
+    const UINT64 uploadRingBytes = static_cast<UINT64>((std::clamp)(uploadRingBufferMiB, 16, 512)) * mebibyte;
     renderer->uploadBarriers.reserve(64);
+    renderer->uploadPages.reserve(16);
+    renderer->pendingRetireAllocations.reserve(256);
     renderer->visible.reserve(256);
     renderer->sectionList.reserve(256);
+    renderer->sectionIndices.reserve(256);
     if (FAILED(D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&renderer->device)))) {
         throwJava(env, "DX12/OpenGL interop could not create a Direct3D 12 device.");
         return false;
@@ -1107,12 +1347,19 @@ bool initializeInteropRenderer(InteropRenderer* renderer, jint width, jint heigh
         throwJava(env, "DX12/OpenGL interop could not create a D3D11On12 device.");
         return false;
     }
-    if (!createDescriptorHeaps(renderer) || !createCommandObjects(renderer)) {
-        throwJava(env, "DX12 terrain descriptor heaps or command lists could not be created.");
+    if (!createDescriptorHeaps(renderer) || !createCommandObjects(renderer)
+            || !createUploadRingBuffers(renderer, uploadRingBytes, env)) {
+        if (!env->ExceptionCheck()) {
+            throwJava(env, "DX12 terrain descriptor heaps, command lists, or upload rings could not be created.");
+        }
         return false;
     }
     inspectAdapter(renderer);
-    if (!createTerrainPipelines(renderer, env) || !createSizeResources(renderer, env)) {
+    if (!createTerrainPipelines(renderer, env)) {
+        return false;
+    }
+    createTerrainCommandSignature(renderer); // optional optimization; direct draws remain the fallback
+    if (!createSizeResources(renderer, env)) {
         return false;
     }
     if (!createSharedFence(renderer->device, &renderer->fence, &renderer->sharedFenceHandle)
@@ -1134,7 +1381,9 @@ bool initializeInteropRenderer(InteropRenderer* renderer, jint width, jint heigh
             closeHandle(renderer->sharedGlDoneFenceHandle);
         }
     }
-    startRecordWorker(renderer);
+    if (parallelSectionRecording) {
+        startRecordWorker(renderer);
+    }
     return true;
 }
 
@@ -1240,6 +1489,90 @@ void beginTerrainPass(InteropRenderer* renderer, ID3D12GraphicsCommandList* list
     list->SetGraphicsRootDescriptorTable(2, renderer->srvHeap->GetGPUDescriptorHandleForHeapStart());
 }
 
+bool prepareTerrainIndirectCommands(InteropRenderer* renderer, FrameSlot& slot, bool drawTerrain,
+        bool useExecuteIndirect) {
+    slot.indirectReady = false;
+    slot.opaqueIndirectCount = 0;
+    slot.cutoutIndirectCount = 0;
+    slot.opaqueIndirectOffset = 0;
+    slot.cutoutIndirectOffset = 0;
+    if (!useExecuteIndirect || renderer->terrainCommandSignature == nullptr
+            || slot.uploadBuffer == nullptr || slot.uploadMapped == nullptr) {
+        return false;
+    }
+
+    if (!drawTerrain) {
+        slot.indirectReady = true;
+        return true;
+    }
+
+    UINT opaqueCount = 0;
+    UINT cutoutCount = 0;
+    for (const VisibleSection& entry : renderer->visible) {
+        const TerrainSection* section = entry.section;
+        opaqueCount += section->layerIndexCounts[0] != 0 ? 1u : 0u;
+        cutoutCount += section->layerIndexCounts[1] != 0 ? 1u : 0u;
+        cutoutCount += section->layerIndexCounts[2] != 0 ? 1u : 0u;
+    }
+
+    const UINT64 commandCount = static_cast<UINT64>(opaqueCount) + cutoutCount;
+    if (commandCount == 0) {
+        slot.indirectReady = true;
+        return true;
+    }
+    if (commandCount > (std::numeric_limits<UINT64>::max() / sizeof(TerrainIndirectCommand))) {
+        return false;
+    }
+
+    const UINT64 commandBytes = commandCount * sizeof(TerrainIndirectCommand);
+    const UINT64 startOffset = alignUp(slot.uploadOffset, 256);
+    if (startOffset > slot.uploadCapacity || commandBytes > slot.uploadCapacity - startOffset) {
+        return false;
+    }
+
+    slot.opaqueIndirectOffset = startOffset;
+    slot.cutoutIndirectOffset = startOffset + static_cast<UINT64>(opaqueCount) * sizeof(TerrainIndirectCommand);
+    slot.opaqueIndirectCount = opaqueCount;
+    slot.cutoutIndirectCount = cutoutCount;
+
+    auto* commands = reinterpret_cast<TerrainIndirectCommand*>(slot.uploadMapped + startOffset);
+    const UINT atlasIndex = renderer->atlasIndex;
+    UINT opaqueIndex = 0;
+    UINT cutoutIndex = opaqueCount;
+    auto writeCommand = [&](TerrainIndirectCommand& command, const VisibleSection& entry,
+            const TerrainSection* section, UINT layer) {
+        command = {};
+        command.vertexView = section->vertexView;
+        command.indexView = section->indexView;
+        std::memcpy(&command.constants[0], &entry.offset[0], sizeof(float));
+        std::memcpy(&command.constants[1], &entry.offset[1], sizeof(float));
+        std::memcpy(&command.constants[2], &entry.offset[2], sizeof(float));
+        std::memcpy(&command.constants[3], &kLayerAlphaCutoff[layer], sizeof(float));
+        command.constants[4] = atlasIndex;
+        command.draw.IndexCountPerInstance = section->layerIndexCounts[layer];
+        command.draw.InstanceCount = 1;
+        command.draw.StartIndexLocation = section->layerStart[layer];
+        command.draw.BaseVertexLocation = 0;
+        command.draw.StartInstanceLocation = 0;
+    };
+
+    for (const VisibleSection& entry : renderer->visible) {
+        const TerrainSection* section = entry.section;
+        if (section->layerIndexCounts[0] != 0) {
+            writeCommand(commands[opaqueIndex++], entry, section, 0);
+        }
+        for (UINT layer = 1; layer < kLayerCount; ++layer) {
+            if (section->layerIndexCounts[layer] != 0) {
+                writeCommand(commands[cutoutIndex++], entry, section, layer);
+            }
+        }
+    }
+
+    slot.uploadOffset = startOffset + commandBytes;
+    slot.indirectReady = true;
+    return true;
+}
+
 bool recordTerrainList(InteropRenderer* renderer, ID3D12CommandAllocator* allocator,
         ID3D12GraphicsCommandList* list, ID3D12GraphicsCommandList4* passList, PassRole role) {
     if (FAILED(allocator->Reset()) || FAILED(list->Reset(allocator, nullptr))) {
@@ -1249,23 +1582,35 @@ bool recordTerrainList(InteropRenderer* renderer, ID3D12CommandAllocator* alloca
     const UINT firstLayer = role == PassRole::Opaque ? 0 : 1;
     const UINT lastLayer = role == PassRole::Opaque ? 1 : kLayerCount;
     if (role != PassRole::ClearOnly) {
-        const UINT atlasIndex = renderer->atlasIndex;
-        list->SetGraphicsRoot32BitConstants(1, 1, &atlasIndex, 4);
-        for (const VisibleSection& entry : renderer->visible) {
-            const TerrainSection* section = entry.section;
-            bool bound = false;
-            for (UINT layer = firstLayer; layer < lastLayer; ++layer) {
-                if (section->layerIndexCounts[layer] == 0) {
-                    continue;
+        FrameSlot& slot = renderer->slots[renderer->slotIndex];
+        const UINT indirectCount = role == PassRole::Opaque
+                ? slot.opaqueIndirectCount : slot.cutoutIndirectCount;
+        const UINT64 indirectOffset = role == PassRole::Opaque
+                ? slot.opaqueIndirectOffset : slot.cutoutIndirectOffset;
+        if (slot.indirectReady && renderer->terrainCommandSignature != nullptr) {
+            if (indirectCount > 0) {
+                list->ExecuteIndirect(renderer->terrainCommandSignature, indirectCount,
+                        slot.uploadBuffer, indirectOffset, nullptr, 0);
+            }
+        } else {
+            const UINT atlasIndex = renderer->atlasIndex;
+            list->SetGraphicsRoot32BitConstants(1, 1, &atlasIndex, 4);
+            for (const VisibleSection& entry : renderer->visible) {
+                const TerrainSection* section = entry.section;
+                bool bound = false;
+                for (UINT layer = firstLayer; layer < lastLayer; ++layer) {
+                    if (section->layerIndexCounts[layer] == 0) {
+                        continue;
+                    }
+                    if (!bound) {
+                        list->IASetVertexBuffers(0, 1, &section->vertexView);
+                        list->IASetIndexBuffer(&section->indexView);
+                        list->SetGraphicsRoot32BitConstants(1, 3, entry.offset, 0);
+                        bound = true;
+                    }
+                    list->SetGraphicsRoot32BitConstants(1, 1, &kLayerAlphaCutoff[layer], 3);
+                    list->DrawIndexedInstanced(section->layerIndexCounts[layer], 1, section->layerStart[layer], 0, 0);
                 }
-                if (!bound) {
-                    list->IASetVertexBuffers(0, 1, &section->vertexView);
-                    list->IASetIndexBuffer(&section->indexView);
-                    list->SetGraphicsRoot32BitConstants(1, 3, entry.offset, 0);
-                    bound = true;
-                }
-                list->SetGraphicsRoot32BitConstants(1, 1, &kLayerAlphaCutoff[layer], 3);
-                list->DrawIndexedInstanced(section->layerIndexCounts[layer], 1, section->layerStart[layer], 0, 0);
             }
         }
     }
@@ -1310,6 +1655,14 @@ bool submitUploads(InteropRenderer* renderer) {
                 renderer->uploadBarriers.data());
         renderer->uploadBarriers.clear();
     }
+    for (ArenaPage* page : renderer->uploadPages) {
+        const D3D12_RESOURCE_BARRIER barrier = transition(page->resource,
+                D3D12_RESOURCE_STATE_COPY_DEST, kTerrainBufferState);
+        renderer->uploadList->ResourceBarrier(1, &barrier);
+        page->state = kTerrainBufferState;
+        page->uploadQueued = false;
+    }
+    renderer->uploadPages.clear();
     renderer->uploadOpen = false;
     if (FAILED(renderer->uploadList->Close())) {
         return false;
@@ -1348,16 +1701,26 @@ bool recordExtensionPasses(InteropRenderer* renderer, FrameSlot& slot, UINT64 fr
     const D3D12_RESOURCE_BARRIER colorForSampling = transition(renderer->colorTarget,
             D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
     list->ResourceBarrier(1, &colorForSampling);
-    D3D12_CPU_DESCRIPTOR_HANDLE rtv = renderer->extensionRtvHeap->GetCPUDescriptorHandleForHeapStart();
-    D3D12_GPU_DESCRIPTOR_HANDLE input = renderer->extensionSrvHeap->GetGPUDescriptorHandleForHeapStart();
+
+    const D3D12_CPU_DESCRIPTOR_HANDLE rtvBase =
+            renderer->extensionRtvHeap->GetCPUDescriptorHandleForHeapStart();
+    const D3D12_GPU_DESCRIPTOR_HANDLE srvBase =
+            renderer->extensionSrvHeap->GetGPUDescriptorHandleForHeapStart();
     for (UINT index = 0; index < renderer->extensionPasses.size(); ++index) {
-        ID3D12Resource* output = renderer->extensionTargets[index];
+        const UINT outputIndex = index & 1u;
+        const UINT inputDescriptorIndex = index == 0 ? 0u : (((index - 1u) & 1u) + 1u);
+        ID3D12Resource* output = renderer->extensionTargets[outputIndex];
+        D3D12_CPU_DESCRIPTOR_HANDLE outputRtv = rtvBase;
+        outputRtv.ptr += static_cast<SIZE_T>(outputIndex) * renderer->extensionRtvIncrement;
+        D3D12_GPU_DESCRIPTOR_HANDLE inputSrv = srvBase;
+        inputSrv.ptr += static_cast<UINT64>(inputDescriptorIndex) * renderer->extensionSrvIncrement;
+
         const D3D12_RESOURCE_BARRIER toRenderTarget = transition(output,
                 D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
         list->ResourceBarrier(1, &toRenderTarget);
-        list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+        list->OMSetRenderTargets(1, &outputRtv, FALSE, nullptr);
         list->SetPipelineState(renderer->extensionPasses[index].pipeline);
-        list->SetGraphicsRootDescriptorTable(1, input);
+        list->SetGraphicsRootDescriptorTable(1, inputSrv);
         float constants[kPassConstantCount] = {};
         constants[0] = elapsedSeconds;
         constants[1] = static_cast<float>(renderer->width);
@@ -1370,11 +1733,9 @@ bool recordExtensionPasses(InteropRenderer* renderer, FrameSlot& slot, UINT64 fr
         const D3D12_RESOURCE_BARRIER toShaderResource = transition(output,
                 D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
         list->ResourceBarrier(1, &toShaderResource);
-        rtv.ptr += renderer->extensionRtvIncrement;
-        input.ptr += renderer->extensionSrvIncrement;
     }
 
-    ID3D12Resource* finalPass = renderer->extensionTargets[renderer->extensionPasses.size() - 1];
+    ID3D12Resource* finalPass = renderer->extensionTargets[(renderer->extensionPasses.size() - 1u) & 1u];
     const D3D12_RESOURCE_BARRIER toCopy[] = {
         transition(renderer->colorTarget, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
                 D3D12_RESOURCE_STATE_COPY_DEST),
@@ -1393,8 +1754,8 @@ bool recordExtensionPasses(InteropRenderer* renderer, FrameSlot& slot, UINT64 fr
 bool renderInteropFrame(InteropRenderer* renderer, const float* viewProjection,
         double cameraX, double cameraY, double cameraZ, float renderDistance,
         UINT64 frameIndex, float elapsedSeconds, const float* passUniforms,
-        bool useGpuSynchronization, JNIEnv* env, bool* gpuSynchronizationUsed,
-        bool* frameSkipped) {
+        bool useGpuSynchronization, bool useExecuteIndirect, JNIEnv* env,
+        bool* gpuSynchronizationUsed, bool* frameSkipped) {
     if (frameIndex >= kFenceError - 1) {
         throwJava(env, "DX12/OpenGL interop fence timeline has exhausted its frame values.");
         return false;
@@ -1435,6 +1796,7 @@ bool renderInteropFrame(InteropRenderer* renderer, const float* viewProjection,
         throwJava(env, "DX12 terrain upload command list could not be closed.");
         return false;
     }
+    prepareTerrainIndirectCommands(renderer, slot, drawTerrain, useExecuteIndirect);
     if (!recordTerrain(renderer, slot, drawTerrain)) {
         throwJava(env, "DX12 terrain command lists could not be recorded.");
         return false;
@@ -1473,6 +1835,11 @@ bool renderInteropFrame(InteropRenderer* renderer, const float* viewProjection,
         renderer->retired.push_back({dxReadyValue, resource});
     }
     renderer->pendingRetire.clear();
+    for (const RetiredAllocation& allocation : renderer->pendingRetireAllocations) {
+        renderer->retiredAllocations.push_back(
+                {dxReadyValue, allocation.page, allocation.offset, allocation.bytes});
+    }
+    renderer->pendingRetireAllocations.clear();
     if (gpu) {
         renderer->watchdogCondition.notify_one();
     } else if (!waitFence(renderer, renderer->fence, dxReadyValue)) {
@@ -1484,7 +1851,7 @@ bool renderInteropFrame(InteropRenderer* renderer, const float* viewProjection,
 }
 
 bool uploadAtlas(InteropRenderer* renderer, const void* const* levelData, jsize levelCount,
-        UINT width, UINT height, bool compress, JNIEnv* env) {
+        UINT width, UINT height, bool compress, UINT bc7EncoderThreads, JNIEnv* env) {
     // BC7 exige que o nível 0 seja múltiplo de 4; níveis menores são preenchidos por bloco.
     const bool bc7 = compress && width % 4 == 0 && height % 4 == 0;
     std::vector<std::vector<uint8_t>> encoded;
@@ -1495,7 +1862,7 @@ bool uploadAtlas(InteropRenderer* renderer, const void* const* levelData, jsize 
             const UINT levelHeight = (std::max)(1u, height >> level);
             encoded[level].resize(static_cast<size_t>(direct::bc7LevelSize(levelWidth, levelHeight)));
             direct::encodeBc7Level(static_cast<const uint8_t*>(levelData[level]), levelWidth, levelHeight,
-                    encoded[level].data());
+                    encoded[level].data(), bc7EncoderThreads);
         }
     }
     const DXGI_FORMAT format = bc7 ? DXGI_FORMAT_BC7_UNORM : kColorFormat;
@@ -1575,11 +1942,14 @@ bool uploadAtlas(InteropRenderer* renderer, const void* const* levelData, jsize 
 } // namespace
 
 extern "C" JNIEXPORT jlongArray JNICALL
-Java_com_redondoguibi_direct_NativeDx12_initializeInterop(JNIEnv* env, jclass, jint width, jint height) {
+Java_com_redondoguibi_direct_NativeDx12_initializeInterop(JNIEnv* env, jclass, jint width, jint height,
+        jboolean parallelSectionRecording, jint uploadRingBufferMiB, jint terrainArenaPageMiB,
+        jint maxTerrainArenaMiB) {
     destroyInteropRenderer(g_interopRenderer);
     g_interopRenderer = nullptr;
     InteropRenderer* renderer = new InteropRenderer{};
-    if (!initializeInteropRenderer(renderer, width, height, env)) {
+    if (!initializeInteropRenderer(renderer, width, height, parallelSectionRecording == JNI_TRUE,
+            uploadRingBufferMiB, terrainArenaPageMiB, maxTerrainArenaMiB, env)) {
         destroyInteropRenderer(renderer);
         return nullptr;
     }
@@ -1683,6 +2053,13 @@ Java_com_redondoguibi_direct_NativeDx12_isCurrentFrameSlotReady(JNIEnv* env, jcl
     if (!currentFrameSlotReady(g_interopRenderer, env, &ready)) {
         return JNI_FALSE;
     }
+    if (ready) {
+        // Reclaim completed arena ranges before Java starts staging this frame's chunk uploads.
+        releaseCompleted(g_interopRenderer);
+        if (!g_interopRenderer->uploadOpen) {
+            g_interopRenderer->slots[g_interopRenderer->slotIndex].uploadOffset = 0;
+        }
+    }
     return ready ? JNI_TRUE : JNI_FALSE;
 }
 
@@ -1690,7 +2067,7 @@ extern "C" JNIEXPORT jint JNICALL
 Java_com_redondoguibi_direct_NativeDx12_renderInterop(JNIEnv* env, jclass, jfloatArray matrix,
         jdouble cameraX, jdouble cameraY, jdouble cameraZ, jfloat renderDistance,
         jlong frameIndex, jfloat elapsedSeconds, jfloatArray passUniforms,
-        jboolean useGpuSynchronization) {
+        jboolean useGpuSynchronization, jboolean useExecuteIndirect) {
     if (g_interopRenderer == nullptr) {
         throwJava(env, "DX12/OpenGL interop is not initialized.");
         return -1;
@@ -1720,7 +2097,8 @@ Java_com_redondoguibi_direct_NativeDx12_renderInterop(JNIEnv* env, jclass, jfloa
     if (!renderInteropFrame(g_interopRenderer, values, cameraX, cameraY, cameraZ, renderDistance,
             static_cast<UINT64>(frameIndex), elapsedSeconds,
             expectedUniforms > 0 ? uniformValues : nullptr,
-            useGpuSynchronization == JNI_TRUE, env, &gpuUsed, &frameSkipped)) {
+            useGpuSynchronization == JNI_TRUE, useExecuteIndirect == JNI_TRUE,
+            env, &gpuUsed, &frameSkipped)) {
         return -1;
     }
     if (frameSkipped) {
@@ -1789,36 +2167,74 @@ Java_com_redondoguibi_direct_NativeDx12_updateTerrainSection(JNIEnv* env, jclass
         return;
     }
 
-    // Um único buffer por seção (vértices seguidos de índices) em memória de vídeo, via staging.
+    // Suballocate section data from reusable GPU pages and stage it through the current frame's upload ring.
     const UINT64 totalBytes = static_cast<UINT64>(vertexBytes + indexBytes);
-    ID3D12Resource* buffer = nullptr;
-    ID3D12Resource* upload = nullptr;
-    void* mapped = nullptr;
-    const D3D12_RANGE noRead = {0, 0};
-    if (!createBuffer(renderer, D3D12_HEAP_TYPE_DEFAULT, totalBytes, D3D12_RESOURCE_STATE_COMMON, &buffer)
-            || !createBuffer(renderer, D3D12_HEAP_TYPE_UPLOAD, totalBytes, D3D12_RESOURCE_STATE_GENERIC_READ,
-                &upload)
-            || FAILED(upload->Map(0, &noRead, &mapped))
-            || !ensureUploadOpen(renderer)) {
-        release(upload);
-        release(buffer);
-        throwJava(env, "DX12 terrain section buffer creation failed.");
+    ArenaPage* page = nullptr;
+    UINT64 arenaOffset = 0;
+    UINT64 arenaBytes = 0;
+    UINT64 uploadOffset = 0;
+    if (!allocateArenaRange(renderer, totalBytes, &page, &arenaOffset, &arenaBytes)) {
+        throwJava(env, "Direct terrain GPU arena is full; increase maxTerrainArenaMiB.");
         return;
     }
-    std::memcpy(mapped, vertices, static_cast<size_t>(vertexBytes));
-    std::memcpy(static_cast<uint8_t*>(mapped) + vertexBytes, indices, static_cast<size_t>(indexBytes));
-    upload->Unmap(0, nullptr);
-    renderer->uploadList->CopyBufferRegion(buffer, 0, upload, 0, totalBytes);
-    renderer->uploadBarriers.push_back(transition(buffer, D3D12_RESOURCE_STATE_COPY_DEST,
-            D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER | D3D12_RESOURCE_STATE_INDEX_BUFFER));
-    retire(renderer, upload);
+    if (!ensureUploadOpen(renderer)) {
+        freeArenaRange(page, arenaOffset, arenaBytes);
+        throwJava(env, "Direct could not open the current frame's upload command list.");
+        return;
+    }
+    const bool useUploadRing = reserveUploadRange(renderer, totalBytes, 256, &uploadOffset);
+
+    if (!page->uploadQueued) {
+        if (page->state == kTerrainBufferState) {
+            const D3D12_RESOURCE_BARRIER toCopy = transition(page->resource,
+                    kTerrainBufferState, D3D12_RESOURCE_STATE_COPY_DEST);
+            renderer->uploadList->ResourceBarrier(1, &toCopy);
+        } else if (page->state != D3D12_RESOURCE_STATE_COMMON) {
+            freeArenaRange(page, arenaOffset, arenaBytes);
+            throwJava(env, "Direct terrain arena page entered an unexpected resource state.");
+            return;
+        }
+        page->state = D3D12_RESOURCE_STATE_COPY_DEST;
+        page->uploadQueued = true;
+        renderer->uploadPages.push_back(page);
+    }
+
+    if (useUploadRing) {
+        FrameSlot& uploadSlot = renderer->slots[renderer->slotIndex];
+        std::memcpy(uploadSlot.uploadMapped + uploadOffset, vertices, static_cast<size_t>(vertexBytes));
+        std::memcpy(uploadSlot.uploadMapped + uploadOffset + vertexBytes, indices, static_cast<size_t>(indexBytes));
+        renderer->uploadList->CopyBufferRegion(page->resource, arenaOffset,
+                uploadSlot.uploadBuffer, uploadOffset, totalBytes);
+    } else {
+        // Oversized per-frame batches use a one-shot staging resource, retired behind this frame's fence.
+        ID3D12Resource* upload = nullptr;
+        void* mapped = nullptr;
+        const D3D12_RANGE noRead = {0, 0};
+        if (!createBuffer(renderer, D3D12_HEAP_TYPE_UPLOAD, totalBytes,
+                    D3D12_RESOURCE_STATE_GENERIC_READ, &upload)
+                || FAILED(upload->Map(0, &noRead, &mapped))) {
+            release(upload);
+            freeArenaRange(page, arenaOffset, arenaBytes);
+            throwJava(env, "Direct could not allocate overflow staging memory for a terrain section.");
+            return;
+        }
+        std::memcpy(mapped, vertices, static_cast<size_t>(vertexBytes));
+        std::memcpy(static_cast<uint8_t*>(mapped) + vertexBytes, indices, static_cast<size_t>(indexBytes));
+        const D3D12_RANGE writtenRange = {0, static_cast<SIZE_T>(totalBytes)};
+        upload->Unmap(0, &writtenRange);
+        renderer->uploadList->CopyBufferRegion(page->resource, arenaOffset, upload, 0, totalBytes);
+        retire(renderer, upload);
+    }
 
     TerrainSection* section = new TerrainSection{};
+    section->key = key;
     section->x = sectionX;
     section->y = sectionY;
     section->z = sectionZ;
-    section->buffer = buffer;
-    const D3D12_GPU_VIRTUAL_ADDRESS address = buffer->GetGPUVirtualAddress();
+    section->page = page;
+    section->allocationOffset = arenaOffset;
+    section->allocationSize = arenaBytes;
+    const D3D12_GPU_VIRTUAL_ADDRESS address = page->resource->GetGPUVirtualAddress() + arenaOffset;
     section->vertexView = {address, static_cast<UINT>(vertexBytes), kVertexStride};
     section->indexView = {address + vertexBytes, static_cast<UINT>(indexBytes), DXGI_FORMAT_R32_UINT};
     UINT start = 0;
@@ -1830,23 +2246,34 @@ Java_com_redondoguibi_direct_NativeDx12_updateTerrainSection(JNIEnv* env, jclass
     auto existing = renderer->sections.find(key);
     if (existing != renderer->sections.end()) {
         TerrainSection* previous = existing->second;
-        for (TerrainSection*& entry : renderer->sectionList) {
-            if (entry == previous) {
-                entry = section;
-                break;
+        const auto index = renderer->sectionIndices.find(key);
+        if (index != renderer->sectionIndices.end() && index->second < renderer->sectionList.size()
+                && renderer->sectionList[index->second] == previous) {
+            renderer->sectionList[index->second] = section;
+        } else {
+            // Repair the auxiliary index only if its invariant was already broken.
+            const auto position = std::find(renderer->sectionList.begin(), renderer->sectionList.end(), previous);
+            if (position != renderer->sectionList.end()) {
+                const size_t repairedIndex = static_cast<size_t>(position - renderer->sectionList.begin());
+                renderer->sectionList[repairedIndex] = section;
+                renderer->sectionIndices[key] = repairedIndex;
+            } else {
+                renderer->sectionIndices[key] = renderer->sectionList.size();
+                renderer->sectionList.push_back(section);
             }
         }
         retireSection(renderer, previous);
         existing->second = section;
     } else {
         renderer->sections.emplace(key, section);
+        renderer->sectionIndices.emplace(key, renderer->sectionList.size());
         renderer->sectionList.push_back(section);
     }
 }
 
 extern "C" JNIEXPORT void JNICALL
 Java_com_redondoguibi_direct_NativeDx12_updateTerrainAtlas(JNIEnv* env, jclass, jobjectArray levels,
-        jint width, jint height, jboolean compress) {
+        jint width, jint height, jboolean compress, jint bc7EncoderThreads) {
     InteropRenderer* renderer = g_interopRenderer;
     if (renderer == nullptr) {
         throwJava(env, "DX12 terrain atlas upload requires an initialized renderer.");
@@ -1874,8 +2301,9 @@ Java_com_redondoguibi_direct_NativeDx12_updateTerrainAtlas(JNIEnv* env, jclass, 
         }
         data[level] = pixels;
     }
+    const UINT encoderThreads = static_cast<UINT>((std::clamp)(bc7EncoderThreads, 1, 16));
     uploadAtlas(renderer, data, levelCount, static_cast<UINT>(width), static_cast<UINT>(height),
-            compress == JNI_TRUE, env);
+            compress == JNI_TRUE, encoderThreads, env);
 }
 
 extern "C" JNIEXPORT void JNICALL
@@ -1886,16 +2314,30 @@ Java_com_redondoguibi_direct_NativeDx12_removeTerrainSection(JNIEnv*, jclass, jl
     auto existing = g_interopRenderer->sections.find(key);
     if (existing != g_interopRenderer->sections.end()) {
         TerrainSection* section = existing->second;
-        auto& list = g_interopRenderer->sectionList;
-        for (size_t index = 0; index < list.size(); ++index) {
-            if (list[index] == section) {
-                list[index] = list.back();
-                list.pop_back();
-                break;
+        auto& renderer = *g_interopRenderer;
+        const auto index = renderer.sectionIndices.find(key);
+        size_t removeIndex = renderer.sectionList.size();
+        if (index != renderer.sectionIndices.end() && index->second < renderer.sectionList.size()
+                && renderer.sectionList[index->second] == section) {
+            removeIndex = index->second;
+        } else {
+            // Repair path is intentionally linear; normal section removal stays O(1).
+            const auto position = std::find(renderer.sectionList.begin(), renderer.sectionList.end(), section);
+            if (position != renderer.sectionList.end()) {
+                removeIndex = static_cast<size_t>(position - renderer.sectionList.begin());
+            }
+        }
+        renderer.sectionIndices.erase(key);
+        if (removeIndex < renderer.sectionList.size()) {
+            TerrainSection* moved = renderer.sectionList.back();
+            renderer.sectionList[removeIndex] = moved;
+            renderer.sectionList.pop_back();
+            if (removeIndex < renderer.sectionList.size()) {
+                renderer.sectionIndices[moved->key] = removeIndex;
             }
         }
         retireSection(g_interopRenderer, section);
-        g_interopRenderer->sections.erase(existing);
+        renderer.sections.erase(existing);
     }
 }
 

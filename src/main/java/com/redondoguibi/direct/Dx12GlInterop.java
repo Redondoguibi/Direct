@@ -22,6 +22,7 @@ import org.lwjgl.opengl.GL14;
 import org.lwjgl.opengl.GL15;
 import org.lwjgl.opengl.GL20;
 import org.lwjgl.opengl.GL30;
+import org.lwjgl.opengl.GL32;
 import org.lwjgl.opengl.WGLCapabilities;
 import org.lwjgl.opengl.WGLNVDXInterop;
 import org.lwjgl.system.MemoryStack;
@@ -66,6 +67,7 @@ public final class Dx12GlInterop {
     private static final String[] NO_PASS_SOURCES = new String[0];
 
     private static boolean matricesCaptured;
+    private static boolean lastFrameSucceeded;
     private static double cameraX;
     private static double cameraY;
     private static double cameraZ;
@@ -76,6 +78,7 @@ public final class Dx12GlInterop {
     private static boolean reportedHook;
     private static boolean wglInteropAvailable;
     private static float[] passUniformScratch = new float[0];
+    private static long configuredPassRevision = -1L;
     private static volatile boolean blockAtlasDirty = true;
     private static boolean terrainCaptureEnabled;
     private static boolean gpuSemaphoreInterop;
@@ -94,6 +97,8 @@ public final class Dx12GlInterop {
     private static int sourceTextureUniform = -1;
     private static int interopSemaphore;
     private static int glDoneSemaphore;
+    private static long pendingGlSync;
+    private static long pendingGlFenceValue;
     private static int blockAtlasId = -1;
 
     private Dx12GlInterop() {
@@ -111,6 +116,11 @@ public final class Dx12GlInterop {
     }
 
     public static void renderTerrainOverlay() {
+        lastFrameSucceeded = false;
+        if (!pollCpuGlSync()) {
+            DirectStatusOverlay.setStatus("D3D12 / waiting for OpenGL");
+            return;
+        }
         if (!reportedHook) {
             Direct.LOGGER.info("DX12/OpenGL interop terrain composite hook reached.");
             reportedHook = true;
@@ -203,13 +213,15 @@ public final class Dx12GlInterop {
             }
             long dxReadyValue = frameIndex + 1;
             float elapsedSeconds = (System.nanoTime() - startedAtNanos) / 1_000_000_000.0f;
-            float renderDistance = minecraft.options.getEffectiveRenderDistance() * 16.0f;
+            float renderDistance = minecraft.options.getEffectiveRenderDistance() * 16.0f
+                    * (ClientConfig.TERRAIN_RENDER_DISTANCE_PERCENT.get() / 100.0f);
             DirectFrameContext frameContext = DirectRenderApi.frame(frameIndex, currentWidth, currentHeight,
                     elapsedSeconds, renderDistance);
             DirectRenderEventBridge.postFrame(new DirectFrameRenderEvent(
                     DirectFrameRenderEvent.Stage.BEFORE_PASSES, frameContext));
-            List<DirectRenderPass> passes = DirectRenderApi.snapshot();
-            if (DirectRenderApi.consumeDirty()) {
+            DirectRenderApi.PassSnapshot passSnapshot = DirectRenderApi.snapshotState();
+            List<DirectRenderPass> passes = passSnapshot.passes();
+            if (passSnapshot.revision() != configuredPassRevision) {
                 String[] sources = NO_PASS_SOURCES;
                 if (!passes.isEmpty()) {
                     sources = new String[passes.size()];
@@ -218,6 +230,7 @@ public final class Dx12GlInterop {
                     }
                 }
                 NativeDx12.configureRenderPasses(sources);
+                configuredPassRevision = passSnapshot.revision();
             }
             int uniformCount = passes.size() * DirectRenderApi.MAX_UNIFORM_FLOATS;
             if (passUniformScratch.length != uniformCount) {
@@ -230,9 +243,10 @@ public final class Dx12GlInterop {
                 DirectRenderApi.copyUniforms(pass, passContext, passUniformScratch,
                         index * DirectRenderApi.MAX_UNIFORM_FLOATS);
             }
+            boolean useGpuSync = gpuSemaphoreInterop && ClientConfig.USE_GPU_SEMAPHORE_SYNC.get();
             int renderResult = NativeDx12.renderInterop(MATRIX, cameraX, cameraY, cameraZ,
                     renderDistance, frameIndex,
-                    elapsedSeconds, passUniformScratch, gpuSemaphoreInterop);
+                    elapsedSeconds, passUniformScratch, useGpuSync, ClientConfig.USE_EXECUTE_INDIRECT.get());
             if (renderResult == NativeDx12.FRAME_SKIPPED_BUSY) {
                 DirectStatusOverlay.setStatus("D3D12 / waiting for GPU");
                 return;
@@ -242,11 +256,11 @@ public final class Dx12GlInterop {
                 throw new IllegalStateException("DX12 returned an invalid frame status: " + renderResult);
             }
             boolean nativeGpu = renderResult == NativeDx12.FRAME_RENDERED_GPU_SYNC;
-            if (gpuSemaphoreInterop && !nativeGpu) {
+            if (useGpuSync && !nativeGpu) {
                 disableGpuSemaphore("The native command queue could not enqueue a GPU-side fence wait; "
                         + "using CPU fence waits.");
             }
-            boolean frameUsesGpuSemaphore = gpuSemaphoreInterop && nativeGpu;
+            boolean frameUsesGpuSemaphore = useGpuSync && nativeGpu;
             if (frameUsesGpuSemaphore && !waitForDx12Frame(dxReadyValue)) {
                 NativeDx12.waitInteropFence(dxReadyValue);
                 disableGpuSemaphore("OpenGL rejected the D3D12 timeline semaphore wait; using CPU fence waits.");
@@ -258,9 +272,10 @@ public final class Dx12GlInterop {
             drawImportedTexture(frameUsesGpuSemaphore, frameIndex);
             DirectRenderEventBridge.postFrame(new DirectFrameRenderEvent(
                     DirectFrameRenderEvent.Stage.AFTER_PASSES, frameContext));
+            lastFrameSucceeded = true;
             frameIndex++;
             retryAfterNanos = 0;
-            DirectStatusOverlay.setStatus(gpuSemaphoreInterop ? "D3D12 / GPU sync" : "D3D12 / CPU fallback");
+            DirectStatusOverlay.setStatus(frameUsesGpuSemaphore ? "D3D12 / GPU sync" : "D3D12 / CPU fallback");
         } catch (IOException | RuntimeException | UnsatisfiedLinkError exception) {
             Direct.LOGGER.error("DX12/OpenGL interop failed; retaining vanilla rendering.", exception);
             shutdown();
@@ -272,9 +287,12 @@ public final class Dx12GlInterop {
     }
 
     public static void shutdown() {
+        configuredPassRevision = -1L;
+        lastFrameSucceeded = false;
         if (interopSemaphore != 0 || glDoneSemaphore != 0 || interopObject != 0) {
             GL11.glFinish();
         }
+        finishPendingGlSync();
         if (interopSemaphore != 0) {
             EXTSemaphore.glDeleteSemaphoresEXT(interopSemaphore);
             interopSemaphore = 0;
@@ -315,6 +333,20 @@ public final class Dx12GlInterop {
         blockAtlasDirty = true;
     }
 
+    /**
+     * Allows the LevelRenderer mixin to skip only the three base chunk layers Direct can reproduce.
+     * Vanilla remains active until the capture queue has drained and a successful DX12 frame exists.
+     */
+    public static boolean shouldSkipVanillaLayer(net.minecraft.client.renderer.RenderType layer) {
+        if (!ClientConfig.REPLACE_VANILLA_TERRAIN.get() || !initialized || disabled
+                || !lastFrameSucceeded || !TerrainMeshStore.isCaptureReady()) {
+            return false;
+        }
+        return layer == net.minecraft.client.renderer.RenderType.solid()
+                || layer == net.minecraft.client.renderer.RenderType.cutoutMipped()
+                || layer == net.minecraft.client.renderer.RenderType.cutout();
+    }
+
     private static void disableTerrainCapture() {
         TerrainMeshStore.setCaptureEnabled(false);
         if (terrainCaptureEnabled) {
@@ -325,7 +357,9 @@ public final class Dx12GlInterop {
 
     private static void initialize(int frameWidth, int frameHeight) throws IOException {
         NativeLibrary.load();
-        long[] handles = NativeDx12.initializeInterop(frameWidth, frameHeight);
+        long[] handles = NativeDx12.initializeInterop(frameWidth, frameHeight,
+                ClientConfig.PARALLEL_SECTION_RECORDING.get(), ClientConfig.UPLOAD_RING_BUFFER_MIB.get(),
+                ClientConfig.TERRAIN_ARENA_PAGE_MIB.get(), ClientConfig.MAX_TERRAIN_ARENA_MIB.get());
         if (handles == null || handles.length != 4 || handles[0] == 0 || handles[1] == 0) {
             throw new IllegalStateException("DX12 did not expose its D3D11 device and shared texture.");
         }
@@ -354,6 +388,7 @@ public final class Dx12GlInterop {
 
     private static void resize(int frameWidth, int frameHeight) {
         GL11.glFinish();
+        finishPendingGlSync();
         unregisterTexture();
         long sharedTexture = NativeDx12.resizeInterop(frameWidth, frameHeight);
         if (sharedTexture == 0) {
@@ -438,7 +473,7 @@ public final class Dx12GlInterop {
                 levels.add(pixels);
             }
             NativeDx12.updateTerrainAtlas(levels.toArray(ByteBuffer[]::new), baseWidth, baseHeight,
-                    ClientConfig.COMPRESS_BLOCK_ATLAS.get());
+                    ClientConfig.COMPRESS_BLOCK_ATLAS.get(), ClientConfig.BC7_ENCODER_THREADS.get());
             blockAtlasDirty = false;
         } finally {
             GL11.glPixelStorei(GL11.GL_PACK_ALIGNMENT, previousPackAlignment);
@@ -526,14 +561,65 @@ public final class Dx12GlInterop {
             setEnabled(GL11.GL_STENCIL_TEST, stencilEnabled);
         }
 
-        boolean signalQueued = useGpuSemaphore && signalGlDoneFence(frame + 1);
-        if (useGpuSemaphore && !signalQueued) {
-            disableGpuSemaphore("OpenGL rejected the D3D12 timeline semaphore signal; using CPU fence waits.");
+        if (useGpuSemaphore) {
+            if (!signalGlDoneFence(frame + 1)) {
+                disableGpuSemaphore("OpenGL rejected the D3D12 timeline semaphore signal; using a polled GL sync.");
+                queueCpuGlSync(frame + 1);
+            }
+        } else {
+            queueCpuGlSync(frame + 1);
         }
-        if (!signalQueued) {
+    }
+
+    /** Queue a non-blocking GL completion fence for the CPU-synchronized interop fallback. */
+    private static void queueCpuGlSync(long value) {
+        if (pendingGlSync != 0) {
+            finishPendingGlSync();
+        }
+        long sync = GL32.glFenceSync(GL32.GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+        if (sync == 0) {
+            // The sync object could not be created; preserve correctness with the old blocking fallback.
             GL11.glFinish();
-            NativeDx12.signalInteropFence(frame + 1);
+            NativeDx12.signalInteropFence(value);
+            return;
         }
+        pendingGlSync = sync;
+        pendingGlFenceValue = value;
+        GL11.glFlush();
+    }
+
+    /** Polls without stalling the render thread. A false result means vanilla should render this frame. */
+    private static boolean pollCpuGlSync() {
+        if (pendingGlSync == 0) {
+            return true;
+        }
+        int result = GL32.glClientWaitSync(pendingGlSync, 0, 0L);
+        if (result == GL32.GL_ALREADY_SIGNALED || result == GL32.GL_CONDITION_SATISFIED) {
+            long value = pendingGlFenceValue;
+            GL32.glDeleteSync(pendingGlSync);
+            pendingGlSync = 0;
+            pendingGlFenceValue = 0;
+            NativeDx12.signalInteropFence(value);
+            return true;
+        }
+        if (result == GL32.GL_WAIT_FAILED) {
+            finishPendingGlSync();
+            return true;
+        }
+        return false;
+    }
+
+    /** Used only during resize/shutdown, when waiting is required before releasing shared resources. */
+    private static void finishPendingGlSync() {
+        if (pendingGlSync == 0) {
+            return;
+        }
+        GL11.glFinish();
+        long value = pendingGlFenceValue;
+        GL32.glDeleteSync(pendingGlSync);
+        pendingGlSync = 0;
+        pendingGlFenceValue = 0;
+        NativeDx12.signalInteropFence(value);
     }
 
     private static void initializeGpuSemaphore(long sharedReadyFenceHandle, long sharedGlDoneFenceHandle) {

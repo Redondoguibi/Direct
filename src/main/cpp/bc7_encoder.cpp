@@ -186,9 +186,12 @@ uint64_t bc7LevelSize(uint32_t width, uint32_t height) {
     return static_cast<uint64_t>((width + 3) / 4) * ((height + 3) / 4) * 16;
 }
 
-void encodeBc7Level(const uint8_t* rgba, uint32_t width, uint32_t height, uint8_t* blocks) {
+void encodeBc7Level(const uint8_t* rgba, uint32_t width, uint32_t height, uint8_t* blocks,
+        uint32_t maxThreads) {
     const uint32_t blocksHigh = (height + 3) / 4;
-    const uint32_t threadCount = std::clamp(std::thread::hardware_concurrency(), 1u, std::max(1u, blocksHigh));
+    const uint32_t hardwareThreads = std::max(1u, std::thread::hardware_concurrency());
+    const uint32_t availableThreads = std::min(hardwareThreads, std::max(1u, blocksHigh));
+    const uint32_t threadCount = std::clamp(maxThreads, 1u, availableThreads);
     std::vector<std::thread> threads;
     uint32_t started = 1;
     try {
