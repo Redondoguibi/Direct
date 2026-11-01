@@ -60,6 +60,9 @@ public final class Dx12GlInterop {
     private static final Matrix4f CAPTURED_PROJECTION = new Matrix4f();
     private static final Matrix4f VIEW_PROJECTION = new Matrix4f();
     private static final float[] MATRIX = new float[16];
+    private static final int[] PREVIOUS_VIEWPORT = new int[4];
+    private static final boolean[] PREVIOUS_COLOR_MASK = new boolean[4];
+    private static final String[] NO_PASS_SOURCES = new String[0];
 
     private static boolean matricesCaptured;
     private static double cameraX;
@@ -70,6 +73,8 @@ public final class Dx12GlInterop {
     private static boolean disabled;
     private static boolean reportedUnsupported;
     private static boolean reportedHook;
+    private static boolean wglInteropAvailable;
+    private static float[] passUniformScratch = new float[0];
     private static volatile boolean blockAtlasDirty = true;
     private static boolean terrainCaptureEnabled;
     private static boolean gpuSemaphoreInterop;
@@ -111,8 +116,10 @@ public final class Dx12GlInterop {
         boolean captured = matricesCaptured;
         matricesCaptured = false;
         if (!ClientConfig.ENABLE_DX12.get()) {
-            disableTerrainCapture();
-            shutdown();
+            if (initialized || terrainCaptureEnabled) {
+                disableTerrainCapture();
+                shutdown();
+            }
             disabled = false;
             DirectStatusOverlay.setStatus("Vanilla (disabled in config)");
             return;
@@ -122,18 +129,21 @@ public final class Dx12GlInterop {
         }
 
         try {
-            WGLCapabilities capabilities = GL.getCapabilitiesWGL();
-            if (capabilities == null || !capabilities.WGL_NV_DX_interop2) {
-                if (!reportedUnsupported) {
-                    Direct.LOGGER.error("WGL_NV_DX_interop2 is unavailable on the active OpenGL driver; "
-                            + "vanilla rendering remains active.");
-                    reportedUnsupported = true;
+            if (!wglInteropAvailable) {
+                WGLCapabilities capabilities = GL.getCapabilitiesWGL();
+                if (capabilities == null || !capabilities.WGL_NV_DX_interop2) {
+                    if (!reportedUnsupported) {
+                        Direct.LOGGER.error("WGL_NV_DX_interop2 is unavailable on the active OpenGL driver; "
+                                + "vanilla rendering remains active.");
+                        reportedUnsupported = true;
+                    }
+                    DirectRenderApi.updateCapabilities(DirectRenderCapabilities.unavailable());
+                    DirectStatusOverlay.setStatus("Vanilla (WGL interop unavailable)");
+                    disabled = true;
+                    disableTerrainCapture();
+                    return;
                 }
-                DirectRenderApi.updateCapabilities(DirectRenderCapabilities.unavailable());
-                DirectStatusOverlay.setStatus("Vanilla (WGL interop unavailable)");
-                disabled = true;
-                disableTerrainCapture();
-                return;
+                wglInteropAvailable = true;
             }
 
             Minecraft minecraft = Minecraft.getInstance();
@@ -175,27 +185,36 @@ public final class Dx12GlInterop {
             }
             long dxReadyValue = frameIndex + 1;
             float elapsedSeconds = (System.nanoTime() - startedAtNanos) / 1_000_000_000.0f;
+            float renderDistance = minecraft.options.getEffectiveRenderDistance() * 16.0f;
             DirectFrameContext frameContext = DirectRenderApi.frame(frameIndex, currentWidth, currentHeight,
-                    elapsedSeconds, minecraft.options.getEffectiveRenderDistance() * 16.0f);
+                    elapsedSeconds, renderDistance);
             DirectRenderEventBridge.postFrame(new DirectFrameRenderEvent(
                     DirectFrameRenderEvent.Stage.BEFORE_PASSES, frameContext));
             List<DirectRenderPass> passes = DirectRenderApi.snapshot();
             if (DirectRenderApi.consumeDirty()) {
-                NativeDx12.configureRenderPasses(passes.stream()
-                        .map(DirectRenderPass::pixelShaderSource).toArray(String[]::new));
+                String[] sources = NO_PASS_SOURCES;
+                if (!passes.isEmpty()) {
+                    sources = new String[passes.size()];
+                    for (int index = 0; index < passes.size(); index++) {
+                        sources[index] = passes.get(index).pixelShaderSource();
+                    }
+                }
+                NativeDx12.configureRenderPasses(sources);
             }
-            float[] passUniforms = new float[passes.size() * DirectRenderApi.MAX_UNIFORM_FLOATS];
+            int uniformCount = passes.size() * DirectRenderApi.MAX_UNIFORM_FLOATS;
+            if (passUniformScratch.length != uniformCount) {
+                passUniformScratch = new float[uniformCount];
+            }
             for (int index = 0; index < passes.size(); index++) {
                 DirectRenderPass pass = passes.get(index);
                 DirectFrameContext passContext = DirectRenderApi.frame(frameIndex, currentWidth, currentHeight,
-                        elapsedSeconds, minecraft.options.getEffectiveRenderDistance() * 16.0f,
-                        pass.id(), index);
-                float[] values = DirectRenderApi.uniformValues(pass, passContext);
-                System.arraycopy(values, 0, passUniforms, index * DirectRenderApi.MAX_UNIFORM_FLOATS, values.length);
+                        elapsedSeconds, renderDistance, pass.id(), index);
+                DirectRenderApi.copyUniforms(pass, passContext, passUniformScratch,
+                        index * DirectRenderApi.MAX_UNIFORM_FLOATS);
             }
             boolean nativeGpu = NativeDx12.renderInterop(MATRIX, cameraX, cameraY, cameraZ,
-                    minecraft.options.getEffectiveRenderDistance() * 16.0f, frameIndex,
-                    elapsedSeconds, passUniforms, gpuSemaphoreInterop);
+                    renderDistance, frameIndex,
+                    elapsedSeconds, passUniformScratch, gpuSemaphoreInterop);
             if (gpuSemaphoreInterop && !nativeGpu) {
                 disableGpuSemaphore("The native command queue could not enqueue a GPU-side fence wait; "
                         + "using CPU fence waits.");
@@ -237,6 +256,7 @@ public final class Dx12GlInterop {
             glDoneSemaphore = 0;
         }
         gpuSemaphoreInterop = false;
+        wglInteropAvailable = false;
         unregisterTexture();
         if (interopDevice != 0) {
             WGLNVDXInterop.wglDXCloseDeviceNV(interopDevice);
@@ -404,8 +424,7 @@ public final class Dx12GlInterop {
         int previousProgram = GL11.glGetInteger(GL20.GL_CURRENT_PROGRAM);
         int previousVertexArray = GL11.glGetInteger(GL30.GL_VERTEX_ARRAY_BINDING);
         int previousActiveTexture = GL11.glGetInteger(GL13.GL_ACTIVE_TEXTURE);
-        int[] previousViewport = new int[4];
-        GL11.glGetIntegerv(GL11.GL_VIEWPORT, previousViewport);
+        GL11.glGetIntegerv(GL11.GL_VIEWPORT, PREVIOUS_VIEWPORT);
         GL13.glActiveTexture(GL13.GL_TEXTURE0);
         int previousTexture = GL11.glGetInteger(GL11.GL_TEXTURE_BINDING_2D);
         boolean depthEnabled = GL11.glIsEnabled(GL11.GL_DEPTH_TEST);
@@ -420,13 +439,12 @@ public final class Dx12GlInterop {
         int blendDstAlpha = GL11.glGetInteger(GL14.GL_BLEND_DST_ALPHA);
         int blendEquationRgb = GL11.glGetInteger(GL20.GL_BLEND_EQUATION_RGB);
         int blendEquationAlpha = GL11.glGetInteger(GL20.GL_BLEND_EQUATION_ALPHA);
-        boolean[] previousColorMask = new boolean[4];
 
         try (MemoryStack stack = MemoryStack.stackPush()) {
             ByteBuffer colorMask = stack.malloc(4);
             GL11.glGetBooleanv(GL11.GL_COLOR_WRITEMASK, colorMask);
             for (int component = 0; component < 4; component++) {
-                previousColorMask[component] = colorMask.get(component) != 0;
+                PREVIOUS_COLOR_MASK[component] = colorMask.get(component) != 0;
             }
             var objects = stack.mallocPointer(1);
             objects.put(0, interopObject);
@@ -467,9 +485,10 @@ public final class Dx12GlInterop {
             GL30.glBindVertexArray(previousVertexArray);
             GL11.glBindTexture(GL11.GL_TEXTURE_2D, previousTexture);
             GL13.glActiveTexture(previousActiveTexture);
-            GL11.glViewport(previousViewport[0], previousViewport[1], previousViewport[2], previousViewport[3]);
+            GL11.glViewport(PREVIOUS_VIEWPORT[0], PREVIOUS_VIEWPORT[1], PREVIOUS_VIEWPORT[2], PREVIOUS_VIEWPORT[3]);
             GL11.glDepthMask(depthMask);
-            GL11.glColorMask(previousColorMask[0], previousColorMask[1], previousColorMask[2], previousColorMask[3]);
+            GL11.glColorMask(PREVIOUS_COLOR_MASK[0], PREVIOUS_COLOR_MASK[1], PREVIOUS_COLOR_MASK[2],
+                    PREVIOUS_COLOR_MASK[3]);
             GL20.glBlendEquationSeparate(blendEquationRgb, blendEquationAlpha);
             GL14.glBlendFuncSeparate(blendSrcRgb, blendDstRgb, blendSrcAlpha, blendDstAlpha);
             setEnabled(GL11.GL_DEPTH_TEST, depthEnabled);

@@ -98,6 +98,14 @@ class DirectRenderServiceTest {
         assertEquals(DirectRenderApi.MAX_UNIFORM_FLOATS, result.length);
         assertArrayEquals(new float[] {1.0f, 0.5f, 0.25f, 1.0f}, java.util.Arrays.copyOf(result, 4));
         assertEquals(0.0f, result[4]);
+
+        float[] reused = new float[DirectRenderApi.MAX_UNIFORM_FLOATS];
+        java.util.Arrays.fill(reused, 9.0f);
+        DirectRenderApi.copyUniforms(pass, DirectRenderApi.frame(7, 1280, 720, 4.0f, 96.0f, pass.id(), 2),
+                reused, 0);
+        assertArrayEquals(new float[] {1.0f, 0.5f, 0.25f, 1.0f}, java.util.Arrays.copyOf(reused, 4));
+        assertEquals(0.0f, reused[4]);
+        assertEquals(0.0f, reused[DirectRenderApi.MAX_UNIFORM_FLOATS - 1]);
     }
 
     @Test

@@ -13,7 +13,6 @@
 #include <cstdint>
 #include <cstring>
 #include <deque>
-#include <functional>
 #include <limits>
 #include <mutex>
 #include <string>
@@ -114,15 +113,17 @@ struct ExtensionPass {
 };
 
 struct Plane {
-    float a, b, c, d;
+    float a, b, c, d, length;
 };
+
+enum class PassRole { ClearOnly, Opaque, Cutout };
 
 // Thread persistente que grava uma command list enquanto a thread de render grava outra.
 struct RecordWorker {
     std::thread thread;
     std::mutex mutex;
     std::condition_variable condition;
-    std::function<bool()> job;
+    FrameSlot* slot;
     bool pending;
     bool stop;
     bool result;
@@ -172,6 +173,7 @@ struct InteropRenderer {
     ID3D12DescriptorHeap* extensionRtvHeap;
     ID3D12DescriptorHeap* extensionSrvHeap;
     UINT extensionSrvIncrement;
+    UINT extensionRtvIncrement;
     ID3D12Resource* extensionTargets[kMaxExtensionPasses];
     FrameSlot slots[kFramesInFlight];
     UINT slotIndex;
@@ -193,7 +195,11 @@ struct InteropRenderer {
     RecordWorker worker;
     bool workerRunning;
     std::unordered_map<jlong, TerrainSection*> sections;
+    std::vector<TerrainSection*> sectionList;
 };
+
+bool recordTerrainList(InteropRenderer* renderer, ID3D12CommandAllocator* allocator,
+        ID3D12GraphicsCommandList* list, ID3D12GraphicsCommandList4* passList, PassRole role);
 
 InteropRenderer* g_interopRenderer;
 
@@ -358,16 +364,18 @@ void fenceWatchdog(InteropRenderer* renderer) {
     }
 }
 
-void recordWorkerLoop(RecordWorker* worker) {
+void recordWorkerLoop(InteropRenderer* renderer) {
+    RecordWorker* worker = &renderer->worker;
     std::unique_lock<std::mutex> lock(worker->mutex);
     for (;;) {
         worker->condition.wait(lock, [worker] { return worker->stop || worker->pending; });
         if (worker->stop) {
             return;
         }
-        std::function<bool()> job = std::move(worker->job);
+        FrameSlot* slot = worker->slot;
         lock.unlock();
-        const bool result = job();
+        const bool result = recordTerrainList(renderer, slot->cutout, renderer->cutoutList,
+                renderer->cutoutPassList, PassRole::Cutout);
         lock.lock();
         worker->result = result;
         worker->pending = false;
@@ -478,6 +486,7 @@ void retireTerrainSections(InteropRenderer* renderer) {
         retireSection(renderer, entry.second);
     }
     renderer->sections.clear();
+    renderer->sectionList.clear();
 }
 
 void releaseExtensionResources(InteropRenderer* renderer) {
@@ -854,6 +863,8 @@ bool createExtensionResources(InteropRenderer* renderer, JNIEnv* env) {
     }
     renderer->extensionSrvIncrement = renderer->device->GetDescriptorHandleIncrementSize(
             D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    renderer->extensionRtvIncrement = renderer->device->GetDescriptorHandleIncrementSize(
+            D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
     const D3D12_RESOURCE_DESC description = {
         D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, renderer->width, renderer->height, 1, 1,
         kColorFormat, {1, 0}, D3D12_TEXTURE_LAYOUT_UNKNOWN, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET
@@ -865,7 +876,6 @@ bool createExtensionResources(InteropRenderer* renderer, JNIEnv* env) {
     std::memcpy(clear.Color, kClearColor, sizeof(kClearColor));
     D3D12_CPU_DESCRIPTOR_HANDLE rtvHandle = renderer->extensionRtvHeap->GetCPUDescriptorHandleForHeapStart();
     D3D12_CPU_DESCRIPTOR_HANDLE srvHandle = renderer->extensionSrvHeap->GetCPUDescriptorHandleForHeapStart();
-    const UINT rtvIncrement = renderer->device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
     for (UINT index = 0; index < passCount; ++index) {
         if (FAILED(renderer->device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &description,
                 D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, &clear,
@@ -881,7 +891,7 @@ bool createExtensionResources(InteropRenderer* renderer, JNIEnv* env) {
         view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
         view.Texture2D.MipLevels = 1;
         renderer->device->CreateShaderResourceView(input, &view, srvHandle);
-        rtvHandle.ptr += rtvIncrement;
+        rtvHandle.ptr += renderer->extensionRtvIncrement;
         srvHandle.ptr += renderer->extensionSrvIncrement;
     }
     return true;
@@ -1041,7 +1051,7 @@ bool createCommandObjects(InteropRenderer* renderer) {
 
 void startRecordWorker(InteropRenderer* renderer) {
     try {
-        renderer->worker.thread = std::thread(recordWorkerLoop, &renderer->worker);
+        renderer->worker.thread = std::thread(recordWorkerLoop, renderer);
         renderer->workerRunning = true;
     } catch (const std::system_error&) {
         renderer->workerRunning = false; // grava as duas listas na thread de render
@@ -1055,6 +1065,9 @@ bool initializeInteropRenderer(InteropRenderer* renderer, jint width, jint heigh
     }
     renderer->width = static_cast<UINT>(width);
     renderer->height = static_cast<UINT>(height);
+    renderer->uploadBarriers.reserve(64);
+    renderer->visible.reserve(256);
+    renderer->sectionList.reserve(256);
     if (FAILED(D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&renderer->device)))) {
         throwJava(env, "DX12/OpenGL interop could not create a Direct3D 12 device.");
         return false;
@@ -1116,17 +1129,14 @@ void extractFrustum(const float* m, Plane* planes) {
     for (int index = 0; index < 6; ++index) {
         const int axis = index / 2;
         const float sign = index % 2 == 0 ? 1.0f : -1.0f;
-        Plane plane;
+        Plane plane = {};
         if (axis == 2 && sign > 0.0f) { // near: z >= 0 (clip D3D)
-            plane = {at(2, 0), at(2, 1), at(2, 2), at(2, 3)};
+            plane = {at(2, 0), at(2, 1), at(2, 2), at(2, 3), 0.0f};
         } else {
             plane = {at(3, 0) + sign * at(axis, 0), at(3, 1) + sign * at(axis, 1),
-                    at(3, 2) + sign * at(axis, 2), at(3, 3) + sign * at(axis, 3)};
+                    at(3, 2) + sign * at(axis, 2), at(3, 3) + sign * at(axis, 3), 0.0f};
         }
-        const float length = std::sqrt(plane.a * plane.a + plane.b * plane.b + plane.c * plane.c);
-        if (length > 0.0f) {
-            plane = {plane.a / length, plane.b / length, plane.c / length, plane.d / length};
-        }
+        plane.length = std::sqrt(plane.a * plane.a + plane.b * plane.b + plane.c * plane.c);
         planes[index] = plane;
     }
 }
@@ -1134,7 +1144,7 @@ void extractFrustum(const float* m, Plane* planes) {
 bool sphereVisible(const Plane* planes, float x, float y, float z, float radius) {
     for (int index = 0; index < 6; ++index) {
         const Plane& p = planes[index];
-        if (p.a * x + p.b * y + p.c * z + p.d < -radius) {
+        if (p.a * x + p.b * y + p.c * z + p.d < -radius * p.length) {
             return false;
         }
     }
@@ -1144,11 +1154,11 @@ bool sphereVisible(const Plane* planes, float x, float y, float z, float radius)
 void collectVisibleSections(InteropRenderer* renderer, double cameraX, double cameraY, double cameraZ,
         float renderDistance) {
     renderer->visible.clear();
+    renderer->visible.reserve(renderer->sectionList.size());
     Plane frustum[6];
     extractFrustum(renderer->viewProjection, frustum);
     const double maxDistanceSquared = static_cast<double>(renderDistance) * renderDistance;
-    for (const auto& entry : renderer->sections) {
-        const TerrainSection* section = entry.second;
+    for (const TerrainSection* section : renderer->sectionList) {
         const double ox = section->x - cameraX;
         const double oy = section->y - cameraY;
         const double oz = section->z - cameraZ;
@@ -1164,8 +1174,6 @@ void collectVisibleSections(InteropRenderer* renderer, double cameraX, double ca
                 static_cast<float>(oz)}});
     }
 }
-
-enum class PassRole { ClearOnly, Opaque, Cutout };
 
 // Opaco abre o render pass (clear) e o suspende; cutout o retoma e descarta o depth no fim.
 void beginTerrainPass(InteropRenderer* renderer, ID3D12GraphicsCommandList* list,
@@ -1218,16 +1226,6 @@ void beginTerrainPass(InteropRenderer* renderer, ID3D12GraphicsCommandList* list
     list->SetGraphicsRootDescriptorTable(2, renderer->srvHeap->GetGPUDescriptorHandleForHeapStart());
 }
 
-void drawLayer(InteropRenderer* renderer, ID3D12GraphicsCommandList* list, const VisibleSection& entry,
-        UINT layer) {
-    UINT32 constants[kDrawConstantCount];
-    std::memcpy(constants, entry.offset, sizeof(entry.offset));
-    std::memcpy(&constants[3], &kLayerAlphaCutoff[layer], sizeof(float));
-    constants[4] = renderer->atlasIndex;
-    list->SetGraphicsRoot32BitConstants(1, kDrawConstantCount, constants, 0);
-    list->DrawIndexedInstanced(entry.section->layerIndexCounts[layer], 1, entry.section->layerStart[layer], 0, 0);
-}
-
 bool recordTerrainList(InteropRenderer* renderer, ID3D12CommandAllocator* allocator,
         ID3D12GraphicsCommandList* list, ID3D12GraphicsCommandList4* passList, PassRole role) {
     if (FAILED(allocator->Reset()) || FAILED(list->Reset(allocator, nullptr))) {
@@ -1237,6 +1235,8 @@ bool recordTerrainList(InteropRenderer* renderer, ID3D12CommandAllocator* alloca
     const UINT firstLayer = role == PassRole::Opaque ? 0 : 1;
     const UINT lastLayer = role == PassRole::Opaque ? 1 : kLayerCount;
     if (role != PassRole::ClearOnly) {
+        const UINT atlasIndex = renderer->atlasIndex;
+        list->SetGraphicsRoot32BitConstants(1, 1, &atlasIndex, 4);
         for (const VisibleSection& entry : renderer->visible) {
             const TerrainSection* section = entry.section;
             bool bound = false;
@@ -1247,9 +1247,11 @@ bool recordTerrainList(InteropRenderer* renderer, ID3D12CommandAllocator* alloca
                 if (!bound) {
                     list->IASetVertexBuffers(0, 1, &section->vertexView);
                     list->IASetIndexBuffer(&section->indexView);
+                    list->SetGraphicsRoot32BitConstants(1, 3, entry.offset, 0);
                     bound = true;
                 }
-                drawLayer(renderer, list, entry, layer);
+                list->SetGraphicsRoot32BitConstants(1, 1, &kLayerAlphaCutoff[layer], 3);
+                list->DrawIndexedInstanced(section->layerIndexCounts[layer], 1, section->layerStart[layer], 0, 0);
             }
         }
     }
@@ -1265,18 +1267,16 @@ bool recordTerrain(InteropRenderer* renderer, FrameSlot& slot, bool drawTerrain)
         return recordTerrainList(renderer, slot.opaque, renderer->opaqueList, renderer->opaquePassList,
                 PassRole::ClearOnly);
     }
-    auto cutoutJob = [renderer, &slot] {
-        return recordTerrainList(renderer, slot.cutout, renderer->cutoutList, renderer->cutoutPassList,
-                PassRole::Cutout);
-    };
     if (!renderer->workerRunning) {
         return recordTerrainList(renderer, slot.opaque, renderer->opaqueList, renderer->opaquePassList,
-                PassRole::Opaque) && cutoutJob();
+                PassRole::Opaque)
+                && recordTerrainList(renderer, slot.cutout, renderer->cutoutList, renderer->cutoutPassList,
+                        PassRole::Cutout);
     }
     RecordWorker& worker = renderer->worker;
     {
         std::lock_guard<std::mutex> lock(worker.mutex);
-        worker.job = cutoutJob;
+        worker.slot = &slot;
         worker.pending = true;
     }
     worker.condition.notify_all();
@@ -1335,7 +1335,6 @@ bool recordExtensionPasses(InteropRenderer* renderer, FrameSlot& slot, UINT64 fr
             D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
     list->ResourceBarrier(1, &colorForSampling);
     D3D12_CPU_DESCRIPTOR_HANDLE rtv = renderer->extensionRtvHeap->GetCPUDescriptorHandleForHeapStart();
-    const UINT rtvIncrement = renderer->device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
     D3D12_GPU_DESCRIPTOR_HANDLE input = renderer->extensionSrvHeap->GetGPUDescriptorHandleForHeapStart();
     for (UINT index = 0; index < renderer->extensionPasses.size(); ++index) {
         ID3D12Resource* output = renderer->extensionTargets[index];
@@ -1357,7 +1356,7 @@ bool recordExtensionPasses(InteropRenderer* renderer, FrameSlot& slot, UINT64 fr
         const D3D12_RESOURCE_BARRIER toShaderResource = transition(output,
                 D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
         list->ResourceBarrier(1, &toShaderResource);
-        rtv.ptr += rtvIncrement;
+        rtv.ptr += renderer->extensionRtvIncrement;
         input.ptr += renderer->extensionSrvIncrement;
     }
 
@@ -1677,9 +1676,9 @@ Java_com_redondoguibi_direct_NativeDx12_renderInterop(JNIEnv* env, jclass, jfloa
     if (env->ExceptionCheck()) {
         return JNI_FALSE;
     }
-    std::vector<float> uniformValues(static_cast<size_t>(expectedUniforms));
+    float uniformValues[kMaxExtensionPasses * kPassUniformFloatCount];
     if (expectedUniforms > 0) {
-        env->GetFloatArrayRegion(passUniforms, 0, expectedUniforms, uniformValues.data());
+        env->GetFloatArrayRegion(passUniforms, 0, expectedUniforms, uniformValues);
         if (env->ExceptionCheck()) {
             return JNI_FALSE;
         }
@@ -1687,7 +1686,7 @@ Java_com_redondoguibi_direct_NativeDx12_renderInterop(JNIEnv* env, jclass, jfloa
     bool gpuUsed = false;
     if (!renderInteropFrame(g_interopRenderer, values, cameraX, cameraY, cameraZ, renderDistance,
             static_cast<UINT64>(frameIndex), elapsedSeconds,
-            uniformValues.empty() ? nullptr : uniformValues.data(),
+            expectedUniforms > 0 ? uniformValues : nullptr,
             useGpuSynchronization == JNI_TRUE, env, &gpuUsed)) {
         return JNI_FALSE;
     }
@@ -1794,10 +1793,18 @@ Java_com_redondoguibi_direct_NativeDx12_updateTerrainSection(JNIEnv* env, jclass
     }
     auto existing = renderer->sections.find(key);
     if (existing != renderer->sections.end()) {
-        retireSection(renderer, existing->second);
+        TerrainSection* previous = existing->second;
+        for (TerrainSection*& entry : renderer->sectionList) {
+            if (entry == previous) {
+                entry = section;
+                break;
+            }
+        }
+        retireSection(renderer, previous);
         existing->second = section;
     } else {
         renderer->sections.emplace(key, section);
+        renderer->sectionList.push_back(section);
     }
 }
 
@@ -1842,7 +1849,16 @@ Java_com_redondoguibi_direct_NativeDx12_removeTerrainSection(JNIEnv*, jclass, jl
     }
     auto existing = g_interopRenderer->sections.find(key);
     if (existing != g_interopRenderer->sections.end()) {
-        retireSection(g_interopRenderer, existing->second);
+        TerrainSection* section = existing->second;
+        auto& list = g_interopRenderer->sectionList;
+        for (size_t index = 0; index < list.size(); ++index) {
+            if (list[index] == section) {
+                list[index] = list.back();
+                list.pop_back();
+                break;
+            }
+        }
+        retireSection(g_interopRenderer, section);
         g_interopRenderer->sections.erase(existing);
     }
 }

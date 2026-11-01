@@ -18,7 +18,9 @@ final class DirectStatusOverlay {
     }
 
     static void setStatus(String next) {
-        status = next;
+        if (!next.equals(status)) {
+            status = next;
+        }
     }
 
     private static void render(GuiGraphics graphics, DeltaTracker deltaTracker) {

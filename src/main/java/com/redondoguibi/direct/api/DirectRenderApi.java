@@ -22,6 +22,7 @@ public final class DirectRenderApi implements DirectRenderService {
     private static final DirectRenderApi INSTANCE = new DirectRenderApi();
     private final ConcurrentHashMap<String, DirectRenderPass> passes = new ConcurrentHashMap<>();
     private final AtomicBoolean dirty = new AtomicBoolean(true);
+    private volatile List<DirectRenderPass> orderedPasses = List.of();
     private volatile DirectRenderCapabilities capabilities = DirectRenderCapabilities.unavailable();
 
     private DirectRenderApi() {
@@ -114,6 +115,21 @@ public final class DirectRenderApi implements DirectRenderService {
      * @return fixed-size uniform array
      */
     public static float[] uniformValues(DirectRenderPass pass, DirectFrameContext context) {
+        float[] padded = new float[MAX_UNIFORM_FLOATS];
+        copyUniforms(pass, context, padded, 0);
+        return padded;
+    }
+
+    /**
+     * Validates a pass's uniforms and writes them into a native-sized slot, zero-padding the tail.
+     *
+     * @param pass registered pass
+     * @param context frame context
+     * @param destination destination array
+     * @param destinationOffset start of this pass's slot
+     */
+    public static void copyUniforms(DirectRenderPass pass, DirectFrameContext context, float[] destination,
+            int destinationOffset) {
         float[] values;
         try {
             values = pass.uniforms(context);
@@ -128,9 +144,11 @@ public final class DirectRenderApi implements DirectRenderService {
             throw new IllegalArgumentException("Direct pass " + pass.id() + " returned more than "
                     + MAX_UNIFORM_FLOATS + " uniform floats.");
         }
-        float[] padded = new float[MAX_UNIFORM_FLOATS];
-        System.arraycopy(values, 0, padded, 0, values.length);
-        return padded;
+        System.arraycopy(values, 0, destination, destinationOffset, values.length);
+        if (values.length < MAX_UNIFORM_FLOATS) {
+            java.util.Arrays.fill(destination, destinationOffset + values.length,
+                    destinationOffset + MAX_UNIFORM_FLOATS, 0.0f);
+        }
     }
 
     @Override
@@ -159,14 +177,16 @@ public final class DirectRenderApi implements DirectRenderService {
             passes.remove(id, pass);
             throw new IllegalArgumentException("Direct supports at most " + MAX_PASSES + " extension passes.");
         }
+        refreshOrderedPasses();
         dirty.set(true);
     }
 
     @Override
-    public boolean unregisterPass(String id) {
+    public synchronized boolean unregisterPass(String id) {
         Objects.requireNonNull(id, "id");
         boolean removed = passes.remove(id) != null;
         if (removed) {
+            refreshOrderedPasses();
             dirty.set(true);
         }
         return removed;
@@ -174,8 +194,12 @@ public final class DirectRenderApi implements DirectRenderService {
 
     @Override
     public List<DirectRenderPass> passes() {
+        return orderedPasses;
+    }
+
+    private void refreshOrderedPasses() {
         ArrayList<DirectRenderPass> snapshot = new ArrayList<>(passes.values());
         snapshot.sort(Comparator.comparingInt(DirectRenderPass::order).thenComparing(DirectRenderPass::id));
-        return List.copyOf(snapshot);
+        orderedPasses = List.copyOf(snapshot);
     }
 }
