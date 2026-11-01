@@ -9,7 +9,7 @@ if(NOT JAVA_HOME)
     message(FATAL_ERROR "JAVA_HOME must point to the JDK used to run Gradle.")
 endif()
 
-add_library(direct_renderer SHARED direct_renderer.cpp dx12_gl_interop.cpp)
+add_library(direct_renderer SHARED direct_renderer.cpp dx12_gl_interop.cpp bc7_encoder.cpp)
 target_compile_features(direct_renderer PRIVATE cxx_std_17)
 target_compile_definitions(direct_renderer PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
 target_include_directories(direct_renderer PRIVATE

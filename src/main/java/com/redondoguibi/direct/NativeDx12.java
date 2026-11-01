@@ -30,7 +30,7 @@ final class NativeDx12 {
     static native void updateTerrainSection(long key, int sectionX, int sectionY, int sectionZ,
             ByteBuffer vertices, int vertexCount, ByteBuffer indices, int[] layerIndexCounts);
 
-    static native void updateTerrainAtlas(ByteBuffer[] mipLevels, int width, int height);
+    static native void updateTerrainAtlas(ByteBuffer[] mipLevels, int width, int height, boolean compressBc7);
 
     static native void removeTerrainSection(long key);
 

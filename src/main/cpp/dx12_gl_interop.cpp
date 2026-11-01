@@ -4,53 +4,62 @@
 #include <d3d11on12.h>
 #include <d3d12.h>
 #include <d3dcompiler.h>
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
 #include <cstdint>
 #include <cstring>
+#include <deque>
+#include <functional>
 #include <limits>
 #include <mutex>
 #include <system_error>
 #include <thread>
 #include <unordered_map>
+#include <vector>
+
+#include "bc7_encoder.h"
 
 namespace {
 
 constexpr UINT64 kFenceError = std::numeric_limits<UINT64>::max();
 constexpr DWORD kFenceWaitTimeoutMs = 5000;
-constexpr UINT kVertexStride = 24;
+constexpr UINT kVertexStride = 16;
 constexpr UINT kLayerCount = 3;
+constexpr UINT kFramesInFlight = 3;
+constexpr UINT kAtlasSlots = 64;
+constexpr UINT kDrawConstantCount = 5;
 constexpr jsize kMaxAtlasLevels = 16;
 constexpr float kSectionRadius = 13.8564f; // sqrt(3) * 8
 constexpr float kClearColor[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+constexpr DXGI_FORMAT kColorFormat = DXGI_FORMAT_R8G8B8A8_UNORM;
+constexpr DXGI_FORMAT kDepthFormat = DXGI_FORMAT_D32_FLOAT;
 // Ordem das camadas: solid, cutout_mipped, cutout (confirmar nos .fsh vanilla).
 constexpr float kLayerAlphaCutoff[kLayerCount] = {-1.0f, 0.5f, 0.1f};
 
-constexpr char kTerrainVertexShader[] = R"(
-cbuffer SectionConstants : register(b0) {
-    float4x4 viewProjection;
-    float4 sectionOffset;
-};
-struct VertexInput { float3 position : POSITION; float4 color : COLOR; float2 uv : TEXCOORD0; };
+// Vértice de 16 bytes: posição uint16 (1/1024 de bloco, origem -16), cor RGBA8, UV unorm16.
+constexpr char kTerrainShader[] = R"(
+cbuffer FrameConstants : register(b0) { float4x4 viewProjection; };
+cbuffer DrawConstants : register(b1) { float3 sectionOffset; float alphaCutoff; uint atlasIndex; };
+Texture2D atlasTextures[ATLAS_SLOTS] : register(t0);
+SamplerState atlasSampler : register(s0);
+struct VertexInput { uint4 position : POSITION; float4 color : COLOR; float2 uv : TEXCOORD0; };
 struct VertexOutput { float4 position : SV_Position; float4 color : COLOR; float2 uv : TEXCOORD0; };
-VertexOutput main(VertexInput input) {
+VertexOutput vsMain(VertexInput input) {
     VertexOutput output;
-    output.position = mul(viewProjection, float4(input.position + sectionOffset.xyz, 1.0));
+    float3 local = float3(input.position.xyz) * (1.0 / 1024.0) - 16.0;
+    output.position = mul(viewProjection, float4(local + sectionOffset, 1.0));
     output.color = input.color;
     output.uv = input.uv;
     return output;
 }
-)";
-
-constexpr char kTerrainPixelShader[] = R"(
-cbuffer LayerConstants : register(b1) { float4 layer; };
-Texture2D terrainAtlas : register(t0);
-SamplerState terrainAtlasSampler : register(s0);
-float4 main(float4 position : SV_Position, float4 color : COLOR, float2 uv : TEXCOORD0) : SV_Target {
-    float4 result = terrainAtlas.Sample(terrainAtlasSampler, uv) * color;
-    clip(result.a - layer.x);
+float4 psMain(VertexOutput input) : SV_Target {
+    float4 result = atlasTextures[atlasIndex].Sample(atlasSampler, input.uv) * input.color;
+#ifdef DIRECT_CUTOUT
+    clip(result.a - alphaCutoff);
+#endif
     return float4(result.rgb, 1.0);
 }
 )";
@@ -60,17 +69,42 @@ struct TerrainSection {
     int y;
     int z;
     UINT layerIndexCounts[kLayerCount];
-    ID3D11Buffer* vertexBuffer;
-    ID3D11Buffer* indexBuffer;
+    UINT layerStart[kLayerCount];
+    ID3D12Resource* buffer;
+    D3D12_VERTEX_BUFFER_VIEW vertexView;
+    D3D12_INDEX_BUFFER_VIEW indexView;
 };
 
-struct SectionConstants {
-    float viewProjection[16];
-    float sectionOffset[4];
+struct VisibleSection {
+    const TerrainSection* section;
+    float offset[3];
+};
+
+struct RetiredResource {
+    UINT64 fenceValue;
+    ID3D12Resource* resource;
+};
+
+struct FrameSlot {
+    ID3D12CommandAllocator* upload;
+    ID3D12CommandAllocator* opaque;
+    ID3D12CommandAllocator* cutout;
+    UINT64 fenceValue;
 };
 
 struct Plane {
     float a, b, c, d;
+};
+
+// Thread persistente que grava uma command list enquanto a thread de render grava outra.
+struct RecordWorker {
+    std::thread thread;
+    std::mutex mutex;
+    std::condition_variable condition;
+    std::function<bool()> job;
+    bool pending;
+    bool stop;
+    bool result;
 };
 
 struct InteropRenderer {
@@ -92,22 +126,40 @@ struct InteropRenderer {
     UINT64 watchedFenceValue;
     bool stopWatchdog;
     std::atomic<bool> gpuSyncFault;
+    // D3D11On12 só faz a ponte para o WGL: uma cópia por frame para a textura importada.
     ID3D11Device* d3d11Device;
     ID3D11DeviceContext* d3d11Context;
+    ID3D11On12Device* d3d11On12;
     ID3D11Texture2D* interopTexture;
-    ID3D11RenderTargetView* renderTarget;
-    ID3D11Texture2D* depthTexture;
-    ID3D11DepthStencilView* depthView;
-    ID3D11RasterizerState* rasterizerState;
-    ID3D11DepthStencilState* depthState;
-    ID3D11VertexShader* vertexShader;
-    ID3D11PixelShader* pixelShader;
-    ID3D11InputLayout* inputLayout;
-    ID3D11Buffer* sectionConstants;
-    ID3D11Buffer* layerConstants[kLayerCount];
-    ID3D11Texture2D* atlas;
-    ID3D11ShaderResourceView* atlasView;
-    ID3D11SamplerState* atlasSampler;
+    ID3D11Resource* wrappedColor;
+    // Pipeline de terreno D3D12 nativo.
+    ID3D12Resource* colorTarget;
+    ID3D12Resource* depthTarget;
+    ID3D12DescriptorHeap* rtvHeap;
+    ID3D12DescriptorHeap* dsvHeap;
+    ID3D12DescriptorHeap* srvHeap;
+    UINT srvIncrement;
+    ID3D12RootSignature* rootSignature;
+    ID3D12PipelineState* opaquePipeline;
+    ID3D12PipelineState* cutoutPipeline;
+    FrameSlot slots[kFramesInFlight];
+    UINT slotIndex;
+    ID3D12GraphicsCommandList* uploadList;
+    ID3D12GraphicsCommandList* opaqueList;
+    ID3D12GraphicsCommandList* cutoutList;
+    ID3D12GraphicsCommandList4* opaquePassList;
+    ID3D12GraphicsCommandList4* cutoutPassList;
+    bool uploadOpen;
+    std::vector<D3D12_RESOURCE_BARRIER> uploadBarriers;
+    std::vector<ID3D12Resource*> pendingRetire;
+    std::deque<RetiredResource> retired;
+    ID3D12Resource* atlas;
+    UINT atlasIndex;
+    UINT nextAtlasSlot;
+    std::vector<VisibleSection> visible;
+    float viewProjection[16];
+    RecordWorker worker;
+    bool workerRunning;
     std::unordered_map<jlong, TerrainSection*> sections;
 };
 
@@ -225,26 +277,135 @@ void fenceWatchdog(InteropRenderer* renderer) {
     }
 }
 
+void recordWorkerLoop(RecordWorker* worker) {
+    std::unique_lock<std::mutex> lock(worker->mutex);
+    for (;;) {
+        worker->condition.wait(lock, [worker] { return worker->stop || worker->pending; });
+        if (worker->stop) {
+            return;
+        }
+        std::function<bool()> job = std::move(worker->job);
+        lock.unlock();
+        const bool result = job();
+        lock.lock();
+        worker->result = result;
+        worker->pending = false;
+        worker->condition.notify_all();
+    }
+}
+
+void stopRecordWorker(InteropRenderer* renderer) {
+    if (!renderer->workerRunning) {
+        return;
+    }
+    {
+        std::lock_guard<std::mutex> lock(renderer->worker.mutex);
+        renderer->worker.stop = true;
+    }
+    renderer->worker.condition.notify_all();
+    renderer->worker.thread.join();
+    renderer->workerRunning = false;
+}
+
+D3D12_RESOURCE_BARRIER transition(ID3D12Resource* resource, D3D12_RESOURCE_STATES before,
+        D3D12_RESOURCE_STATES after) {
+    D3D12_RESOURCE_BARRIER barrier = {};
+    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    barrier.Transition.pResource = resource;
+    barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    barrier.Transition.StateBefore = before;
+    barrier.Transition.StateAfter = after;
+    return barrier;
+}
+
+D3D12_RESOURCE_DESC bufferDescription(UINT64 bytes) {
+    D3D12_RESOURCE_DESC description = {};
+    description.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    description.Width = bytes;
+    description.Height = 1;
+    description.DepthOrArraySize = 1;
+    description.MipLevels = 1;
+    description.SampleDesc.Count = 1;
+    description.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    return description;
+}
+
+bool createBuffer(InteropRenderer* renderer, D3D12_HEAP_TYPE heapType, UINT64 bytes,
+        D3D12_RESOURCE_STATES state, ID3D12Resource** buffer) {
+    D3D12_HEAP_PROPERTIES heap = {};
+    heap.Type = heapType;
+    const D3D12_RESOURCE_DESC description = bufferDescription(bytes);
+    return SUCCEEDED(renderer->device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &description,
+            state, nullptr, IID_PPV_ARGS(buffer)));
+}
+
+// Recursos só são liberados depois que o frame que os submete por último termina na GPU.
+void retire(InteropRenderer* renderer, ID3D12Resource* resource) {
+    if (resource != nullptr) {
+        renderer->pendingRetire.push_back(resource);
+    }
+}
+
+void releaseCompleted(InteropRenderer* renderer) {
+    const UINT64 completed = renderer->fence->GetCompletedValue();
+    while (!renderer->retired.empty() && completed != kFenceError
+            && renderer->retired.front().fenceValue <= completed) {
+        renderer->retired.front().resource->Release();
+        renderer->retired.pop_front();
+    }
+}
+
+void releaseAllRetired(InteropRenderer* renderer) {
+    for (RetiredResource& entry : renderer->retired) {
+        entry.resource->Release();
+    }
+    renderer->retired.clear();
+    for (ID3D12Resource* resource : renderer->pendingRetire) {
+        resource->Release();
+    }
+    renderer->pendingRetire.clear();
+}
+
+// Abre (uma vez por frame) a lista de upload usando o alocador do slot do próximo frame.
+bool ensureUploadOpen(InteropRenderer* renderer) {
+    if (renderer->uploadOpen) {
+        return true;
+    }
+    FrameSlot& slot = renderer->slots[renderer->slotIndex];
+    if (!waitFence(renderer, renderer->fence, slot.fenceValue)
+            || FAILED(slot.upload->Reset())
+            || FAILED(renderer->uploadList->Reset(slot.upload, nullptr))) {
+        return false;
+    }
+    renderer->uploadOpen = true;
+    return true;
+}
+
 void deleteSection(TerrainSection* section) {
-    release(section->vertexBuffer);
-    release(section->indexBuffer);
+    release(section->buffer);
     delete section;
 }
 
-void releaseTerrainSections(InteropRenderer* renderer) {
+void retireSection(InteropRenderer* renderer, TerrainSection* section) {
+    retire(renderer, section->buffer);
+    section->buffer = nullptr;
+    delete section;
+}
+
+void retireTerrainSections(InteropRenderer* renderer) {
     for (auto& entry : renderer->sections) {
-        deleteSection(entry.second);
+        retireSection(renderer, entry.second);
     }
     renderer->sections.clear();
 }
 
 void releaseSizeResources(InteropRenderer* renderer) {
+    release(renderer->wrappedColor);
     if (renderer->d3d11Context != nullptr) {
-        renderer->d3d11Context->OMSetRenderTargets(0, nullptr, nullptr);
+        renderer->d3d11Context->Flush();
     }
-    release(renderer->depthView);
-    release(renderer->depthTexture);
-    release(renderer->renderTarget);
+    release(renderer->depthTarget);
+    release(renderer->colorTarget);
     release(renderer->interopTexture);
 }
 
@@ -254,23 +415,53 @@ bool createSizeResources(InteropRenderer* renderer, JNIEnv* env) {
     color.Height = renderer->height;
     color.MipLevels = 1;
     color.ArraySize = 1;
-    color.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    color.Format = kColorFormat;
     color.SampleDesc.Count = 1;
     color.Usage = D3D11_USAGE_DEFAULT;
     color.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
-    if (FAILED(renderer->d3d11Device->CreateTexture2D(&color, nullptr, &renderer->interopTexture))
-            || FAILED(renderer->d3d11Device->CreateRenderTargetView(renderer->interopTexture, nullptr,
-                    &renderer->renderTarget))) {
+    if (FAILED(renderer->d3d11Device->CreateTexture2D(&color, nullptr, &renderer->interopTexture))) {
         throwJava(env, "DX12/OpenGL interop could not create the shared color target.");
         return false;
     }
-    D3D11_TEXTURE2D_DESC depth = color;
-    depth.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
-    depth.BindFlags = D3D11_BIND_DEPTH_STENCIL;
-    if (FAILED(renderer->d3d11Device->CreateTexture2D(&depth, nullptr, &renderer->depthTexture))
-            || FAILED(renderer->d3d11Device->CreateDepthStencilView(renderer->depthTexture, nullptr,
-                    &renderer->depthView))) {
-        throwJava(env, "DX12 terrain depth buffer creation failed.");
+
+    D3D12_HEAP_PROPERTIES heap = {};
+    heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+    D3D12_RESOURCE_DESC texture = {};
+    texture.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    texture.Width = renderer->width;
+    texture.Height = renderer->height;
+    texture.DepthOrArraySize = 1;
+    texture.MipLevels = 1;
+    texture.Format = kColorFormat;
+    texture.SampleDesc.Count = 1;
+    texture.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    D3D12_CLEAR_VALUE colorClear = {};
+    colorClear.Format = kColorFormat;
+    std::memcpy(colorClear.Color, kClearColor, sizeof(kClearColor));
+    D3D12_RESOURCE_DESC depth = texture;
+    depth.Format = kDepthFormat;
+    depth.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL | D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE;
+    D3D12_CLEAR_VALUE depthClear = {};
+    depthClear.Format = kDepthFormat;
+    depthClear.DepthStencil.Depth = 1.0f;
+    if (FAILED(renderer->device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &texture,
+                D3D12_RESOURCE_STATE_RENDER_TARGET, &colorClear, IID_PPV_ARGS(&renderer->colorTarget)))
+            || FAILED(renderer->device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &depth,
+                D3D12_RESOURCE_STATE_DEPTH_WRITE, &depthClear, IID_PPV_ARGS(&renderer->depthTarget)))) {
+        throwJava(env, "DX12 terrain color/depth target creation failed.");
+        return false;
+    }
+    renderer->device->CreateRenderTargetView(renderer->colorTarget, nullptr,
+            renderer->rtvHeap->GetCPUDescriptorHandleForHeapStart());
+    renderer->device->CreateDepthStencilView(renderer->depthTarget, nullptr,
+            renderer->dsvHeap->GetCPUDescriptorHandleForHeapStart());
+
+    D3D11_RESOURCE_FLAGS flags = {};
+    flags.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+    if (FAILED(renderer->d3d11On12->CreateWrappedResource(renderer->colorTarget, &flags,
+            D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_RENDER_TARGET,
+            IID_PPV_ARGS(&renderer->wrappedColor)))) {
+        throwJava(env, "DX12 terrain target could not be wrapped for the OpenGL bridge.");
         return false;
     }
     return true;
@@ -280,6 +471,7 @@ void destroyInteropRenderer(InteropRenderer* renderer) {
     if (renderer == nullptr) {
         return;
     }
+    stopRecordWorker(renderer);
     // Apenas no shutdown: o Java já chamou glFinish, então o GL nunca mais sinalizará.
     // Libera uma eventual Wait() pendente na fila para não travar o teardown.
     if (renderer->glDoneFence != nullptr && renderer->lastQueuedGlDoneValue > 0) {
@@ -314,20 +506,30 @@ void destroyInteropRenderer(InteropRenderer* renderer) {
             }
         }
     }
-    releaseTerrainSections(renderer);
-    releaseSizeResources(renderer);
-    for (UINT layer = 0; layer < kLayerCount; ++layer) {
-        release(renderer->layerConstants[layer]);
+    for (auto& entry : renderer->sections) {
+        deleteSection(entry.second);
     }
-    release(renderer->sectionConstants);
-    release(renderer->inputLayout);
-    release(renderer->vertexShader);
-    release(renderer->pixelShader);
-    release(renderer->rasterizerState);
-    release(renderer->depthState);
-    release(renderer->atlasSampler);
-    release(renderer->atlasView);
+    renderer->sections.clear();
+    releaseAllRetired(renderer);
+    releaseSizeResources(renderer);
     release(renderer->atlas);
+    release(renderer->cutoutPassList);
+    release(renderer->opaquePassList);
+    release(renderer->cutoutList);
+    release(renderer->opaqueList);
+    release(renderer->uploadList);
+    for (FrameSlot& slot : renderer->slots) {
+        release(slot.cutout);
+        release(slot.opaque);
+        release(slot.upload);
+    }
+    release(renderer->cutoutPipeline);
+    release(renderer->opaquePipeline);
+    release(renderer->rootSignature);
+    release(renderer->srvHeap);
+    release(renderer->dsvHeap);
+    release(renderer->rtvHeap);
+    release(renderer->d3d11On12);
     release(renderer->d3d11Context);
     release(renderer->d3d11Device);
     closeHandle(renderer->sharedGlDoneFenceHandle);
@@ -341,10 +543,16 @@ void destroyInteropRenderer(InteropRenderer* renderer) {
     delete renderer;
 }
 
-bool compileShader(const char* source, SIZE_T length, const char* target, ID3DBlob** bytecode) {
+bool compileShader(const char* entryPoint, const char* target, bool cutout, ID3DBlob** bytecode) {
+    const D3D_SHADER_MACRO defines[] = {
+        {"ATLAS_SLOTS", "64"},
+        {cutout ? "DIRECT_CUTOUT" : nullptr, "1"},
+        {nullptr, nullptr}
+    };
+    static_assert(kAtlasSlots == 64, "ATLAS_SLOTS must match kAtlasSlots");
     ID3DBlob* errors = nullptr;
-    const HRESULT result = D3DCompile(source, length, nullptr, nullptr, nullptr, "main", target,
-            D3DCOMPILE_ENABLE_STRICTNESS, 0, bytecode, &errors);
+    const HRESULT result = D3DCompile(kTerrainShader, sizeof(kTerrainShader) - 1, nullptr, defines, nullptr,
+            entryPoint, target, D3DCOMPILE_ENABLE_STRICTNESS | D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, bytecode, &errors);
     if (errors != nullptr) {
         OutputDebugStringA(static_cast<const char*>(errors->GetBufferPointer()));
     }
@@ -352,89 +560,186 @@ bool compileShader(const char* source, SIZE_T length, const char* target, ID3DBl
     return SUCCEEDED(result);
 }
 
-bool createTerrainPipeline(InteropRenderer* renderer, JNIEnv* env) {
-    ID3DBlob* vertexBytecode = nullptr;
-    if (!compileShader(kTerrainVertexShader, sizeof(kTerrainVertexShader) - 1, "vs_4_0", &vertexBytecode)) {
-        throwJava(env, "DX12 terrain vertex shader compilation failed.");
+bool createRootSignature(InteropRenderer* renderer) {
+    D3D12_DESCRIPTOR_RANGE atlasRange = {};
+    atlasRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+    atlasRange.NumDescriptors = kAtlasSlots;
+    atlasRange.OffsetInDescriptorsFromTableStart = 0;
+    D3D12_ROOT_PARAMETER parameters[3] = {};
+    parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    parameters[0].Constants.ShaderRegister = 0;
+    parameters[0].Constants.Num32BitValues = 16;
+    parameters[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
+    parameters[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    parameters[1].Constants.ShaderRegister = 1;
+    parameters[1].Constants.Num32BitValues = kDrawConstantCount;
+    parameters[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    parameters[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    parameters[2].DescriptorTable.NumDescriptorRanges = 1;
+    parameters[2].DescriptorTable.pDescriptorRanges = &atlasRange;
+    parameters[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    D3D12_STATIC_SAMPLER_DESC sampler = {};
+    sampler.Filter = D3D12_FILTER_MIN_MAG_POINT_MIP_LINEAR;
+    sampler.AddressU = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+    sampler.AddressV = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+    sampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+    sampler.ComparisonFunc = D3D12_COMPARISON_FUNC_NEVER;
+    sampler.MaxLOD = D3D12_FLOAT32_MAX;
+    sampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    D3D12_ROOT_SIGNATURE_DESC description = {};
+    description.NumParameters = ARRAYSIZE(parameters);
+    description.pParameters = parameters;
+    description.NumStaticSamplers = 1;
+    description.pStaticSamplers = &sampler;
+    description.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT
+            | D3D12_ROOT_SIGNATURE_FLAG_DENY_HULL_SHADER_ROOT_ACCESS
+            | D3D12_ROOT_SIGNATURE_FLAG_DENY_DOMAIN_SHADER_ROOT_ACCESS
+            | D3D12_ROOT_SIGNATURE_FLAG_DENY_GEOMETRY_SHADER_ROOT_ACCESS;
+    ID3DBlob* serialized = nullptr;
+    ID3DBlob* errors = nullptr;
+    HRESULT result = D3D12SerializeRootSignature(&description, D3D_ROOT_SIGNATURE_VERSION_1,
+            &serialized, &errors);
+    if (SUCCEEDED(result)) {
+        result = renderer->device->CreateRootSignature(0, serialized->GetBufferPointer(),
+                serialized->GetBufferSize(), IID_PPV_ARGS(&renderer->rootSignature));
+    }
+    release(errors);
+    release(serialized);
+    return SUCCEEDED(result);
+}
+
+// PSOs criados uma única vez na inicialização: opaco (sem clip) e cutout (clip por root constant).
+bool createTerrainPipelines(InteropRenderer* renderer, JNIEnv* env) {
+    if (!createRootSignature(renderer)) {
+        throwJava(env, "DX12 terrain root signature creation failed.");
         return false;
     }
-    const D3D11_INPUT_ELEMENT_DESC elements[] = {
-        {"POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D11_INPUT_PER_VERTEX_DATA, 0},
-        {"COLOR", 0, DXGI_FORMAT_R8G8B8A8_UNORM, 0, 12, D3D11_INPUT_PER_VERTEX_DATA, 0},
-        {"TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 16, D3D11_INPUT_PER_VERTEX_DATA, 0}
+    ID3DBlob* vertexBytecode = nullptr;
+    ID3DBlob* opaqueBytecode = nullptr;
+    ID3DBlob* cutoutBytecode = nullptr;
+    if (!compileShader("vsMain", "vs_5_1", false, &vertexBytecode)
+            || !compileShader("psMain", "ps_5_1", false, &opaqueBytecode)
+            || !compileShader("psMain", "ps_5_1", true, &cutoutBytecode)) {
+        release(vertexBytecode);
+        release(opaqueBytecode);
+        release(cutoutBytecode);
+        throwJava(env, "DX12 terrain shader compilation failed.");
+        return false;
+    }
+    const D3D12_INPUT_ELEMENT_DESC elements[] = {
+        {"POSITION", 0, DXGI_FORMAT_R16G16B16A16_UINT, 0, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+        {"COLOR", 0, DXGI_FORMAT_R8G8B8A8_UNORM, 0, 8, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+        {"TEXCOORD", 0, DXGI_FORMAT_R16G16_UNORM, 0, 12, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0}
     };
-    HRESULT result = renderer->d3d11Device->CreateVertexShader(vertexBytecode->GetBufferPointer(),
-            vertexBytecode->GetBufferSize(), nullptr, &renderer->vertexShader);
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC description = {};
+    description.pRootSignature = renderer->rootSignature;
+    description.VS = {vertexBytecode->GetBufferPointer(), vertexBytecode->GetBufferSize()};
+    description.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+    description.BlendState.RenderTarget[0].SrcBlend = D3D12_BLEND_ONE;
+    description.BlendState.RenderTarget[0].DestBlend = D3D12_BLEND_ZERO;
+    description.BlendState.RenderTarget[0].BlendOp = D3D12_BLEND_OP_ADD;
+    description.BlendState.RenderTarget[0].SrcBlendAlpha = D3D12_BLEND_ONE;
+    description.BlendState.RenderTarget[0].DestBlendAlpha = D3D12_BLEND_ZERO;
+    description.BlendState.RenderTarget[0].BlendOpAlpha = D3D12_BLEND_OP_ADD;
+    description.BlendState.RenderTarget[0].LogicOp = D3D12_LOGIC_OP_NOOP;
+    description.SampleMask = UINT_MAX;
+    // GL usa CCW como frente; o flip em Y da matriz de correção transforma isso em CW no D3D.
+    description.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+    description.RasterizerState.CullMode = D3D12_CULL_MODE_BACK;
+    description.RasterizerState.FrontCounterClockwise = FALSE;
+    description.RasterizerState.DepthClipEnable = TRUE;
+    description.DepthStencilState.DepthEnable = TRUE;
+    description.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
+    description.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_LESS_EQUAL;
+    description.InputLayout = {elements, ARRAYSIZE(elements)};
+    description.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    description.NumRenderTargets = 1;
+    description.RTVFormats[0] = kColorFormat;
+    description.DSVFormat = kDepthFormat;
+    description.SampleDesc.Count = 1;
+    description.PS = {opaqueBytecode->GetBufferPointer(), opaqueBytecode->GetBufferSize()};
+    HRESULT result = renderer->device->CreateGraphicsPipelineState(&description,
+            IID_PPV_ARGS(&renderer->opaquePipeline));
     if (SUCCEEDED(result)) {
-        result = renderer->d3d11Device->CreateInputLayout(elements, ARRAYSIZE(elements),
-                vertexBytecode->GetBufferPointer(), vertexBytecode->GetBufferSize(), &renderer->inputLayout);
+        description.PS = {cutoutBytecode->GetBufferPointer(), cutoutBytecode->GetBufferSize()};
+        result = renderer->device->CreateGraphicsPipelineState(&description,
+                IID_PPV_ARGS(&renderer->cutoutPipeline));
     }
     release(vertexBytecode);
+    release(opaqueBytecode);
+    release(cutoutBytecode);
     if (FAILED(result)) {
-        throwJava(env, "DX12 terrain vertex shader or input layout creation failed.");
-        return false;
-    }
-
-    ID3DBlob* pixelBytecode = nullptr;
-    if (!compileShader(kTerrainPixelShader, sizeof(kTerrainPixelShader) - 1, "ps_4_0", &pixelBytecode)) {
-        throwJava(env, "DX12 terrain pixel shader compilation failed.");
-        return false;
-    }
-    result = renderer->d3d11Device->CreatePixelShader(pixelBytecode->GetBufferPointer(),
-            pixelBytecode->GetBufferSize(), nullptr, &renderer->pixelShader);
-    release(pixelBytecode);
-    if (FAILED(result)) {
-        throwJava(env, "DX12 terrain pixel shader creation failed.");
-        return false;
-    }
-
-    D3D11_BUFFER_DESC constants = {};
-    constants.ByteWidth = sizeof(SectionConstants);
-    constants.Usage = D3D11_USAGE_DYNAMIC;
-    constants.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
-    constants.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
-    if (FAILED(renderer->d3d11Device->CreateBuffer(&constants, nullptr, &renderer->sectionConstants))) {
-        throwJava(env, "DX12 terrain section constant buffer creation failed.");
-        return false;
-    }
-    D3D11_BUFFER_DESC layerDescription = {};
-    layerDescription.ByteWidth = 16;
-    layerDescription.Usage = D3D11_USAGE_IMMUTABLE;
-    layerDescription.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
-    for (UINT layer = 0; layer < kLayerCount; ++layer) {
-        const float values[4] = {kLayerAlphaCutoff[layer], 0.0f, 0.0f, 0.0f};
-        D3D11_SUBRESOURCE_DATA data = {values, 0, 0};
-        if (FAILED(renderer->d3d11Device->CreateBuffer(&layerDescription, &data,
-                &renderer->layerConstants[layer]))) {
-            throwJava(env, "DX12 terrain layer constant buffer creation failed.");
-            return false;
-        }
-    }
-
-    // GL usa CCW como frente; o flip em Y da matriz de correção transforma isso em CW no D3D.
-    D3D11_RASTERIZER_DESC rasterizer = {};
-    rasterizer.FillMode = D3D11_FILL_SOLID;
-    rasterizer.CullMode = D3D11_CULL_BACK;
-    rasterizer.FrontCounterClockwise = FALSE;
-    rasterizer.DepthClipEnable = TRUE;
-    D3D11_DEPTH_STENCIL_DESC depth = {};
-    depth.DepthEnable = TRUE;
-    depth.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ALL;
-    depth.DepthFunc = D3D11_COMPARISON_LESS_EQUAL;
-    D3D11_SAMPLER_DESC sampler = {};
-    sampler.Filter = D3D11_FILTER_MIN_MAG_POINT_MIP_LINEAR;
-    sampler.AddressU = D3D11_TEXTURE_ADDRESS_CLAMP;
-    sampler.AddressV = D3D11_TEXTURE_ADDRESS_CLAMP;
-    sampler.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
-    sampler.ComparisonFunc = D3D11_COMPARISON_NEVER;
-    sampler.MaxLOD = D3D11_FLOAT32_MAX;
-    if (FAILED(renderer->d3d11Device->CreateRasterizerState(&rasterizer, &renderer->rasterizerState))
-            || FAILED(renderer->d3d11Device->CreateDepthStencilState(&depth, &renderer->depthState))
-            || FAILED(renderer->d3d11Device->CreateSamplerState(&sampler, &renderer->atlasSampler))) {
-        throwJava(env, "DX12 terrain fixed-function state creation failed.");
+        throwJava(env, "DX12 terrain pipeline state creation failed.");
         return false;
     }
     return true;
+}
+
+bool createDescriptorHeaps(InteropRenderer* renderer) {
+    D3D12_DESCRIPTOR_HEAP_DESC rtv = {D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
+    D3D12_DESCRIPTOR_HEAP_DESC dsv = {D3D12_DESCRIPTOR_HEAP_TYPE_DSV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
+    D3D12_DESCRIPTOR_HEAP_DESC srv = {D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, kAtlasSlots,
+            D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
+    if (FAILED(renderer->device->CreateDescriptorHeap(&rtv, IID_PPV_ARGS(&renderer->rtvHeap)))
+            || FAILED(renderer->device->CreateDescriptorHeap(&dsv, IID_PPV_ARGS(&renderer->dsvHeap)))
+            || FAILED(renderer->device->CreateDescriptorHeap(&srv, IID_PPV_ARGS(&renderer->srvHeap)))) {
+        return false;
+    }
+    renderer->srvIncrement = renderer->device->GetDescriptorHandleIncrementSize(
+            D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    // Todos os slots começam com um SRV nulo válido (exigido em hardware de binding tier 1).
+    D3D12_SHADER_RESOURCE_VIEW_DESC nullView = {};
+    nullView.Format = kColorFormat;
+    nullView.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    nullView.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    nullView.Texture2D.MipLevels = 1;
+    D3D12_CPU_DESCRIPTOR_HANDLE handle = renderer->srvHeap->GetCPUDescriptorHandleForHeapStart();
+    for (UINT slot = 0; slot < kAtlasSlots; ++slot) {
+        renderer->device->CreateShaderResourceView(nullptr, &nullView, handle);
+        handle.ptr += renderer->srvIncrement;
+    }
+    return true;
+}
+
+bool createCommandObjects(InteropRenderer* renderer) {
+    for (FrameSlot& slot : renderer->slots) {
+        if (FAILED(renderer->device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+                    IID_PPV_ARGS(&slot.upload)))
+                || FAILED(renderer->device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+                    IID_PPV_ARGS(&slot.opaque)))
+                || FAILED(renderer->device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+                    IID_PPV_ARGS(&slot.cutout)))) {
+            return false;
+        }
+    }
+    FrameSlot& first = renderer->slots[0];
+    if (FAILED(renderer->device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, first.upload, nullptr,
+                IID_PPV_ARGS(&renderer->uploadList)))
+            || FAILED(renderer->device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, first.opaque,
+                nullptr, IID_PPV_ARGS(&renderer->opaqueList)))
+            || FAILED(renderer->device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, first.cutout,
+                nullptr, IID_PPV_ARGS(&renderer->cutoutList)))
+            || FAILED(renderer->uploadList->Close())
+            || FAILED(renderer->opaqueList->Close())
+            || FAILED(renderer->cutoutList->Close())) {
+        return false;
+    }
+    // Render passes exigem ID3D12GraphicsCommandList4 (Windows 10 1809+); sem ela usa OMSetRenderTargets.
+    if (FAILED(renderer->opaqueList->QueryInterface(IID_PPV_ARGS(&renderer->opaquePassList)))
+            || FAILED(renderer->cutoutList->QueryInterface(IID_PPV_ARGS(&renderer->cutoutPassList)))) {
+        release(renderer->opaquePassList);
+        release(renderer->cutoutPassList);
+    }
+    return true;
+}
+
+void startRecordWorker(InteropRenderer* renderer) {
+    try {
+        renderer->worker.thread = std::thread(recordWorkerLoop, &renderer->worker);
+        renderer->workerRunning = true;
+    } catch (const std::system_error&) {
+        renderer->workerRunning = false; // grava as duas listas na thread de render
+    }
 }
 
 bool initializeInteropRenderer(InteropRenderer* renderer, jint width, jint height, JNIEnv* env) {
@@ -458,11 +763,16 @@ bool initializeInteropRenderer(InteropRenderer* renderer, jint width, jint heigh
     D3D_FEATURE_LEVEL featureLevels[] = {D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0};
     if (FAILED(D3D11On12CreateDevice(renderer->device, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
             featureLevels, ARRAYSIZE(featureLevels), queues, ARRAYSIZE(queues), 0,
-            &renderer->d3d11Device, &renderer->d3d11Context, nullptr))) {
+            &renderer->d3d11Device, &renderer->d3d11Context, nullptr))
+            || FAILED(renderer->d3d11Device->QueryInterface(IID_PPV_ARGS(&renderer->d3d11On12)))) {
         throwJava(env, "DX12/OpenGL interop could not create a D3D11On12 device.");
         return false;
     }
-    if (!createSizeResources(renderer, env) || !createTerrainPipeline(renderer, env)) {
+    if (!createDescriptorHeaps(renderer) || !createCommandObjects(renderer)) {
+        throwJava(env, "DX12 terrain descriptor heaps or command lists could not be created.");
+        return false;
+    }
+    if (!createTerrainPipelines(renderer, env) || !createSizeResources(renderer, env)) {
         return false;
     }
     if (!createSharedFence(renderer->device, &renderer->fence, &renderer->sharedFenceHandle)
@@ -484,6 +794,7 @@ bool initializeInteropRenderer(InteropRenderer* renderer, jint width, jint heigh
             closeHandle(renderer->sharedGlDoneFenceHandle);
         }
     }
+    startRecordWorker(renderer);
     return true;
 }
 
@@ -517,6 +828,178 @@ bool sphereVisible(const Plane* planes, float x, float y, float z, float radius)
     return true;
 }
 
+void collectVisibleSections(InteropRenderer* renderer, double cameraX, double cameraY, double cameraZ,
+        float renderDistance) {
+    renderer->visible.clear();
+    Plane frustum[6];
+    extractFrustum(renderer->viewProjection, frustum);
+    const double maxDistanceSquared = static_cast<double>(renderDistance) * renderDistance;
+    for (const auto& entry : renderer->sections) {
+        const TerrainSection* section = entry.second;
+        const double ox = section->x - cameraX;
+        const double oy = section->y - cameraY;
+        const double oz = section->z - cameraZ;
+        const double cx = ox + 8.0;
+        const double cy = oy + 8.0;
+        const double cz = oz + 8.0;
+        if (cx * cx + cy * cy + cz * cz > maxDistanceSquared
+                || !sphereVisible(frustum, static_cast<float>(cx), static_cast<float>(cy),
+                        static_cast<float>(cz), kSectionRadius)) {
+            continue;
+        }
+        renderer->visible.push_back({section, {static_cast<float>(ox), static_cast<float>(oy),
+                static_cast<float>(oz)}});
+    }
+}
+
+enum class PassRole { ClearOnly, Opaque, Cutout };
+
+// Opaco abre o render pass (clear) e o suspende; cutout o retoma e descarta o depth no fim.
+void beginTerrainPass(InteropRenderer* renderer, ID3D12GraphicsCommandList* list,
+        ID3D12GraphicsCommandList4* passList, PassRole role) {
+    const D3D12_CPU_DESCRIPTOR_HANDLE rtv = renderer->rtvHeap->GetCPUDescriptorHandleForHeapStart();
+    const D3D12_CPU_DESCRIPTOR_HANDLE dsv = renderer->dsvHeap->GetCPUDescriptorHandleForHeapStart();
+    const bool clear = role != PassRole::Cutout;
+    if (passList != nullptr) {
+        D3D12_RENDER_PASS_RENDER_TARGET_DESC color = {};
+        color.cpuDescriptor = rtv;
+        color.BeginningAccess.Type = clear ? D3D12_RENDER_PASS_BEGINNING_ACCESS_TYPE_CLEAR
+                : D3D12_RENDER_PASS_BEGINNING_ACCESS_TYPE_PRESERVE;
+        color.BeginningAccess.Clear.ClearValue.Format = kColorFormat;
+        std::memcpy(color.BeginningAccess.Clear.ClearValue.Color, kClearColor, sizeof(kClearColor));
+        color.EndingAccess.Type = D3D12_RENDER_PASS_ENDING_ACCESS_TYPE_PRESERVE;
+        D3D12_RENDER_PASS_DEPTH_STENCIL_DESC depth = {};
+        depth.cpuDescriptor = dsv;
+        depth.DepthBeginningAccess.Type = clear ? D3D12_RENDER_PASS_BEGINNING_ACCESS_TYPE_CLEAR
+                : D3D12_RENDER_PASS_BEGINNING_ACCESS_TYPE_PRESERVE;
+        depth.DepthBeginningAccess.Clear.ClearValue.Format = kDepthFormat;
+        depth.DepthBeginningAccess.Clear.ClearValue.DepthStencil.Depth = 1.0f;
+        depth.DepthEndingAccess.Type = role == PassRole::Opaque ? D3D12_RENDER_PASS_ENDING_ACCESS_TYPE_PRESERVE
+                : D3D12_RENDER_PASS_ENDING_ACCESS_TYPE_DISCARD;
+        depth.StencilBeginningAccess.Type = D3D12_RENDER_PASS_BEGINNING_ACCESS_TYPE_NO_ACCESS;
+        depth.StencilEndingAccess.Type = D3D12_RENDER_PASS_ENDING_ACCESS_TYPE_NO_ACCESS;
+        const D3D12_RENDER_PASS_FLAGS flags = role == PassRole::Opaque ? D3D12_RENDER_PASS_FLAG_SUSPENDING_PASS
+                : role == PassRole::Cutout ? D3D12_RENDER_PASS_FLAG_RESUMING_PASS : D3D12_RENDER_PASS_FLAG_NONE;
+        passList->BeginRenderPass(1, &color, &depth, flags);
+    } else {
+        list->OMSetRenderTargets(1, &rtv, FALSE, &dsv);
+        if (clear) {
+            list->ClearRenderTargetView(rtv, kClearColor, 0, nullptr);
+            list->ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
+        }
+    }
+    if (role == PassRole::ClearOnly) {
+        return;
+    }
+    ID3D12DescriptorHeap* heaps[] = {renderer->srvHeap};
+    list->SetDescriptorHeaps(1, heaps);
+    list->SetGraphicsRootSignature(renderer->rootSignature);
+    list->SetPipelineState(role == PassRole::Opaque ? renderer->opaquePipeline : renderer->cutoutPipeline);
+    list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    const D3D12_VIEWPORT viewport = {0.0f, 0.0f, static_cast<float>(renderer->width),
+            static_cast<float>(renderer->height), 0.0f, 1.0f};
+    const D3D12_RECT scissor = {0, 0, static_cast<LONG>(renderer->width), static_cast<LONG>(renderer->height)};
+    list->RSSetViewports(1, &viewport);
+    list->RSSetScissorRects(1, &scissor);
+    list->SetGraphicsRoot32BitConstants(0, 16, renderer->viewProjection, 0);
+    list->SetGraphicsRootDescriptorTable(2, renderer->srvHeap->GetGPUDescriptorHandleForHeapStart());
+}
+
+void drawLayer(InteropRenderer* renderer, ID3D12GraphicsCommandList* list, const VisibleSection& entry,
+        UINT layer) {
+    UINT32 constants[kDrawConstantCount];
+    std::memcpy(constants, entry.offset, sizeof(entry.offset));
+    std::memcpy(&constants[3], &kLayerAlphaCutoff[layer], sizeof(float));
+    constants[4] = renderer->atlasIndex;
+    list->SetGraphicsRoot32BitConstants(1, kDrawConstantCount, constants, 0);
+    list->DrawIndexedInstanced(entry.section->layerIndexCounts[layer], 1, entry.section->layerStart[layer], 0, 0);
+}
+
+bool recordTerrainList(InteropRenderer* renderer, ID3D12CommandAllocator* allocator,
+        ID3D12GraphicsCommandList* list, ID3D12GraphicsCommandList4* passList, PassRole role) {
+    if (FAILED(allocator->Reset()) || FAILED(list->Reset(allocator, nullptr))) {
+        return false;
+    }
+    beginTerrainPass(renderer, list, passList, role);
+    const UINT firstLayer = role == PassRole::Opaque ? 0 : 1;
+    const UINT lastLayer = role == PassRole::Opaque ? 1 : kLayerCount;
+    if (role != PassRole::ClearOnly) {
+        for (const VisibleSection& entry : renderer->visible) {
+            const TerrainSection* section = entry.section;
+            bool bound = false;
+            for (UINT layer = firstLayer; layer < lastLayer; ++layer) {
+                if (section->layerIndexCounts[layer] == 0) {
+                    continue;
+                }
+                if (!bound) {
+                    list->IASetVertexBuffers(0, 1, &section->vertexView);
+                    list->IASetIndexBuffer(&section->indexView);
+                    bound = true;
+                }
+                drawLayer(renderer, list, entry, layer);
+            }
+        }
+    }
+    if (passList != nullptr) {
+        passList->EndRenderPass();
+    }
+    return SUCCEEDED(list->Close());
+}
+
+// Grava opaco na thread de render e cutout em paralelo na thread de gravação.
+bool recordTerrain(InteropRenderer* renderer, FrameSlot& slot, bool drawTerrain) {
+    if (!drawTerrain) {
+        return recordTerrainList(renderer, slot.opaque, renderer->opaqueList, renderer->opaquePassList,
+                PassRole::ClearOnly);
+    }
+    auto cutoutJob = [renderer, &slot] {
+        return recordTerrainList(renderer, slot.cutout, renderer->cutoutList, renderer->cutoutPassList,
+                PassRole::Cutout);
+    };
+    if (!renderer->workerRunning) {
+        return recordTerrainList(renderer, slot.opaque, renderer->opaqueList, renderer->opaquePassList,
+                PassRole::Opaque) && cutoutJob();
+    }
+    RecordWorker& worker = renderer->worker;
+    {
+        std::lock_guard<std::mutex> lock(worker.mutex);
+        worker.job = cutoutJob;
+        worker.pending = true;
+    }
+    worker.condition.notify_all();
+    const bool opaque = recordTerrainList(renderer, slot.opaque, renderer->opaqueList, renderer->opaquePassList,
+            PassRole::Opaque);
+    std::unique_lock<std::mutex> lock(worker.mutex);
+    worker.condition.wait(lock, [&worker] { return !worker.pending; });
+    return opaque && worker.result;
+}
+
+bool submitUploads(InteropRenderer* renderer) {
+    if (!renderer->uploadOpen) {
+        return true;
+    }
+    if (!renderer->uploadBarriers.empty()) {
+        renderer->uploadList->ResourceBarrier(static_cast<UINT>(renderer->uploadBarriers.size()),
+                renderer->uploadBarriers.data());
+        renderer->uploadBarriers.clear();
+    }
+    renderer->uploadOpen = false;
+    if (FAILED(renderer->uploadList->Close())) {
+        return false;
+    }
+    // Submissão separada: os buffers decaem para COMMON antes de serem lidos pelas listas de terreno.
+    ID3D12CommandList* lists[] = {renderer->uploadList};
+    renderer->queue->ExecuteCommandLists(1, lists);
+    return true;
+}
+
+void copyToInteropTexture(InteropRenderer* renderer) {
+    renderer->d3d11On12->AcquireWrappedResources(&renderer->wrappedColor, 1);
+    renderer->d3d11Context->CopyResource(renderer->interopTexture, renderer->wrappedColor);
+    renderer->d3d11On12->ReleaseWrappedResources(&renderer->wrappedColor, 1);
+    renderer->d3d11Context->Flush();
+}
+
 bool renderInteropFrame(InteropRenderer* renderer, const float* viewProjection,
         double cameraX, double cameraY, double cameraZ, float renderDistance,
         UINT64 frameIndex, bool useGpuSynchronization, JNIEnv* env, bool* gpuSynchronizationUsed) {
@@ -526,6 +1009,13 @@ bool renderInteropFrame(InteropRenderer* renderer, const float* viewProjection,
     }
     const UINT64 glDoneValue = frameIndex;
     const UINT64 dxReadyValue = frameIndex + 1;
+    FrameSlot& slot = renderer->slots[renderer->slotIndex];
+    if (!waitFence(renderer, renderer->fence, slot.fenceValue)) {
+        throwJava(env, "DX12 terrain timed out waiting for a free frame slot.");
+        return false;
+    }
+    releaseCompleted(renderer);
+
     bool gpu = useGpuSynchronization && renderer->sharedFenceHandle != nullptr
             && renderer->sharedGlDoneFenceHandle != nullptr && !renderer->gpuSyncFault.load();
     if (gpu && glDoneValue > 0) {
@@ -540,76 +1030,23 @@ bool renderInteropFrame(InteropRenderer* renderer, const float* viewProjection,
         }
     }
 
-    ID3D11DeviceContext* context = renderer->d3d11Context;
-    context->ClearRenderTargetView(renderer->renderTarget, kClearColor);
-    context->ClearDepthStencilView(renderer->depthView, D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL, 1.0f, 0);
-
-    if (renderer->atlasView != nullptr && !renderer->sections.empty()) {
-        const float blendFactor[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-        context->OMSetRenderTargets(1, &renderer->renderTarget, renderer->depthView);
-        context->OMSetBlendState(nullptr, blendFactor, 0xffffffff);
-        context->OMSetDepthStencilState(renderer->depthState, 0);
-        context->RSSetState(renderer->rasterizerState);
-        const D3D11_VIEWPORT viewport = {0.0f, 0.0f, static_cast<float>(renderer->width),
-                static_cast<float>(renderer->height), 0.0f, 1.0f};
-        context->RSSetViewports(1, &viewport);
-        context->IASetInputLayout(renderer->inputLayout);
-        context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-        context->VSSetShader(renderer->vertexShader, nullptr, 0);
-        context->PSSetShader(renderer->pixelShader, nullptr, 0);
-        context->VSSetConstantBuffers(0, 1, &renderer->sectionConstants);
-        context->PSSetShaderResources(0, 1, &renderer->atlasView);
-        context->PSSetSamplers(0, 1, &renderer->atlasSampler);
-
-        Plane frustum[6];
-        extractFrustum(viewProjection, frustum);
-        const double maxDistanceSquared = static_cast<double>(renderDistance) * renderDistance;
-        SectionConstants constants;
-        std::memcpy(constants.viewProjection, viewProjection, sizeof(constants.viewProjection));
-        constants.sectionOffset[3] = 0.0f;
-
-        for (const auto& entry : renderer->sections) {
-            const TerrainSection* section = entry.second;
-            const double ox = section->x - cameraX;
-            const double oy = section->y - cameraY;
-            const double oz = section->z - cameraZ;
-            const double cx = ox + 8.0;
-            const double cy = oy + 8.0;
-            const double cz = oz + 8.0;
-            if (cx * cx + cy * cy + cz * cz > maxDistanceSquared
-                    || !sphereVisible(frustum, static_cast<float>(cx), static_cast<float>(cy),
-                            static_cast<float>(cz), kSectionRadius)) {
-                continue;
-            }
-            constants.sectionOffset[0] = static_cast<float>(ox);
-            constants.sectionOffset[1] = static_cast<float>(oy);
-            constants.sectionOffset[2] = static_cast<float>(oz);
-            D3D11_MAPPED_SUBRESOURCE mapped = {};
-            if (FAILED(context->Map(renderer->sectionConstants, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
-                throwJava(env, "DX12 terrain section constants could not be mapped.");
-                return false;
-            }
-            std::memcpy(mapped.pData, &constants, sizeof(constants));
-            context->Unmap(renderer->sectionConstants, 0);
-
-            const UINT stride = kVertexStride;
-            const UINT offset = 0;
-            context->IASetVertexBuffers(0, 1, &section->vertexBuffer, &stride, &offset);
-            context->IASetIndexBuffer(section->indexBuffer, DXGI_FORMAT_R32_UINT, 0);
-            UINT startIndex = 0;
-            for (UINT layer = 0; layer < kLayerCount; ++layer) {
-                const UINT count = section->layerIndexCounts[layer];
-                if (count == 0) {
-                    continue;
-                }
-                context->PSSetConstantBuffers(1, 1, &renderer->layerConstants[layer]);
-                context->DrawIndexed(count, startIndex, 0);
-                startIndex += count;
-            }
-        }
-        context->OMSetRenderTargets(0, nullptr, nullptr);
+    std::memcpy(renderer->viewProjection, viewProjection, sizeof(renderer->viewProjection));
+    const bool drawTerrain = renderer->atlas != nullptr && !renderer->sections.empty();
+    if (drawTerrain) {
+        collectVisibleSections(renderer, cameraX, cameraY, cameraZ, renderDistance);
     }
-    context->Flush();
+    if (!submitUploads(renderer)) {
+        throwJava(env, "DX12 terrain upload command list could not be closed.");
+        return false;
+    }
+    if (!recordTerrain(renderer, slot, drawTerrain)) {
+        throwJava(env, "DX12 terrain command lists could not be recorded.");
+        return false;
+    }
+    // Ambas as listas na mesma submissão: o render pass suspenso no opaco é retomado pelo cutout.
+    ID3D12CommandList* lists[] = {renderer->opaqueList, renderer->cutoutList};
+    renderer->queue->ExecuteCommandLists(drawTerrain ? 2 : 1, lists);
+    copyToInteropTexture(renderer);
 
     HRESULT signalResult;
     {
@@ -626,6 +1063,12 @@ bool renderInteropFrame(InteropRenderer* renderer, const float* viewProjection,
         throwJava(env, "DX12/OpenGL interop failed to signal its frame fence.");
         return false;
     }
+    slot.fenceValue = dxReadyValue;
+    renderer->slotIndex = (renderer->slotIndex + 1) % kFramesInFlight;
+    for (ID3D12Resource* resource : renderer->pendingRetire) {
+        renderer->retired.push_back({dxReadyValue, resource});
+    }
+    renderer->pendingRetire.clear();
     if (gpu) {
         renderer->watchdogCondition.notify_one();
     } else if (!waitFence(renderer, renderer->fence, dxReadyValue)) {
@@ -633,6 +1076,95 @@ bool renderInteropFrame(InteropRenderer* renderer, const float* viewProjection,
         return false;
     }
     *gpuSynchronizationUsed = gpu;
+    return true;
+}
+
+bool uploadAtlas(InteropRenderer* renderer, const void* const* levelData, jsize levelCount,
+        UINT width, UINT height, bool compress, JNIEnv* env) {
+    // BC7 exige que o nível 0 seja múltiplo de 4; níveis menores são preenchidos por bloco.
+    const bool bc7 = compress && width % 4 == 0 && height % 4 == 0;
+    std::vector<std::vector<uint8_t>> encoded;
+    if (bc7) {
+        encoded.resize(static_cast<size_t>(levelCount));
+        for (jsize level = 0; level < levelCount; ++level) {
+            const UINT levelWidth = (std::max)(1u, width >> level);
+            const UINT levelHeight = (std::max)(1u, height >> level);
+            encoded[level].resize(static_cast<size_t>(direct::bc7LevelSize(levelWidth, levelHeight)));
+            direct::encodeBc7Level(static_cast<const uint8_t*>(levelData[level]), levelWidth, levelHeight,
+                    encoded[level].data());
+        }
+    }
+    const DXGI_FORMAT format = bc7 ? DXGI_FORMAT_BC7_UNORM : kColorFormat;
+    D3D12_RESOURCE_DESC description = {};
+    description.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    description.Width = width;
+    description.Height = height;
+    description.DepthOrArraySize = 1;
+    description.MipLevels = static_cast<UINT16>(levelCount);
+    description.Format = format;
+    description.SampleDesc.Count = 1;
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprints[kMaxAtlasLevels];
+    UINT rowCounts[kMaxAtlasLevels];
+    UINT64 rowSizes[kMaxAtlasLevels];
+    UINT64 uploadBytes = 0;
+    renderer->device->GetCopyableFootprints(&description, 0, static_cast<UINT>(levelCount), 0, footprints,
+            rowCounts, rowSizes, &uploadBytes);
+
+    D3D12_HEAP_PROPERTIES heap = {};
+    heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+    ID3D12Resource* atlas = nullptr;
+    ID3D12Resource* upload = nullptr;
+    void* mapped = nullptr;
+    const D3D12_RANGE noRead = {0, 0};
+    if (FAILED(renderer->device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &description,
+                D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&atlas)))
+            || !createBuffer(renderer, D3D12_HEAP_TYPE_UPLOAD, uploadBytes, D3D12_RESOURCE_STATE_GENERIC_READ,
+                &upload)
+            || FAILED(upload->Map(0, &noRead, &mapped))
+            || !ensureUploadOpen(renderer)) {
+        release(upload);
+        release(atlas);
+        throwJava(env, "DX12 terrain atlas texture upload failed.");
+        return false;
+    }
+    for (jsize level = 0; level < levelCount; ++level) {
+        const uint8_t* source = bc7 ? encoded[level].data() : static_cast<const uint8_t*>(levelData[level]);
+        uint8_t* destination = static_cast<uint8_t*>(mapped) + footprints[level].Offset;
+        for (UINT row = 0; row < rowCounts[level]; ++row) {
+            std::memcpy(destination + static_cast<UINT64>(row) * footprints[level].Footprint.RowPitch,
+                    source + row * rowSizes[level], static_cast<size_t>(rowSizes[level]));
+        }
+    }
+    upload->Unmap(0, nullptr);
+    for (jsize level = 0; level < levelCount; ++level) {
+        D3D12_TEXTURE_COPY_LOCATION target = {};
+        target.pResource = atlas;
+        target.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        target.SubresourceIndex = static_cast<UINT>(level);
+        D3D12_TEXTURE_COPY_LOCATION source = {};
+        source.pResource = upload;
+        source.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        source.PlacedFootprint = footprints[level];
+        renderer->uploadList->CopyTextureRegion(&target, 0, 0, 0, &source, nullptr);
+    }
+    renderer->uploadBarriers.push_back(transition(atlas, D3D12_RESOURCE_STATE_COPY_DEST,
+            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE));
+
+    // Bindless: o novo atlas ganha um slot próprio no heap e o shader o indexa por root constant.
+    const UINT slot = renderer->nextAtlasSlot;
+    renderer->nextAtlasSlot = (slot + 1) % kAtlasSlots;
+    D3D12_SHADER_RESOURCE_VIEW_DESC view = {};
+    view.Format = format;
+    view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    view.Texture2D.MipLevels = static_cast<UINT>(levelCount);
+    D3D12_CPU_DESCRIPTOR_HANDLE handle = renderer->srvHeap->GetCPUDescriptorHandleForHeapStart();
+    handle.ptr += static_cast<SIZE_T>(slot) * renderer->srvIncrement;
+    renderer->device->CreateShaderResourceView(atlas, &view, handle);
+    retire(renderer, upload);
+    retire(renderer, renderer->atlas);
+    renderer->atlas = atlas;
+    renderer->atlasIndex = slot;
     return true;
 }
 
@@ -769,39 +1301,52 @@ Java_com_redondoguibi_direct_NativeDx12_updateTerrainSection(JNIEnv* env, jclass
     if (indexCount == 0 || vertices == nullptr || indices == nullptr
             || env->GetDirectBufferCapacity(vertexData) < vertexBytes
             || env->GetDirectBufferCapacity(indexData) < indexBytes
-            || vertexBytes > std::numeric_limits<UINT>::max()
-            || indexBytes > std::numeric_limits<UINT>::max()) {
+            || vertexBytes + indexBytes > std::numeric_limits<UINT>::max()) {
         throwJava(env, "DX12 terrain section buffers have invalid direct-buffer sizes.");
         return;
     }
 
-    TerrainSection* section = new TerrainSection{};
-    D3D11_BUFFER_DESC description = {};
-    description.Usage = D3D11_USAGE_IMMUTABLE;
-    description.ByteWidth = static_cast<UINT>(vertexBytes);
-    description.BindFlags = D3D11_BIND_VERTEX_BUFFER;
-    D3D11_SUBRESOURCE_DATA vertexInitial = {vertices, 0, 0};
-    HRESULT result = renderer->d3d11Device->CreateBuffer(&description, &vertexInitial, &section->vertexBuffer);
-    if (SUCCEEDED(result)) {
-        description.ByteWidth = static_cast<UINT>(indexBytes);
-        description.BindFlags = D3D11_BIND_INDEX_BUFFER;
-        D3D11_SUBRESOURCE_DATA indexInitial = {indices, 0, 0};
-        result = renderer->d3d11Device->CreateBuffer(&description, &indexInitial, &section->indexBuffer);
-    }
-    if (FAILED(result)) {
-        deleteSection(section);
+    // Um único buffer por seção (vértices seguidos de índices) em memória de vídeo, via staging.
+    const UINT64 totalBytes = static_cast<UINT64>(vertexBytes + indexBytes);
+    ID3D12Resource* buffer = nullptr;
+    ID3D12Resource* upload = nullptr;
+    void* mapped = nullptr;
+    const D3D12_RANGE noRead = {0, 0};
+    if (!createBuffer(renderer, D3D12_HEAP_TYPE_DEFAULT, totalBytes, D3D12_RESOURCE_STATE_COMMON, &buffer)
+            || !createBuffer(renderer, D3D12_HEAP_TYPE_UPLOAD, totalBytes, D3D12_RESOURCE_STATE_GENERIC_READ,
+                &upload)
+            || FAILED(upload->Map(0, &noRead, &mapped))
+            || !ensureUploadOpen(renderer)) {
+        release(upload);
+        release(buffer);
         throwJava(env, "DX12 terrain section buffer creation failed.");
         return;
     }
+    std::memcpy(mapped, vertices, static_cast<size_t>(vertexBytes));
+    std::memcpy(static_cast<uint8_t*>(mapped) + vertexBytes, indices, static_cast<size_t>(indexBytes));
+    upload->Unmap(0, nullptr);
+    renderer->uploadList->CopyBufferRegion(buffer, 0, upload, 0, totalBytes);
+    renderer->uploadBarriers.push_back(transition(buffer, D3D12_RESOURCE_STATE_COPY_DEST,
+            D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER | D3D12_RESOURCE_STATE_INDEX_BUFFER));
+    retire(renderer, upload);
+
+    TerrainSection* section = new TerrainSection{};
     section->x = sectionX;
     section->y = sectionY;
     section->z = sectionZ;
+    section->buffer = buffer;
+    const D3D12_GPU_VIRTUAL_ADDRESS address = buffer->GetGPUVirtualAddress();
+    section->vertexView = {address, static_cast<UINT>(vertexBytes), kVertexStride};
+    section->indexView = {address + vertexBytes, static_cast<UINT>(indexBytes), DXGI_FORMAT_R32_UINT};
+    UINT start = 0;
     for (UINT layer = 0; layer < kLayerCount; ++layer) {
         section->layerIndexCounts[layer] = static_cast<UINT>(counts[layer]);
+        section->layerStart[layer] = start;
+        start += section->layerIndexCounts[layer];
     }
     auto existing = renderer->sections.find(key);
     if (existing != renderer->sections.end()) {
-        deleteSection(existing->second);
+        retireSection(renderer, existing->second);
         existing->second = section;
     } else {
         renderer->sections.emplace(key, section);
@@ -810,7 +1355,7 @@ Java_com_redondoguibi_direct_NativeDx12_updateTerrainSection(JNIEnv* env, jclass
 
 extern "C" JNIEXPORT void JNICALL
 Java_com_redondoguibi_direct_NativeDx12_updateTerrainAtlas(JNIEnv* env, jclass, jobjectArray levels,
-        jint width, jint height) {
+        jint width, jint height, jboolean compress) {
     InteropRenderer* renderer = g_interopRenderer;
     if (renderer == nullptr) {
         throwJava(env, "DX12 terrain atlas upload requires an initialized renderer.");
@@ -821,7 +1366,7 @@ Java_com_redondoguibi_direct_NativeDx12_updateTerrainAtlas(JNIEnv* env, jclass, 
         throwJava(env, "DX12 terrain atlas dimensions or mip chain are invalid.");
         return;
     }
-    D3D11_SUBRESOURCE_DATA data[kMaxAtlasLevels] = {};
+    const void* data[kMaxAtlasLevels] = {};
     for (jsize level = 0; level < levelCount; ++level) {
         jobject buffer = env->GetObjectArrayElement(levels, level);
         const uint64_t levelWidth = (std::max)(1u, static_cast<UINT>(width) >> level);
@@ -836,34 +1381,10 @@ Java_com_redondoguibi_direct_NativeDx12_updateTerrainAtlas(JNIEnv* env, jclass, 
             throwJava(env, "DX12 terrain atlas mip level buffer is invalid.");
             return;
         }
-        data[level].pSysMem = pixels;
-        data[level].SysMemPitch = static_cast<UINT>(levelWidth * 4);
+        data[level] = pixels;
     }
-    D3D11_TEXTURE2D_DESC description = {};
-    description.Width = static_cast<UINT>(width);
-    description.Height = static_cast<UINT>(height);
-    description.MipLevels = static_cast<UINT>(levelCount);
-    description.ArraySize = 1;
-    description.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-    description.SampleDesc.Count = 1;
-    description.Usage = D3D11_USAGE_IMMUTABLE;
-    description.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-    ID3D11Texture2D* atlas = nullptr;
-    ID3D11ShaderResourceView* atlasView = nullptr;
-    HRESULT result = renderer->d3d11Device->CreateTexture2D(&description, data, &atlas);
-    if (SUCCEEDED(result)) {
-        result = renderer->d3d11Device->CreateShaderResourceView(atlas, nullptr, &atlasView);
-    }
-    if (FAILED(result)) {
-        release(atlasView);
-        release(atlas);
-        throwJava(env, "DX12 terrain atlas texture upload failed.");
-        return;
-    }
-    release(renderer->atlasView);
-    release(renderer->atlas);
-    renderer->atlas = atlas;
-    renderer->atlasView = atlasView;
+    uploadAtlas(renderer, data, levelCount, static_cast<UINT>(width), static_cast<UINT>(height),
+            compress == JNI_TRUE, env);
 }
 
 extern "C" JNIEXPORT void JNICALL
@@ -873,7 +1394,7 @@ Java_com_redondoguibi_direct_NativeDx12_removeTerrainSection(JNIEnv*, jclass, jl
     }
     auto existing = g_interopRenderer->sections.find(key);
     if (existing != g_interopRenderer->sections.end()) {
-        deleteSection(existing->second);
+        retireSection(g_interopRenderer, existing->second);
         g_interopRenderer->sections.erase(existing);
     }
 }
@@ -881,7 +1402,7 @@ Java_com_redondoguibi_direct_NativeDx12_removeTerrainSection(JNIEnv*, jclass, jl
 extern "C" JNIEXPORT void JNICALL
 Java_com_redondoguibi_direct_NativeDx12_clearTerrain(JNIEnv*, jclass) {
     if (g_interopRenderer != nullptr) {
-        releaseTerrainSections(g_interopRenderer);
+        retireTerrainSections(g_interopRenderer);
     }
 }
 

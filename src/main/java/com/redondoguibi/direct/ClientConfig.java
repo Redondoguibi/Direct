@@ -20,6 +20,11 @@ public final class ClientConfig {
             .define("shaderPack", "default", value -> value instanceof String name
                     && name.matches("[A-Za-z0-9_-]+"));
 
+    public static final ModConfigSpec.BooleanValue COMPRESS_BLOCK_ATLAS = BUILDER
+            .comment("Compress the DX12 block atlas to BC7 on load (less GPU memory bandwidth).",
+                    "Lossy: may slightly change pixel-art colors. Applied on the next resource reload.")
+            .define("compressBlockAtlas", true);
+
     public static final ModConfigSpec SPEC = BUILDER.build();
 
     private ClientConfig() {

@@ -17,7 +17,10 @@ import net.minecraft.core.BlockPos;
 import net.minecraft.core.SectionPos;
 
 public final class TerrainMeshStore {
-    private static final int OUTPUT_VERTEX_SIZE = 24;
+    // Precisa bater com o input layout nativo: posição uint16 x4, cor RGBA8, UV unorm16 x2.
+    private static final int OUTPUT_VERTEX_SIZE = 16;
+    private static final float POSITION_SCALE = 1024.0f;
+    private static final float POSITION_ORIGIN = -16.0f;
     private static final int LAYER_COUNT = 3;
     private static final Object LOCK = new Object();
     private static final ConcurrentLinkedQueue<SectionMesh> UPDATES = new ConcurrentLinkedQueue<>();
@@ -87,12 +90,13 @@ public final class TerrainMeshStore {
                 int uvOffset = format.getOffset(VertexFormatElement.UV0);
                 for (int vertex = 0; vertex < drawState.vertexCount(); vertex++) {
                     int offset = sourceVertices.position() + vertex * stride;
-                    vertices.putFloat(sourceVertices.getFloat(offset + positionOffset));
-                    vertices.putFloat(sourceVertices.getFloat(offset + positionOffset + Float.BYTES));
-                    vertices.putFloat(sourceVertices.getFloat(offset + positionOffset + 2 * Float.BYTES));
+                    vertices.putShort(packPosition(sourceVertices.getFloat(offset + positionOffset)));
+                    vertices.putShort(packPosition(sourceVertices.getFloat(offset + positionOffset + Float.BYTES)));
+                    vertices.putShort(packPosition(sourceVertices.getFloat(offset + positionOffset + 2 * Float.BYTES)));
+                    vertices.putShort((short) 0);
                     vertices.putInt(sourceVertices.getInt(offset + colorOffset));
-                    vertices.putFloat(sourceVertices.getFloat(offset + uvOffset));
-                    vertices.putFloat(sourceVertices.getFloat(offset + uvOffset + Float.BYTES));
+                    vertices.putShort(packUnorm16(sourceVertices.getFloat(offset + uvOffset)));
+                    vertices.putShort(packUnorm16(sourceVertices.getFloat(offset + uvOffset + Float.BYTES)));
                 }
                 int indexSize = drawState.indexType().bytes;
                 for (int index = 0; index < drawState.indexCount(); index++) {
@@ -153,6 +157,16 @@ public final class TerrainMeshStore {
                         update.layerIndexCounts());
             }
         }
+    }
+
+    /** Posição local da seção em [-16, 48) com precisão de 1/1024 de bloco. */
+    private static short packPosition(float value) {
+        int packed = Math.round((value - POSITION_ORIGIN) * POSITION_SCALE);
+        return (short) Math.max(0, Math.min(0xFFFF, packed));
+    }
+
+    private static short packUnorm16(float value) {
+        return (short) Math.round(Math.max(0.0f, Math.min(1.0f, value)) * 0xFFFF);
     }
 
     private static RenderType[] supportedLayers() {

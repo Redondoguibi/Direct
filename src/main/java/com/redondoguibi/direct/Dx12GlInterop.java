@@ -344,7 +344,8 @@ public final class Dx12GlInterop {
                 GL11.glGetTexImage(GL11.GL_TEXTURE_2D, level, GL11.GL_RGBA, GL11.GL_UNSIGNED_BYTE, pixels);
                 levels.add(pixels);
             }
-            NativeDx12.updateTerrainAtlas(levels.toArray(ByteBuffer[]::new), baseWidth, baseHeight);
+            NativeDx12.updateTerrainAtlas(levels.toArray(ByteBuffer[]::new), baseWidth, baseHeight,
+                    ClientConfig.COMPRESS_BLOCK_ATLAS.get());
             blockAtlasDirty = false;
         } finally {
             GL11.glPixelStorei(GL11.GL_PACK_ALIGNMENT, previousPackAlignment);
