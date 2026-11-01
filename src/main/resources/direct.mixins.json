@@ -1,0 +1,17 @@
+{
+  "required": true,
+  "package": "com.redondoguibi.direct.mixin",
+  "compatibilityLevel": "JAVA_21",
+  "client": [
+    "GuiMixin",
+    "SectionCompilerMixin",
+    "TextureAtlasMixin",
+    "WindowMixin"
+  ],
+  "injectors": {
+    "defaultRequire": 1
+  },
+  "overwrites": {
+    "requireAnnotations": true
+  }
+}

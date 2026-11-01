@@ -1,0 +1,7 @@
+{
+  "direct.configuration.title": "Direct DX12",
+  "direct.configuration.section.direct.client.toml": "Direct DX12",
+  "direct.configuration.section.direct.client.toml.title": "Direct DX12",
+  "direct.configuration.enableDx12Preview": "Enable DX12 shader preview",
+  "direct.configuration.shaderPack": "Shader pack folder"
+}
