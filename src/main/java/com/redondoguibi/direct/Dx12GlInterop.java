@@ -35,6 +35,7 @@ import com.redondoguibi.direct.api.DirectRenderPass;
 public final class Dx12GlInterop {
     private static final int[] NO_OBJECTS = new int[0];
     private static final int MAX_ATLAS_LEVELS = 16;
+    private static final long RETRY_DELAY_NANOS = 5_000_000_000L;
     private static final String VERTEX_SHADER = """
             #version 150
             out vec2 texCoord;
@@ -86,6 +87,7 @@ public final class Dx12GlInterop {
     private static long interopObject;
     private static long frameIndex;
     private static long startedAtNanos;
+    private static long retryAfterNanos;
     private static int texture;
     private static int vertexArray;
     private static int program;
@@ -121,10 +123,14 @@ public final class Dx12GlInterop {
                 shutdown();
             }
             disabled = false;
+            retryAfterNanos = 0;
             DirectStatusOverlay.setStatus("Vanilla (disabled in config)");
             return;
         }
         if (disabled) {
+            return;
+        }
+        if (!initialized && retryAfterNanos != 0 && System.nanoTime() - retryAfterNanos < 0) {
             return;
         }
 
@@ -175,6 +181,10 @@ public final class Dx12GlInterop {
                 resize(currentWidth, currentHeight);
             }
 
+            if (!NativeDx12.isCurrentFrameSlotReady()) {
+                DirectStatusOverlay.setStatus("D3D12 / waiting for GPU");
+                return;
+            }
             TerrainMeshStore.uploadPending();
             uploadBlockAtlasIfNeeded(minecraft);
 
@@ -212,9 +222,18 @@ public final class Dx12GlInterop {
                 DirectRenderApi.copyUniforms(pass, passContext, passUniformScratch,
                         index * DirectRenderApi.MAX_UNIFORM_FLOATS);
             }
-            boolean nativeGpu = NativeDx12.renderInterop(MATRIX, cameraX, cameraY, cameraZ,
+            int renderResult = NativeDx12.renderInterop(MATRIX, cameraX, cameraY, cameraZ,
                     renderDistance, frameIndex,
                     elapsedSeconds, passUniformScratch, gpuSemaphoreInterop);
+            if (renderResult == NativeDx12.FRAME_SKIPPED_BUSY) {
+                DirectStatusOverlay.setStatus("D3D12 / waiting for GPU");
+                return;
+            }
+            if (renderResult != NativeDx12.FRAME_RENDERED_CPU_SYNC
+                    && renderResult != NativeDx12.FRAME_RENDERED_GPU_SYNC) {
+                throw new IllegalStateException("DX12 returned an invalid frame status: " + renderResult);
+            }
+            boolean nativeGpu = renderResult == NativeDx12.FRAME_RENDERED_GPU_SYNC;
             if (gpuSemaphoreInterop && !nativeGpu) {
                 disableGpuSemaphore("The native command queue could not enqueue a GPU-side fence wait; "
                         + "using CPU fence waits.");
@@ -232,14 +251,15 @@ public final class Dx12GlInterop {
             DirectRenderEventBridge.postFrame(new DirectFrameRenderEvent(
                     DirectFrameRenderEvent.Stage.AFTER_PASSES, frameContext));
             frameIndex++;
+            retryAfterNanos = 0;
             DirectStatusOverlay.setStatus(gpuSemaphoreInterop ? "D3D12 / GPU sync" : "D3D12 / CPU fallback");
         } catch (IOException | RuntimeException | UnsatisfiedLinkError exception) {
             Direct.LOGGER.error("DX12/OpenGL interop failed; retaining vanilla rendering.", exception);
             shutdown();
             disableTerrainCapture();
             DirectRenderApi.updateCapabilities(DirectRenderCapabilities.unavailable());
-            DirectStatusOverlay.setStatus("Vanilla (renderer error)");
-            disabled = true;
+            retryAfterNanos = System.nanoTime() + RETRY_DELAY_NANOS;
+            DirectStatusOverlay.setStatus("Vanilla (retrying after renderer error)");
         }
     }
 

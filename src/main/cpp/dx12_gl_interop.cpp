@@ -444,6 +444,20 @@ void releaseCompleted(InteropRenderer* renderer) {
     }
 }
 
+bool currentFrameSlotReady(InteropRenderer* renderer, JNIEnv* env, bool* ready) {
+    if (renderer->uploadOpen) {
+        *ready = true;
+        return true;
+    }
+    const UINT64 completed = renderer->fence->GetCompletedValue();
+    if (completed == kFenceError) {
+        throwJava(env, "DX12 device was removed while checking the current frame slot.");
+        return false;
+    }
+    *ready = renderer->slots[renderer->slotIndex].fenceValue <= completed;
+    return true;
+}
+
 void releaseAllRetired(InteropRenderer* renderer) {
     for (RetiredResource& entry : renderer->retired) {
         entry.resource->Release();
@@ -1379,7 +1393,8 @@ bool recordExtensionPasses(InteropRenderer* renderer, FrameSlot& slot, UINT64 fr
 bool renderInteropFrame(InteropRenderer* renderer, const float* viewProjection,
         double cameraX, double cameraY, double cameraZ, float renderDistance,
         UINT64 frameIndex, float elapsedSeconds, const float* passUniforms,
-        bool useGpuSynchronization, JNIEnv* env, bool* gpuSynchronizationUsed) {
+        bool useGpuSynchronization, JNIEnv* env, bool* gpuSynchronizationUsed,
+        bool* frameSkipped) {
     if (frameIndex >= kFenceError - 1) {
         throwJava(env, "DX12/OpenGL interop fence timeline has exhausted its frame values.");
         return false;
@@ -1387,9 +1402,13 @@ bool renderInteropFrame(InteropRenderer* renderer, const float* viewProjection,
     const UINT64 glDoneValue = frameIndex;
     const UINT64 dxReadyValue = frameIndex + 1;
     FrameSlot& slot = renderer->slots[renderer->slotIndex];
-    if (!waitFence(renderer, renderer->fence, slot.fenceValue)) {
-        throwJava(env, "DX12 terrain timed out waiting for a free frame slot.");
+    bool slotReady = false;
+    if (!currentFrameSlotReady(renderer, env, &slotReady)) {
         return false;
+    }
+    if (!slotReady) {
+        *frameSkipped = true;
+        return true;
     }
     releaseCompleted(renderer);
 
@@ -1655,13 +1674,26 @@ Java_com_redondoguibi_direct_NativeDx12_interopFeatureFlags(JNIEnv*, jclass) {
 }
 
 extern "C" JNIEXPORT jboolean JNICALL
+Java_com_redondoguibi_direct_NativeDx12_isCurrentFrameSlotReady(JNIEnv* env, jclass) {
+    if (g_interopRenderer == nullptr) {
+        throwJava(env, "DX12/OpenGL interop is not initialized.");
+        return JNI_FALSE;
+    }
+    bool ready = false;
+    if (!currentFrameSlotReady(g_interopRenderer, env, &ready)) {
+        return JNI_FALSE;
+    }
+    return ready ? JNI_TRUE : JNI_FALSE;
+}
+
+extern "C" JNIEXPORT jint JNICALL
 Java_com_redondoguibi_direct_NativeDx12_renderInterop(JNIEnv* env, jclass, jfloatArray matrix,
         jdouble cameraX, jdouble cameraY, jdouble cameraZ, jfloat renderDistance,
         jlong frameIndex, jfloat elapsedSeconds, jfloatArray passUniforms,
         jboolean useGpuSynchronization) {
     if (g_interopRenderer == nullptr) {
         throwJava(env, "DX12/OpenGL interop is not initialized.");
-        return JNI_FALSE;
+        return -1;
     }
     const jsize expectedUniforms = static_cast<jsize>(
             g_interopRenderer->extensionPasses.size() * kPassUniformFloatCount);
@@ -1669,28 +1701,32 @@ Java_com_redondoguibi_direct_NativeDx12_renderInterop(JNIEnv* env, jclass, jfloa
             || (expectedUniforms > 0 && (passUniforms == nullptr
                 || env->GetArrayLength(passUniforms) != expectedUniforms))) {
         throwJava(env, "DX12 terrain rendering received an invalid matrix or frame index.");
-        return JNI_FALSE;
+        return -1;
     }
     jfloat values[16];
     env->GetFloatArrayRegion(matrix, 0, 16, values);
     if (env->ExceptionCheck()) {
-        return JNI_FALSE;
+        return -1;
     }
     float uniformValues[kMaxExtensionPasses * kPassUniformFloatCount];
     if (expectedUniforms > 0) {
         env->GetFloatArrayRegion(passUniforms, 0, expectedUniforms, uniformValues);
         if (env->ExceptionCheck()) {
-            return JNI_FALSE;
+            return -1;
         }
     }
     bool gpuUsed = false;
+    bool frameSkipped = false;
     if (!renderInteropFrame(g_interopRenderer, values, cameraX, cameraY, cameraZ, renderDistance,
             static_cast<UINT64>(frameIndex), elapsedSeconds,
             expectedUniforms > 0 ? uniformValues : nullptr,
-            useGpuSynchronization == JNI_TRUE, env, &gpuUsed)) {
-        return JNI_FALSE;
+            useGpuSynchronization == JNI_TRUE, env, &gpuUsed, &frameSkipped)) {
+        return -1;
     }
-    return gpuUsed ? JNI_TRUE : JNI_FALSE;
+    if (frameSkipped) {
+        return 2;
+    }
+    return gpuUsed ? 1 : 0;
 }
 
 extern "C" JNIEXPORT void JNICALL

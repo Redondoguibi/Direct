@@ -3,6 +3,10 @@ package com.redondoguibi.direct;
 import java.nio.ByteBuffer;
 
 final class NativeDx12 {
+    static final int FRAME_RENDERED_CPU_SYNC = 0;
+    static final int FRAME_RENDERED_GPU_SYNC = 1;
+    static final int FRAME_SKIPPED_BUSY = 2;
+
     private NativeDx12() {
     }
 
@@ -12,13 +16,15 @@ final class NativeDx12 {
 
     static native void configureRenderPasses(String[] pixelShaderSources);
 
-    static native boolean renderInterop(float[] viewProjection, double cameraX, double cameraY, double cameraZ,
+    static native int renderInterop(float[] viewProjection, double cameraX, double cameraY, double cameraZ,
             float renderDistance, long frameIndex, float elapsedSeconds, float[] passUniforms,
             boolean useGpuSynchronization);
 
     static native String interopAdapterName();
 
     static native int interopFeatureFlags();
+
+    static native boolean isCurrentFrameSlotReady();
 
     static native void waitInteropFence(long value);
 
