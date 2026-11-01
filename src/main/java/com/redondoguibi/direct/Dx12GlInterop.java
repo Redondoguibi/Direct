@@ -118,6 +118,7 @@ public final class Dx12GlInterop {
         boolean captured = matricesCaptured;
         matricesCaptured = false;
         if (!ClientConfig.ENABLE_DX12.get()) {
+            TerrainMeshStore.clearCaptureFault();
             if (initialized || terrainCaptureEnabled) {
                 disableTerrainCapture();
                 shutdown();
@@ -125,6 +126,13 @@ public final class Dx12GlInterop {
             disabled = false;
             retryAfterNanos = 0;
             DirectStatusOverlay.setStatus("Vanilla (disabled in config)");
+            return;
+        }
+        if (TerrainMeshStore.hasCaptureFault()) {
+            disableTerrainCapture();
+            shutdown();
+            disabled = true;
+            DirectStatusOverlay.setStatus("Vanilla (terrain capture failed)");
             return;
         }
         if (disabled) {

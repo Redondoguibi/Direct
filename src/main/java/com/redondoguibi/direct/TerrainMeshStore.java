@@ -31,6 +31,7 @@ public final class TerrainMeshStore {
     private static RenderType[] layers;
     private static long generation; // guardado por LOCK
     private static volatile boolean captureEnabled;
+    private static volatile boolean captureFaulted;
 
     static {
         VERSIONS.defaultReturnValue(0L);
@@ -52,7 +53,7 @@ public final class TerrainMeshStore {
     }
 
     public static void capture(SectionPos sectionPos, SectionCompiler.Results results) {
-        if (!captureEnabled || results == null) {
+        if (!captureEnabled || captureFaulted || results == null) {
             return;
         }
         long[] token = CAPTURE_TOKEN.get();
@@ -70,6 +71,9 @@ public final class TerrainMeshStore {
                 MeshData mesh = rendered.get(supported[layerIndex]);
                 if (!isSupported(mesh)) {
                     continue;
+                }
+                if (!hasValidBuffers(mesh)) {
+                    throw new IllegalStateException("Vanilla terrain mesh has inconsistent buffer bounds.");
                 }
                 meshes[layerIndex] = mesh;
                 vertexCount += mesh.drawState().vertexCount();
@@ -103,9 +107,10 @@ public final class TerrainMeshStore {
             indices.flip();
             publish(captureGeneration, captureVersion, new SectionMesh(key, origin.getX(), origin.getY(),
                     origin.getZ(), vertices, vertexBase, indices, layerIndexCounts));
-        } catch (IllegalArgumentException | IndexOutOfBoundsException exception) {
+        } catch (RuntimeException exception) {
+            captureFaulted = true;
+            captureEnabled = false;
             Direct.LOGGER.error("Could not extract vanilla terrain mesh for section {}.", sectionPos, exception);
-            publish(captureGeneration, captureVersion, SectionMesh.empty(key));
         }
     }
 
@@ -133,7 +138,18 @@ public final class TerrainMeshStore {
     }
 
     public static void setCaptureEnabled(boolean enabled) {
+        if (enabled) {
+            captureFaulted = false;
+        }
         captureEnabled = enabled;
+    }
+
+    public static boolean hasCaptureFault() {
+        return captureFaulted;
+    }
+
+    public static void clearCaptureFault() {
+        captureFaulted = false;
     }
 
     public static void uploadPending() {
@@ -172,6 +188,23 @@ public final class TerrainMeshStore {
     private static boolean isSupported(MeshData mesh) {
         return mesh != null && mesh.drawState().format() == DefaultVertexFormat.BLOCK
                 && mesh.drawState().mode() == VertexFormat.Mode.QUADS;
+    }
+
+    private static boolean hasValidBuffers(MeshData mesh) {
+        MeshData.DrawState drawState = mesh.drawState();
+        VertexFormat format = drawState.format();
+        int stride = format.getVertexSize();
+        int indexSize = drawState.indexType().bytes;
+        int positionOffset = format.getOffset(VertexFormatElement.POSITION);
+        int colorOffset = format.getOffset(VertexFormatElement.COLOR);
+        int uvOffset = format.getOffset(VertexFormatElement.UV0);
+        return stride > 0 && positionOffset >= 0 && colorOffset >= 0 && uvOffset >= 0
+                && positionOffset + 3 * Float.BYTES <= stride
+                && colorOffset + Integer.BYTES <= stride
+                && uvOffset + 2 * Float.BYTES <= stride
+                && (indexSize == Short.BYTES || indexSize == Integer.BYTES)
+                && (long) drawState.vertexCount() * stride <= mesh.vertexBuffer().remaining()
+                && (long) drawState.indexCount() * indexSize <= mesh.indexBuffer().remaining();
     }
 
     private static void packVertices(ByteBuffer destination, ByteBuffer source, MeshData.DrawState drawState) {
