@@ -25,7 +25,7 @@ jobs:
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
       - name: Compile and test Java API
-        run: ./gradlew compileJava test javadoc
+        run: bash gradlew compileJava test javadoc
 
   windows:
     name: Windows native build and smoke test
