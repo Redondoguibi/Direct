@@ -4,8 +4,14 @@
 #include <d3d11on12.h>
 #include <d3d12.h>
 #include <d3dcompiler.h>
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <limits>
+#include <mutex>
+#include <system_error>
+#include <thread>
 #include <unordered_map>
 
 namespace {
@@ -18,7 +24,17 @@ struct InteropRenderer {
     ID3D12CommandQueue* queue;
     ID3D12Resource* texture;
     ID3D12Fence* fence;
+    ID3D12Fence* glDoneFence;
     HANDLE fenceEvent;
+    HANDLE sharedFenceHandle;
+    HANDLE sharedGlDoneFenceHandle;
+    std::mutex watchdogMutex;
+    std::condition_variable watchdogCondition;
+    std::thread watchdogThread;
+    UINT64 watchedFenceValue;
+    UINT64 lastQueuedGlDoneValue;
+    bool stopWatchdog;
+    std::atomic<bool> gpuSyncFault;
     ID3D11Device* d3d11Device;
     ID3D11DeviceContext* d3d11Context;
     ID3D11On12Device* d3d11On12Device;
@@ -38,6 +54,8 @@ struct InteropRenderer {
 };
 
 InteropRenderer* g_interopRenderer;
+constexpr DWORD kFenceWaitTimeoutMs = 5000;
+constexpr auto kFenceWatchdogTimeout = std::chrono::seconds(5);
 constexpr float kClearColor[4] = {0.08f, 0.32f, 0.92f, 1.0f};
 constexpr char kTerrainVertexShader[] = R"(
 cbuffer FrameConstants : register(b0) {
@@ -95,6 +113,62 @@ void release(T*& object) {
     }
 }
 
+bool createSharedFence(ID3D12Device* device, ID3D12Fence** fence, HANDLE* sharedHandle) {
+    HRESULT result = device->CreateFence(0, D3D12_FENCE_FLAG_SHARED, IID_PPV_ARGS(fence));
+    const bool createdShared = SUCCEEDED(result);
+    if (FAILED(result)) {
+        result = device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(fence));
+    }
+    if (FAILED(result)) {
+        return false;
+    }
+    if (createdShared) {
+        *sharedHandle = nullptr;
+        device->CreateSharedHandle(*fence, nullptr, GENERIC_ALL, nullptr, sharedHandle);
+    }
+    return true;
+}
+
+void fenceWatchdog(InteropRenderer* renderer) {
+    std::unique_lock<std::mutex> lock(renderer->watchdogMutex);
+    while (!renderer->stopWatchdog) {
+        renderer->watchdogCondition.wait(lock, [renderer] {
+            return renderer->stopWatchdog || renderer->watchedFenceValue != 0;
+        });
+        if (renderer->stopWatchdog) {
+            break;
+        }
+
+        const auto deadline = std::chrono::steady_clock::now() + kFenceWatchdogTimeout;
+        while (!renderer->stopWatchdog && renderer->watchedFenceValue != 0) {
+            const UINT64 targetValue = renderer->watchedFenceValue;
+            const UINT64 completedValue = renderer->fence->GetCompletedValue();
+            if (completedValue == std::numeric_limits<UINT64>::max()) {
+                renderer->gpuSyncFault.store(true);
+                renderer->watchedFenceValue = 0;
+                break;
+            }
+            if (completedValue >= targetValue) {
+                renderer->watchedFenceValue = 0;
+                break;
+            }
+            if (renderer->watchdogCondition.wait_until(lock, deadline) == std::cv_status::timeout) {
+                const UINT64 latestTarget = renderer->watchedFenceValue;
+                if (latestTarget != 0) {
+                    const UINT64 completed = renderer->fence->GetCompletedValue();
+                    if ((completed == std::numeric_limits<UINT64>::max() || completed < latestTarget)
+                            && FAILED(renderer->fence->Signal(latestTarget))) {
+                        OutputDebugStringA("Direct interop watchdog could not CPU-signal the D3D12 fence.\n");
+                    }
+                    renderer->gpuSyncFault.store(true);
+                }
+                renderer->watchedFenceValue = 0;
+                break;
+            }
+        }
+    }
+}
+
 void releaseTerrainSections(InteropRenderer* renderer) {
     if (renderer->terrainSections == nullptr) {
         return;
@@ -111,11 +185,30 @@ void destroyInteropRenderer(InteropRenderer* renderer) {
     if (renderer == nullptr) {
         return;
     }
+    if (renderer->glDoneFence != nullptr && renderer->lastQueuedGlDoneValue > 0
+            && renderer->glDoneFence->GetCompletedValue() < renderer->lastQueuedGlDoneValue) {
+        renderer->glDoneFence->Signal(renderer->lastQueuedGlDoneValue);
+    }
+    {
+        std::lock_guard<std::mutex> lock(renderer->watchdogMutex);
+        renderer->stopWatchdog = true;
+    }
+    renderer->watchdogCondition.notify_all();
+    if (renderer->watchdogThread.joinable()) {
+        renderer->watchdogThread.join();
+    }
     if (renderer->queue != nullptr && renderer->fence != nullptr && renderer->fenceEvent != nullptr) {
-        const UINT64 value = ++renderer->fenceValue;
-        if (SUCCEEDED(renderer->queue->Signal(renderer->fence, value))
-                && SUCCEEDED(renderer->fence->SetEventOnCompletion(value, renderer->fenceEvent))) {
-            WaitForSingleObject(renderer->fenceEvent, INFINITE);
+        const UINT64 completedValue = renderer->fence->GetCompletedValue();
+        if (completedValue != std::numeric_limits<UINT64>::max()) {
+            const UINT64 baseValue = completedValue > renderer->fenceValue
+                    ? completedValue : renderer->fenceValue;
+            if (baseValue != std::numeric_limits<UINT64>::max()) {
+                const UINT64 value = baseValue + 1;
+                if (SUCCEEDED(renderer->queue->Signal(renderer->fence, value))
+                        && SUCCEEDED(renderer->fence->SetEventOnCompletion(value, renderer->fenceEvent))) {
+                    WaitForSingleObject(renderer->fenceEvent, INFINITE);
+                }
+            }
         }
     }
     releaseTerrainSections(renderer);
@@ -136,6 +229,13 @@ void destroyInteropRenderer(InteropRenderer* renderer) {
     release(renderer->d3d11Context);
     release(renderer->d3d11Device);
     release(renderer->texture);
+    if (renderer->sharedGlDoneFenceHandle != nullptr) {
+        CloseHandle(renderer->sharedGlDoneFenceHandle);
+    }
+    if (renderer->sharedFenceHandle != nullptr) {
+        CloseHandle(renderer->sharedFenceHandle);
+    }
+    release(renderer->glDoneFence);
     release(renderer->fence);
     release(renderer->queue);
     release(renderer->device);
@@ -220,6 +320,7 @@ bool createTerrainPipeline(InteropRenderer* renderer, JNIEnv* env) {
 }
 
 bool initializeInteropRenderer(InteropRenderer* renderer, jint width, jint height, JNIEnv* env) {
+    renderer->gpuSyncFault.store(false);
     if (width <= 0 || height <= 0) {
         throwJava(env, "DX12/OpenGL interop requires a non-zero framebuffer size.");
         return false;
@@ -329,8 +430,9 @@ bool initializeInteropRenderer(InteropRenderer* renderer, jint width, jint heigh
         throwJava(env, "DX12/OpenGL interop could not create the D3D11 import texture.");
         return false;
     }
-    if (FAILED(renderer->device->CreateFence(0, D3D12_FENCE_FLAG_NONE,
-            IID_PPV_ARGS(&renderer->fence)))) {
+    if (!createSharedFence(renderer->device, &renderer->fence, &renderer->sharedFenceHandle)
+            || !createSharedFence(renderer->device, &renderer->glDoneFence,
+                    &renderer->sharedGlDoneFenceHandle)) {
         throwJava(env, "DX12/OpenGL interop could not create a Direct3D 12 fence.");
         return false;
     }
@@ -339,11 +441,89 @@ bool initializeInteropRenderer(InteropRenderer* renderer, jint width, jint heigh
         throwJava(env, "DX12/OpenGL interop could not create a fence event.");
         return false;
     }
+    if (renderer->sharedFenceHandle != nullptr && renderer->sharedGlDoneFenceHandle != nullptr) {
+        try {
+            renderer->watchdogThread = std::thread(fenceWatchdog, renderer);
+        } catch (const std::system_error&) {
+            CloseHandle(renderer->sharedFenceHandle);
+            CloseHandle(renderer->sharedGlDoneFenceHandle);
+            renderer->sharedFenceHandle = nullptr;
+            renderer->sharedGlDoneFenceHandle = nullptr;
+        }
+    }
     return true;
 }
 
+bool waitForInteropFence(InteropRenderer* renderer, UINT64 value) {
+    const UINT64 completedValue = renderer->fence->GetCompletedValue();
+    if (completedValue == std::numeric_limits<UINT64>::max()) {
+        return false;
+    }
+    if (completedValue >= value) {
+        return true;
+    }
+    if (FAILED(renderer->fence->SetEventOnCompletion(value, renderer->fenceEvent))) {
+        return false;
+    }
+    const DWORD waitResult = WaitForSingleObject(renderer->fenceEvent, kFenceWaitTimeoutMs);
+    if (waitResult == WAIT_OBJECT_0) {
+        const UINT64 completedAfterWait = renderer->fence->GetCompletedValue();
+        return completedAfterWait != std::numeric_limits<UINT64>::max() && completedAfterWait >= value;
+    }
+    if (waitResult == WAIT_TIMEOUT && SUCCEEDED(renderer->fence->Signal(value))) {
+        renderer->gpuSyncFault.store(true);
+        return true;
+    }
+    return false;
+}
+
+bool waitForGlDoneFence(InteropRenderer* renderer, UINT64 value) {
+    const UINT64 completedValue = renderer->glDoneFence->GetCompletedValue();
+    if (completedValue == std::numeric_limits<UINT64>::max()) {
+        return false;
+    }
+    if (value == 0 || completedValue >= value) {
+        return true;
+    }
+    if (FAILED(renderer->glDoneFence->SetEventOnCompletion(value, renderer->fenceEvent))) {
+        return false;
+    }
+    const DWORD waitResult = WaitForSingleObject(renderer->fenceEvent, kFenceWaitTimeoutMs);
+    if (waitResult == WAIT_OBJECT_0) {
+        const UINT64 completedAfterWait = renderer->glDoneFence->GetCompletedValue();
+        return completedAfterWait != std::numeric_limits<UINT64>::max() && completedAfterWait >= value;
+    }
+    if (waitResult == WAIT_TIMEOUT && SUCCEEDED(renderer->glDoneFence->Signal(value))) {
+        renderer->gpuSyncFault.store(true);
+        return true;
+    }
+    return false;
+}
+
 bool renderInteropFrame(InteropRenderer* renderer, const float* viewProjection,
-        float cameraX, float cameraY, float cameraZ, float renderDistance, JNIEnv* env) {
+        float cameraX, float cameraY, float cameraZ, float renderDistance,
+        UINT64 frameIndex, bool useGpuSynchronization, JNIEnv* env, bool* gpuSynchronizationUsed) {
+    if (frameIndex >= std::numeric_limits<UINT64>::max() - 1) {
+        throwJava(env, "DX12/OpenGL interop fence timeline has exhausted its frame values.");
+        return false;
+    }
+    const UINT64 glDoneValue = frameIndex;
+    const UINT64 dxReadyValue = frameIndex + 1;
+    *gpuSynchronizationUsed = useGpuSynchronization && renderer->sharedFenceHandle != nullptr
+            && renderer->sharedGlDoneFenceHandle != nullptr && !renderer->gpuSyncFault.load();
+    if (*gpuSynchronizationUsed && glDoneValue > 0) {
+        const HRESULT waitResult = renderer->queue->Wait(renderer->glDoneFence, glDoneValue);
+        if (FAILED(waitResult)) {
+            if (!waitForGlDoneFence(renderer, glDoneValue)) {
+                throwJava(env, "DX12/OpenGL interop failed to fall back to a CPU wait for the shared fence.");
+                return false;
+            }
+            *gpuSynchronizationUsed = false;
+        } else {
+            renderer->lastQueuedGlDoneValue = glDoneValue;
+        }
+    }
+
     ID3D11Resource* resources[] = {renderer->wrappedTexture};
     renderer->d3d11On12Device->AcquireWrappedResources(resources, ARRAYSIZE(resources));
     renderer->d3d11Context->ClearRenderTargetView(renderer->renderTarget, kClearColor);
@@ -394,13 +574,25 @@ bool renderInteropFrame(InteropRenderer* renderer, const float* viewProjection,
     renderer->d3d11On12Device->ReleaseWrappedResources(resources, ARRAYSIZE(resources));
     renderer->d3d11Context->Flush();
 
-    const UINT64 value = ++renderer->fenceValue;
-    if (FAILED(renderer->queue->Signal(renderer->fence, value))
-            || FAILED(renderer->fence->SetEventOnCompletion(value, renderer->fenceEvent))) {
+    HRESULT signalResult;
+    {
+        std::lock_guard<std::mutex> lock(renderer->watchdogMutex);
+        signalResult = renderer->queue->Signal(renderer->fence, dxReadyValue);
+        if (SUCCEEDED(signalResult)) {
+            renderer->fenceValue = dxReadyValue;
+            if (*gpuSynchronizationUsed) {
+                renderer->watchedFenceValue = dxReadyValue;
+            }
+        }
+    }
+    if (FAILED(signalResult)) {
         throwJava(env, "DX12/OpenGL interop failed to signal its frame fence.");
         return false;
     }
-    if (WaitForSingleObject(renderer->fenceEvent, INFINITE) != WAIT_OBJECT_0) {
+    if (*gpuSynchronizationUsed) {
+        renderer->watchdogCondition.notify_one();
+    }
+    if (!*gpuSynchronizationUsed && !waitForInteropFence(renderer, dxReadyValue)) {
         throwJava(env, "DX12/OpenGL interop failed while waiting for its frame fence.");
         return false;
     }
@@ -420,14 +612,16 @@ Java_com_redondoguibi_direct_NativeDx12_initializeInterop(JNIEnv* env, jclass, j
     }
     jlong handles[] = {
         static_cast<jlong>(reinterpret_cast<intptr_t>(renderer->d3d11Device)),
-        static_cast<jlong>(reinterpret_cast<intptr_t>(renderer->interopTexture))
+        static_cast<jlong>(reinterpret_cast<intptr_t>(renderer->interopTexture)),
+        static_cast<jlong>(reinterpret_cast<intptr_t>(renderer->sharedFenceHandle)),
+        static_cast<jlong>(reinterpret_cast<intptr_t>(renderer->sharedGlDoneFenceHandle))
     };
-    jlongArray result = env->NewLongArray(2);
+    jlongArray result = env->NewLongArray(4);
     if (result == nullptr) {
         destroyInteropRenderer(renderer);
         return nullptr;
     }
-    env->SetLongArrayRegion(result, 0, 2, handles);
+    env->SetLongArrayRegion(result, 0, 4, handles);
     if (env->ExceptionCheck()) {
         destroyInteropRenderer(renderer);
         return nullptr;
@@ -436,22 +630,56 @@ Java_com_redondoguibi_direct_NativeDx12_initializeInterop(JNIEnv* env, jclass, j
     return result;
 }
 
-extern "C" JNIEXPORT void JNICALL
+extern "C" JNIEXPORT jboolean JNICALL
 Java_com_redondoguibi_direct_NativeDx12_renderInterop(JNIEnv* env, jclass, jfloatArray matrix,
-        jfloat cameraX, jfloat cameraY, jfloat cameraZ, jfloat renderDistance) {
+        jfloat cameraX, jfloat cameraY, jfloat cameraZ, jfloat renderDistance,
+        jlong frameIndex, jboolean useGpuSynchronization) {
     if (g_interopRenderer == nullptr) {
         throwJava(env, "DX12/OpenGL interop is not initialized.");
-        return;
+        return JNI_FALSE;
     }
     if (matrix == nullptr || env->GetArrayLength(matrix) != 16) {
         throwJava(env, "DX12 terrain rendering requires a 4x4 view-projection matrix.");
-        return;
+        return JNI_FALSE;
+    }
+    if (frameIndex < 0) {
+        throwJava(env, "DX12/OpenGL interop received a negative frame index.");
+        return JNI_FALSE;
     }
     jfloat values[16];
     env->GetFloatArrayRegion(matrix, 0, 16, values);
-    if (!env->ExceptionCheck()) {
-        renderInteropFrame(g_interopRenderer, values, cameraX, cameraY, cameraZ, renderDistance, env);
+    if (env->ExceptionCheck()) {
+        return JNI_FALSE;
     }
+    bool gpuSynchronizationUsed = false;
+    if (!renderInteropFrame(g_interopRenderer, values, cameraX, cameraY, cameraZ, renderDistance,
+            static_cast<UINT64>(frameIndex), useGpuSynchronization == JNI_TRUE, env,
+            &gpuSynchronizationUsed)) {
+        return JNI_FALSE;
+    }
+    return gpuSynchronizationUsed ? JNI_TRUE : JNI_FALSE;
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_redondoguibi_direct_NativeDx12_waitInteropFence(JNIEnv* env, jclass, jlong value) {
+    if (g_interopRenderer == nullptr || value < 0
+            || !waitForInteropFence(g_interopRenderer, static_cast<UINT64>(value))) {
+        throwJava(env, "DX12/OpenGL interop could not wait for the requested fence value.");
+    }
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_redondoguibi_direct_NativeDx12_signalInteropFence(JNIEnv* env, jclass, jlong value) {
+    if (g_interopRenderer == nullptr || value < 0
+            || FAILED(g_interopRenderer->glDoneFence->Signal(static_cast<UINT64>(value)))) {
+        throwJava(env, "DX12/OpenGL interop could not CPU-signal the shared fence fallback.");
+    }
+}
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_redondoguibi_direct_NativeDx12_hasInteropGpuSyncFault(JNIEnv*, jclass) {
+    return g_interopRenderer != nullptr && g_interopRenderer->gpuSyncFault.load()
+            ? JNI_TRUE : JNI_FALSE;
 }
 
 extern "C" JNIEXPORT void JNICALL
