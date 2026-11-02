@@ -31,6 +31,7 @@ public final class TerrainMeshStore {
     private static final Long2LongOpenHashMap VERSIONS = new Long2LongOpenHashMap(); // guarded by LOCK
     private static final Map<Long, Integer> IN_FLIGHT = new HashMap<>();
     private static final ThreadLocal<CaptureToken> CAPTURE_TOKEN = ThreadLocal.withInitial(CaptureToken::new);
+    private static final java.util.Set<Long> UPLOADED = new java.util.HashSet<>();
     private static RenderType[] layers;
     private static long generation; // guarded by LOCK
     private static long pendingBytes; // guarded by LOCK
@@ -178,6 +179,7 @@ public final class TerrainMeshStore {
             VERSIONS.clear();
             PENDING_KEYS.clear();
             PENDING.clear();
+            UPLOADED.clear();
             pendingBytes = 0L;
             successfulCaptures = 0L;
             replacementSafe = true;
@@ -208,6 +210,17 @@ public final class TerrainMeshStore {
     /** True only after captures are drained and the terrain set has been quiet for a short grace period. */
     public static boolean isCaptureReady() {
         return captureReady && replacementSafe && captureEnabled && !captureFaulted;
+    }
+
+    public static boolean canReplaceVisible(long[] keys, int count) {
+        synchronized (LOCK) {
+            if (!captureEnabled || captureFaulted || !replacementSafe) return false;
+            for (int i = 0; i < count; i++) {
+                long key = keys[i];
+                if (!UPLOADED.contains(key) || PENDING.containsKey(key) || IN_FLIGHT.containsKey(key)) return false;
+            }
+            return true;
+        }
     }
 
     public static boolean hasCaptureFault() {
@@ -261,6 +274,10 @@ public final class TerrainMeshStore {
                 NativeDx12.updateTerrainSection(update.key(), update.sectionX(), update.sectionY(),
                         update.sectionZ(), update.vertices(), update.vertexCount(), update.indices(),
                         update.layerIndexCounts());
+            }
+            synchronized (LOCK) {
+                if (update.vertices() == null) UPLOADED.remove(update.key());
+                else UPLOADED.add(update.key());
             }
             uploaded++;
             uploadedBytes += update.byteSize();

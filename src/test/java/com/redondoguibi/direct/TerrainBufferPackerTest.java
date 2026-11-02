@@ -58,6 +58,26 @@ class TerrainBufferPackerTest {
                 () -> TerrainBufferPacker.packVertices(destination, source, 1, STRIDE, 0, 12, 16));
     }
 
+    @Test
+    void preservesBothVanillaLightCoordinatesWithoutIncreasingVertexStride() {
+        ByteBuffer source = ByteBuffer.allocateDirect(28).order(ByteOrder.nativeOrder());
+        source.putFloat(1).putFloat(2).putFloat(3).putInt(-1).putFloat(.25f).putFloat(.75f);
+        source.putShort((short) 232).putShort((short) 120).flip();
+        ByteBuffer packed = ByteBuffer.allocateDirect(16).order(ByteOrder.nativeOrder());
+        TerrainBufferPacker.packVertices(packed, source, 1, 28, 0, 12, 16, 24);
+        assertEquals(16, packed.position());
+        assertEquals(232 | 120 << 8, Short.toUnsignedInt(packed.getShort(6)));
+    }
+
+    @Test
+    void rejectsAttributesOutsideTheirVertexBeforeWritingAnything() {
+        ByteBuffer source = ByteBuffer.allocateDirect(56);
+        ByteBuffer packed = ByteBuffer.allocateDirect(32);
+        assertThrows(IllegalArgumentException.class,
+                () -> TerrainBufferPacker.packVertices(packed, source, 2, 28, 0, 12, 16, 26));
+        assertEquals(0, packed.position());
+    }
+
     private static ByteBuffer vertex(float x, float y, float z, int color, float u, float v) {
         ByteBuffer buffer = ByteBuffer.allocateDirect(SOURCE_PREFIX + STRIDE).order(ByteOrder.nativeOrder());
         buffer.position(SOURCE_PREFIX);

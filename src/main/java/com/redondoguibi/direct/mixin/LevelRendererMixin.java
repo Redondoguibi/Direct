@@ -1,10 +1,7 @@
 package com.redondoguibi.direct.mixin;
 
 import org.joml.Matrix4f;
-import java.nio.ByteBuffer;
 
-import org.lwjgl.opengl.GL11;
-import org.lwjgl.system.MemoryStack;
 import com.llamalad7.mixinextras.injector.wrapmethod.WrapMethod;
 import com.llamalad7.mixinextras.injector.wrapoperation.Operation;
 import org.spongepowered.asm.mixin.Mixin;
@@ -23,38 +20,57 @@ import net.minecraft.client.renderer.RenderType;
 
 @Mixin(LevelRenderer.class)
 abstract class LevelRendererMixin {
-    // Even when DX12 replaces the terrain color, vanilla must still populate OpenGL's
-    // depth buffer: clouds, entities, translucent blocks and later GL passes depend on it.
-    // Cancelling these calls leaves those passes with no terrain occlusion.
+    @org.spongepowered.asm.mixin.Shadow @org.spongepowered.asm.mixin.Final
+    private it.unimi.dsi.fastutil.objects.ObjectArrayList<net.minecraft.client.renderer.chunk.SectionRenderDispatcher.RenderSection> visibleSections;
+
     @WrapMethod(method = "renderSectionLayer")
-    private void direct$preserveVanillaDepth(RenderType renderType, double x, double y, double z,
+    private void direct$replaceTerrain(RenderType renderType, double x, double y, double z,
             Matrix4f frustumMatrix, Matrix4f projectionMatrix, Operation<Void> original) {
-        if (!Dx12GlInterop.shouldSkipVanillaLayer(renderType)) {
-            original.call(renderType, x, y, z, frustumMatrix, projectionMatrix);
+        boolean skip = Dx12GlInterop.shouldSkipVanillaLayer(renderType);
+        if (renderType == RenderType.solid() || renderType == RenderType.cutout() || renderType == RenderType.cutoutMipped())
+            com.redondoguibi.direct.RendererMetrics.layer(skip);
+        if (skip) {
+            // Preserve the public NeoForge render-stage notification when bypassing the vanilla draw.
+            var renderer = (LevelRenderer) (Object) this;
+            var minecraft = net.minecraft.client.Minecraft.getInstance();
+            renderType.setupRenderState();
+            try {
+                net.neoforged.neoforge.client.ClientHooks.dispatchRenderStage(renderType, renderer,
+                        frustumMatrix, projectionMatrix, renderer.getTicks(), minecraft.gameRenderer.getMainCamera(), renderer.getFrustum());
+            } finally {
+                renderType.clearRenderState();
+            }
             return;
         }
-        try (MemoryStack stack = MemoryStack.stackPush()) {
-            ByteBuffer colorMask = stack.malloc(4);
-            GL11.glGetBooleanv(GL11.GL_COLOR_WRITEMASK, colorMask);
-            GL11.glColorMask(false, false, false, false);
-            try {
-                // Keep vanilla's depth test, depth writes and cutout discard intact.
-                original.call(renderType, x, y, z, frustumMatrix, projectionMatrix);
-            } finally {
-                GL11.glColorMask(colorMask.get(0) != 0, colorMask.get(1) != 0,
-                        colorMask.get(2) != 0, colorMask.get(3) != 0);
-            }
-        }
+        original.call(renderType, x, y, z, frustumMatrix, projectionMatrix);
+    }
+
+    @com.llamalad7.mixinextras.injector.wrapoperation.WrapOperation(method = "renderSectionLayer",
+            at = @At(value = "INVOKE", target = "Lcom/mojang/blaze3d/vertex/VertexBuffer;draw()V"))
+    private void direct$countVanillaDraw(com.mojang.blaze3d.vertex.VertexBuffer buffer, Operation<Void> original) {
+        com.redondoguibi.direct.RendererMetrics.vanillaDraw();
+        original.call(buffer);
+    }
+
+    @Inject(method = "renderLevel", at = @At(value = "INVOKE",
+            target = "Lnet/minecraft/client/renderer/LevelRenderer;compileSections(Lnet/minecraft/client/Camera;)V",
+            shift = At.Shift.BEFORE))
+    private void direct$submitTerrain(DeltaTracker deltaTracker, boolean renderBlockOutline, Camera camera,
+            GameRenderer gameRenderer, LightTexture lightTexture, Matrix4f frustumMatrix,
+            Matrix4f projectionMatrix, CallbackInfo callback) {
+        Dx12GlInterop.captureVisibleSections(visibleSections);
+        if (Dx12GlInterop.shouldCompositeBeforeVanilla()) Dx12GlInterop.renderTerrainOverlay();
     }
 
     @Inject(method = "renderLevel", at = @At("HEAD"))
     private void direct$captureMatrices(DeltaTracker deltaTracker, boolean renderBlockOutline, Camera camera,
             GameRenderer gameRenderer, LightTexture lightTexture, Matrix4f frustumMatrix,
             Matrix4f projectionMatrix, CallbackInfo callback) {
+        com.redondoguibi.direct.RendererMetrics.frame();
         Dx12GlInterop.captureLevelMatrices(camera, frustumMatrix, projectionMatrix);
     }
 
-    // Replacement composites Direct before the base layers; vanilla then writes depth without color.
+    // Composite current DX12 color and depth before deciding whether vanilla draws are necessary.
     @Inject(method = "renderLevel",
             at = @At(value = "INVOKE",
                     target = "Lnet/minecraft/client/renderer/LevelRenderer;renderSectionLayer("
@@ -65,7 +81,8 @@ abstract class LevelRendererMixin {
             Camera camera, GameRenderer gameRenderer, LightTexture lightTexture, Matrix4f frustumMatrix,
             Matrix4f projectionMatrix, CallbackInfo callback) {
         if (Dx12GlInterop.shouldCompositeBeforeVanilla()) {
-            Dx12GlInterop.renderTerrainOverlay();
+            Dx12GlInterop.captureVisibleSections(visibleSections);
+            Dx12GlInterop.compositeTerrainFrame();
         }
     }
 

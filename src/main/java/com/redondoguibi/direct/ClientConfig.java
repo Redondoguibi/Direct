@@ -6,7 +6,7 @@ public final class ClientConfig {
     private static final ModConfigSpec.Builder BUILDER = new ModConfigSpec.Builder();
 
     public static final ModConfigSpec.BooleanValue ENABLE_DX12 = BUILDER
-            .comment("Enable the DirectX 12 terrain renderer and registered extension passes.",
+            .comment("Enable DirectX 12 terrain rendering (replacement is experimental).",
                     "If native initialization or OpenGL interop is unavailable, vanilla rendering stays active.")
             .define("enableDx12Preview", false);
 
@@ -39,8 +39,8 @@ public final class ClientConfig {
 
     public static final ModConfigSpec.IntValue ANIMATED_ATLAS_REFRESH_MILLIS = BUILDER
             .comment("Minimum interval between DX12 block-atlas refreshes caused by animated sprites.",
-                    "Each refresh re-reads the whole atlas and re-encodes it when BC7 is enabled, so lower",
-                    "values cost CPU time. Animated blocks (water, lava, fire) update at this rate.")
+                    "Only changed sprite regions are read; BC7 compression runs off the render thread. Lower",
+                    "values increase readback frequency. Animated blocks update at this rate.")
             .defineInRange("animatedAtlasRefreshMillis", 250, 50, 2000);
 
     public static final ModConfigSpec.IntValue BC7_ENCODER_THREADS = BUILDER
@@ -57,9 +57,9 @@ public final class ClientConfig {
             .define("useExecuteIndirect", true);
 
     public static final ModConfigSpec.BooleanValue REPLACE_VANILLA_TERRAIN = BUILDER
-            .comment("Replace vanilla solid/cutout chunk layers with Direct after its terrain capture is stable.",
-                    "Experimental: custom geometry may not be represented, and baked lightmap/normal shading is not yet reproduced.")
-            .define("replaceVanillaTerrain", false);
+            .comment("Replace vanilla solid/cutout terrain with DX12 color AND depth when the current visible set is complete.",
+                    "Experimental until in-game visual and performance validation; false enables the diagnostic overlay.")
+            .define("replaceVanillaTerrain", true);
 
     public static final ModConfigSpec.IntValue UPLOAD_RING_BUFFER_MIB = BUILDER
             .comment("Persistent per-frame D3D12 upload-ring capacity shared by terrain section updates.")
@@ -76,6 +76,10 @@ public final class ClientConfig {
     public static final ModConfigSpec.IntValue MAX_PENDING_MESH_MIB = BUILDER
             .comment("Soft backpressure limit for compiled terrain meshes waiting for GPU upload.")
             .defineInRange("maxPendingMeshMiB", 128, 64, 2048);
+
+    public static final ModConfigSpec.BooleanValue PROFILE_RENDERER = BUILDER
+            .comment("Log optional CPU/GPU renderer costs and draw counts every 60 seconds; no FPS recording.")
+            .define("profileRenderer", false);
 
     public static final ModConfigSpec SPEC = BUILDER.build();
 

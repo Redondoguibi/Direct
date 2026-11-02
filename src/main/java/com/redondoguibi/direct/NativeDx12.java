@@ -13,13 +13,31 @@ final class NativeDx12 {
     static native long[] initializeInterop(int width, int height, boolean parallelSectionRecording,
             int uploadRingBufferMiB, int terrainArenaPageMiB, int maxTerrainArenaMiB);
 
-    static native long resizeInterop(int width, int height);
+    static native long[] resizeInterop(int width, int height);
 
     static native void configureRenderPasses(String[] pixelShaderSources);
 
     static native int renderInterop(float[] viewProjection, double cameraX, double cameraY, double cameraZ,
             float renderDistance, long frameIndex, float elapsedSeconds, float[] passUniforms,
             boolean useGpuSynchronization, boolean useExecuteIndirect);
+
+    static native void setProfilingEnabled(boolean enabled);
+
+    static native double[] frameMetrics();
+
+    static native boolean isAtlasCompressed();
+
+    static native int atlasMipLevels();
+
+    static native void encodeAtlasRegion(ByteBuffer input, ByteBuffer output, int width, int height, int threads);
+
+    static native boolean updateAtlasRegion(ByteBuffer pixels, int level, int x, int y, int width, int height);
+
+    static native void updateLightmap(ByteBuffer pixels);
+
+    static native void setVisibleSections(long[] keys, int count, boolean exactCoverage);
+
+    static native boolean waitInteropFrame(long value);
 
     static native String interopAdapterName();
 

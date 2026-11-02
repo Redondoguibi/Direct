@@ -16,9 +16,17 @@ final class TerrainBufferPacker {
 
     static void packVertices(ByteBuffer destination, ByteBuffer source, int vertexCount, int stride,
             int positionOffset, int colorOffset, int uvOffset) {
+        packVertices(destination, source, vertexCount, stride, positionOffset, colorOffset, uvOffset, -1);
+    }
+
+    static void packVertices(ByteBuffer destination, ByteBuffer source, int vertexCount, int stride,
+            int positionOffset, int colorOffset, int uvOffset, int lightOffset) {
         long sourceBytes = (long) vertexCount * stride;
         long destinationBytes = (long) vertexCount * OUTPUT_VERTEX_SIZE;
         if (vertexCount < 0 || stride <= 0 || positionOffset < 0 || colorOffset < 0 || uvOffset < 0
+                || (long) positionOffset + 12 > stride || (long) colorOffset + 4 > stride
+                || (long) uvOffset + 8 > stride || lightOffset < -1
+                || (lightOffset >= 0 && (long) lightOffset + 4 > stride)
                 || sourceBytes > source.remaining() || destinationBytes > destination.remaining()) {
             throw new IllegalArgumentException("Terrain vertex pack would exceed a buffer's remaining range.");
         }
@@ -30,7 +38,9 @@ final class TerrainBufferPacker {
             destination.putShort(packPosition(sourceVertices.getFloat(offset + positionOffset)));
             destination.putShort(packPosition(sourceVertices.getFloat(offset + positionOffset + Float.BYTES)));
             destination.putShort(packPosition(sourceVertices.getFloat(offset + positionOffset + 2 * Float.BYTES)));
-            destination.putShort((short) 0);
+            int lightU = lightOffset < 0 ? 0 : Math.clamp(sourceVertices.getShort(offset + lightOffset), 0, 255);
+            int lightV = lightOffset < 0 ? 0 : Math.clamp(sourceVertices.getShort(offset + lightOffset + 2), 0, 255);
+            destination.putShort((short) (lightU | lightV << 8));
             destination.putInt(sourceVertices.getInt(offset + colorOffset));
             destination.putShort(packUnorm16(sourceVertices.getFloat(offset + uvOffset)));
             destination.putShort(packUnorm16(sourceVertices.getFloat(offset + uvOffset + Float.BYTES)));
