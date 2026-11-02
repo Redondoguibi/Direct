@@ -10,7 +10,7 @@ import java.util.List;
  */
 public interface DirectRenderService {
     /** Current public API semantic version. */
-    String API_VERSION = "1.0.0";
+    String API_VERSION = "1.1.0";
 
     /**
      * Returns the active service. The service is available on the client after client setup.
@@ -57,4 +57,15 @@ public interface DirectRenderService {
      * @return passes ordered for execution
      */
     List<DirectRenderPass> passes();
+
+    /**
+     * Returns the last rejected configuration error for a pass, or an empty string.
+     * Registration is asynchronous; a failed replacement retains the previous working chain.
+     *
+     * @param id registered pass id
+     * @return rejection message, empty when no rejection is recorded
+     */
+    default String passFailure(String id) {
+        return "";
+    }
 }

@@ -158,6 +158,8 @@ struct FrameSlot {
     ID3D12CommandAllocator* finish;
     ID3D12Resource* uploadBuffer;
     uint8_t* uploadMapped;
+    ID3D12Resource* passConstants;
+    uint8_t* passConstantsMapped;
     UINT64 uploadCapacity;
     UINT64 uploadOffset;
     UINT64 opaqueIndirectOffset;
@@ -893,6 +895,11 @@ void destroyInteropRenderer(InteropRenderer* renderer) {
             slot.uploadMapped = nullptr;
         }
         release(slot.uploadBuffer);
+        if (slot.passConstants != nullptr && slot.passConstantsMapped != nullptr) {
+            slot.passConstants->Unmap(0, nullptr);
+            slot.passConstantsMapped = nullptr;
+        }
+        release(slot.passConstants);
         release(slot.extension);
         release(slot.finish);
         release(slot.cutout);
@@ -1119,9 +1126,9 @@ bool createExtensionRootSignature(InteropRenderer* renderer) {
     inputRange.BaseShaderRegister = 0;
     inputRange.OffsetInDescriptorsFromTableStart = 0;
     D3D12_ROOT_PARAMETER parameters[2] = {};
-    parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-    parameters[0].Constants.ShaderRegister = 0;
-    parameters[0].Constants.Num32BitValues = kPassConstantCount;
+    // A 64-float root constant block plus the SRV table exceeds the 64-DWORD root limit.
+    parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+    parameters[0].Descriptor.ShaderRegister = 0;
     parameters[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
     parameters[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
     parameters[1].DescriptorTable.NumDescriptorRanges = 1;
@@ -1227,19 +1234,18 @@ bool configureExtensionPasses(InteropRenderer* renderer, const std::vector<std::
         throwJava(env, "Direct supports at most eight extension render passes.");
         return false;
     }
-    releaseExtensionResources(renderer);
-    for (ExtensionPass& pass : renderer->extensionPasses) {
-        release(pass.pipeline);
-    }
-    renderer->extensionPasses.clear();
-    release(renderer->extensionRootSignature);
     if (sources.empty()) {
+        releaseExtensionResources(renderer);
+        for (ExtensionPass& pass : renderer->extensionPasses) release(pass.pipeline);
+        renderer->extensionPasses.clear();
         return true;
     }
-    if (!createExtensionRootSignature(renderer)) {
+    if (renderer->extensionRootSignature == nullptr && !createExtensionRootSignature(renderer)) {
         throwJava(env, "Direct extension pass root signature creation failed.");
         return false;
     }
+    // Keep the working chain alive until every replacement pipeline has compiled.
+    std::vector<ExtensionPass> candidates;
     ID3DBlob* vertex = nullptr;
     ID3DBlob* errors = nullptr;
     const HRESULT vertexResult = D3DCompile(kExtensionVertexShader, sizeof(kExtensionVertexShader) - 1,
@@ -1290,7 +1296,15 @@ bool configureExtensionPasses(InteropRenderer* renderer, const std::vector<std::
         release(errors);
         if (FAILED(compileResult)) {
             release(vertex);
-            throwJava(env, "Direct extension pass pixel shader compilation failed; inspect the native debug output.");
+            release(pixel);
+            for (ExtensionPass& pass : candidates) release(pass.pipeline);
+            jclass errorType = env->FindClass("java/lang/IllegalArgumentException");
+            if (errorType != nullptr) {
+                const std::string message = "Direct extension pass " + std::to_string(candidates.size())
+                        + " pixel shader compilation failed; inspect the native debug output.";
+                env->ThrowNew(errorType, message.c_str());
+                env->DeleteLocalRef(errorType);
+            }
             return false;
         }
         description.PS = {pixel->GetBufferPointer(), pixel->GetBufferSize()};
@@ -1301,12 +1315,16 @@ bool configureExtensionPasses(InteropRenderer* renderer, const std::vector<std::
         release(pixel);
         if (FAILED(pipelineResult)) {
             release(vertex);
+            for (ExtensionPass& pass : candidates) release(pass.pipeline);
             throwJava(env, "Direct extension pass pipeline state creation failed.");
             return false;
         }
-        renderer->extensionPasses.push_back({source, pipeline});
+        candidates.push_back({source, pipeline});
     }
     release(vertex);
+    releaseExtensionResources(renderer);
+    for (ExtensionPass& pass : renderer->extensionPasses) release(pass.pipeline);
+    renderer->extensionPasses = std::move(candidates);
     return createExtensionResources(renderer, env);
 }
 
@@ -1387,6 +1405,17 @@ bool createUploadRingBuffers(InteropRenderer* renderer, UINT64 capacity, JNIEnv*
         slot.uploadMapped = static_cast<uint8_t*>(mapped);
         slot.uploadCapacity = capacity;
         slot.uploadOffset = 0;
+        if (!createBuffer(renderer, D3D12_HEAP_TYPE_UPLOAD, kMaxExtensionPasses * 256,
+                D3D12_RESOURCE_STATE_GENERIC_READ, &slot.passConstants)) {
+            throwJava(env, "Direct could not allocate extension constant buffers.");
+            return false;
+        }
+        mapped = nullptr;
+        if (FAILED(slot.passConstants->Map(0, &noRead, &mapped))) {
+            throwJava(env, "Direct could not map extension constant buffers.");
+            return false;
+        }
+        slot.passConstantsMapped = static_cast<uint8_t*>(mapped);
     }
     return true;
 }
@@ -1825,7 +1854,9 @@ bool recordExtensionPasses(InteropRenderer* renderer, FrameSlot& slot, UINT64 fr
         constants[3] = static_cast<float>(frameIndex);
         std::memcpy(constants + 4, uniforms + index * kPassUniformFloatCount,
                 kPassUniformFloatCount * sizeof(float));
-        list->SetGraphicsRoot32BitConstants(0, kPassConstantCount, constants, 0);
+        const UINT64 constantOffset = static_cast<UINT64>(index) * 256;
+        std::memcpy(slot.passConstantsMapped + constantOffset, constants, sizeof(constants));
+        list->SetGraphicsRootConstantBufferView(0, slot.passConstants->GetGPUVirtualAddress() + constantOffset);
         list->DrawInstanced(3, 1, 0, 0);
         const D3D12_RESOURCE_BARRIER toShaderResource = transition(output,
                 D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);

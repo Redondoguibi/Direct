@@ -52,6 +52,23 @@ class TerrainMeshStoreTest {
                 () -> TerrainIndexPacker.packSequentialQuadIndices(destination, 5, 0));
     }
 
+    @Test
+    void productionCapturePreservesBlockAndSkyLight() {
+        var format = com.mojang.blaze3d.vertex.DefaultVertexFormat.BLOCK;
+        ByteBuffer source = ByteBuffer.allocateDirect(format.getVertexSize()).order(ByteOrder.nativeOrder());
+        int light = format.getOffset(com.mojang.blaze3d.vertex.VertexFormatElement.UV2);
+        source.putShort(light, (short) 232).putShort(light + 2, (short) 120);
+        var state = new com.mojang.blaze3d.vertex.MeshData.DrawState(format, 1, 0,
+                com.mojang.blaze3d.vertex.VertexFormat.Mode.QUADS,
+                com.mojang.blaze3d.vertex.VertexFormat.IndexType.SHORT);
+        ByteBuffer packed = ByteBuffer.allocateDirect(16).order(ByteOrder.nativeOrder());
+
+        TerrainMeshStore.packVertices(packed, source, state);
+
+        org.junit.jupiter.api.Assertions.assertEquals(232 | 120 << 8,
+                Short.toUnsignedInt(packed.getShort(6)));
+    }
+
     private static void assertEqualsIndices(ByteBuffer destination, int[] expected) {
         destination.flip();
         int[] actual = new int[expected.length];

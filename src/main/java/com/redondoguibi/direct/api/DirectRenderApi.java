@@ -30,6 +30,7 @@ public final class DirectRenderApi implements DirectRenderService {
     private static final Pattern PASS_ID = Pattern.compile("[a-z0-9_.-]{1,96}");
     private static final DirectRenderApi INSTANCE = new DirectRenderApi();
     private final ConcurrentHashMap<String, DirectRenderPass> passes = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, String> failures = new ConcurrentHashMap<>();
     private final AtomicBoolean dirty = new AtomicBoolean(true);
     private volatile PassSnapshot passSnapshot = new PassSnapshot(0L, List.of());
     private volatile DirectRenderCapabilities capabilities = DirectRenderCapabilities.unavailable();
@@ -198,6 +199,7 @@ public final class DirectRenderApi implements DirectRenderService {
             passes.remove(id, pass);
             throw new IllegalArgumentException("Direct supports at most " + MAX_PASSES + " extension passes.");
         }
+        failures.remove(id);
         refreshOrderedPasses();
         dirty.set(true);
     }
@@ -205,6 +207,7 @@ public final class DirectRenderApi implements DirectRenderService {
     @Override
     public synchronized boolean unregisterPass(String id) {
         Objects.requireNonNull(id, "id");
+        failures.remove(id);
         boolean removed = passes.remove(id) != null;
         if (removed) {
             refreshOrderedPasses();
@@ -216,6 +219,26 @@ public final class DirectRenderApi implements DirectRenderService {
     @Override
     public List<DirectRenderPass> passes() {
         return passSnapshot.passes();
+    }
+
+    @Override
+    public String passFailure(String id) {
+        return failures.getOrDefault(id, "");
+    }
+
+    /** Records the asynchronous result without overwriting newer registrations.
+     * @param snapshot attempted pass configuration
+     * @param error empty on success, rejection message otherwise
+     */
+    public static void reportConfiguration(PassSnapshot snapshot, String error) {
+        synchronized (INSTANCE) {
+            for (DirectRenderPass pass : snapshot.passes()) {
+                if (INSTANCE.passes.get(pass.id()) == pass) {
+                    if (error.isEmpty()) INSTANCE.failures.remove(pass.id());
+                    else INSTANCE.failures.put(pass.id(), error);
+                }
+            }
+        }
     }
 
     private void refreshOrderedPasses() {

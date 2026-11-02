@@ -111,6 +111,7 @@ public final class Dx12GlInterop {
     private static boolean wglInteropAvailable;
     private static float[] passUniformScratch = new float[0];
     private static long configuredPassRevision = -1L;
+    private static List<DirectRenderPass> configuredPasses = List.of();
     private static volatile boolean blockAtlasDirty = true;
     private static boolean terrainCaptureEnabled;
     private static boolean gpuSemaphoreInterop;
@@ -356,9 +357,18 @@ public final class Dx12GlInterop {
                         sources[index] = passes.get(index).pixelShaderSource();
                     }
                 }
-                NativeDx12.configureRenderPasses(sources);
+                try {
+                    NativeDx12.configureRenderPasses(sources);
+                    configuredPasses = passes;
+                    DirectRenderApi.reportConfiguration(passSnapshot, "");
+                } catch (IllegalArgumentException exception) {
+                    // A shader error leaves native pipelines intact. Retry only after a registration change.
+                    Direct.LOGGER.error("Rejected extension shader configuration; retaining working passes.", exception);
+                    DirectRenderApi.reportConfiguration(passSnapshot, exception.getMessage());
+                }
                 configuredPassRevision = passSnapshot.revision();
             }
+            passes = configuredPasses;
             int uniformCount = passes.size() * DirectRenderApi.MAX_UNIFORM_FLOATS;
             if (passUniformScratch.length != uniformCount) {
                 passUniformScratch = new float[uniformCount];
@@ -414,6 +424,7 @@ public final class Dx12GlInterop {
 
     public static void shutdown() {
         configuredPassRevision = -1L;
+        configuredPasses = List.of();
         lastFrameSucceeded = false;
         if (glDoneSemaphore != 0 || interopObject != 0) {
             GL11.glFinish();

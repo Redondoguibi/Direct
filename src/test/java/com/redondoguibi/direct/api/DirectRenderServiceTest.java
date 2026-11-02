@@ -27,6 +27,19 @@ class DirectRenderServiceTest {
     }
 
     @Test
+    void reportsRejectedConfigurationAndClearsItOnReload() {
+        DirectRenderPass original = pass("example.error", 0);
+        service.registerPass(original);
+        var attempted = DirectRenderApi.snapshotState();
+        DirectRenderApi.reportConfiguration(attempted, "invalid HLSL");
+        assertEquals("invalid HLSL", service.passFailure(original.id()));
+        service.registerPass(pass("example.error", 0));
+        assertEquals("", service.passFailure(original.id()));
+        DirectRenderApi.reportConfiguration(attempted, "stale error");
+        assertEquals("", service.passFailure(original.id()));
+    }
+
+    @Test
     void ordersPassesAndRemovesThem() {
         service.registerPass(pass("example.late", 10));
         service.registerPass(pass("example.first", -2));

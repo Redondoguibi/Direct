@@ -69,7 +69,7 @@ final class TintPass implements DirectRenderPass {
 }
 ```
 
-Uniform values are packed float scalars representing up to 15 `float4` vectors and are zero-filled when fewer than 60 floats are returned. The frame constant `DirectFrameData` is `(elapsedSeconds, width, height, frameIndex)`. The shader entry point must be `main` and return `float4` with `SV_Target0`. HLSL compiles on the native D3D12 device; compilation errors are logged and cause a clean fallback to vanilla rather than exposing the device to the extension.
+Uniform values are packed float scalars representing up to 15 `float4` vectors and are zero-filled when fewer than 60 floats are returned. The frame constant `DirectFrameData` is `(elapsedSeconds, width, height, frameIndex)`. The shader entry point must be `main` and return `float4` with `SV_Target0`. HLSL compiles on the native D3D12 device; shader compilation errors are logged and reject the new configuration while retaining the previous working chain. A rejected configuration is not compiled again until the registrations change. API 1.1 adds `service.passFailure(id)` to query the asynchronous rejection message (empty when no failure is recorded); re-register a corrected pass to retry. Device/resource failures still fall back to vanilla.
 
 Pass ids must match `[a-z0-9_.-]{1,96}` and be unique. At most eight passes may be registered. A repeated id replaces the previous registration. Pass order is ascending integer order, with lexicographic id as the tie-breaker. Call `unregisterPass(id)` when the extension unloads or disables a pass. Updates are thread-safe and native pipelines are rebuilt on the render thread before the next dispatched frame.
 

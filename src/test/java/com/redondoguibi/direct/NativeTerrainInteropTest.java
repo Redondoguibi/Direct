@@ -168,6 +168,25 @@ class NativeTerrainInteropTest {
             assertTrue(WGLNVDXInterop.wglDXUnlockObjectsNV(device, objects));
             GL11.glFinish(); NativeDx12.signalInteropFence(6);
 
+            // A rejected replacement must preserve the previous working native chain.
+            String green = "cbuffer C : register(b0) { float4 header; float4 tint; }; "
+                    + "float4 main(float4 p : SV_Position) : SV_Target0 { return tint; }";
+            NativeDx12.configureRenderPasses(new String[] {green});
+            assertThrows(IllegalArgumentException.class,
+                    () -> NativeDx12.configureRenderPasses(new String[] {green, "invalid HLSL"}));
+            float[] tint = new float[60];
+            tint[1] = 1; tint[3] = 1;
+            NativeDx12.renderInterop(constants, 0, 0, 0, 256, 6, 0, tint, false, true);
+            NativeDx12.waitInteropFrame(7);
+            assertTrue(WGLNVDXInterop.wglDXLockObjectsNV(device, objects));
+            GL11.glBindTexture(GL11.GL_TEXTURE_2D, color);
+            GL11.glGetTexImage(GL11.GL_TEXTURE_2D, 0, GL11.GL_RGBA, GL11.GL_UNSIGNED_BYTE, colors);
+            assertEquals(0, Byte.toUnsignedInt(colors.get(center)));
+            assertEquals(255, Byte.toUnsignedInt(colors.get(center + 1)), "working HLSL must survive rejection");
+            assertTrue(WGLNVDXInterop.wglDXUnlockObjectsNV(device, objects));
+            GL11.glFinish(); NativeDx12.signalInteropFence(7);
+            NativeDx12.configureRenderPasses(new String[0]);
+
             // Resize requires unregistering BOTH resources; an empty world exports clear depth.
             assertTrue(WGLNVDXInterop.wglDXUnregisterObjectNV(device, colorObject)); colorObject = 0;
             assertTrue(WGLNVDXInterop.wglDXUnregisterObjectNV(device, depthObject)); depthObject = 0;
@@ -176,8 +195,8 @@ class NativeTerrainInteropTest {
             int resizedDepth = GL11.glGenTextures();
             depthObject = register(device, resized[1], resizedDepth);
             NativeDx12.clearTerrain();
-            NativeDx12.renderInterop(constants, 0, 0, 0, 256, 6, 0, new float[0], false, true);
-            NativeDx12.waitInteropFrame(7);
+            NativeDx12.renderInterop(constants, 0, 0, 0, 256, 7, 0, new float[0], false, true);
+            NativeDx12.waitInteropFrame(8);
             var resizedObjects = stack.pointers(colorObject, depthObject);
             assertTrue(WGLNVDXInterop.wglDXLockObjectsNV(device, resizedObjects));
             GL11.glBindTexture(GL11.GL_TEXTURE_2D, resizedDepth);
@@ -185,7 +204,7 @@ class NativeTerrainInteropTest {
             GL11.glGetTexImage(GL11.GL_TEXTURE_2D, 0, GL11.GL_RED, GL11.GL_FLOAT, cleared);
             assertEquals(1f, cleared.get(8 * 16 + 8), 1e-5);
             assertTrue(WGLNVDXInterop.wglDXUnlockObjectsNV(device, resizedObjects));
-            GL11.glFinish(); NativeDx12.signalInteropFence(7);
+            GL11.glFinish(); NativeDx12.signalInteropFence(8);
             assertFalse(NativeDx12.hasInteropGpuSyncFault());
             assertEquals(GL11.GL_NO_ERROR, GL11.glGetError());
         } finally {

@@ -332,11 +332,11 @@ public final class TerrainMeshStore {
                 && validIndices;
     }
 
-    private static void packVertices(ByteBuffer destination, ByteBuffer source, MeshData.DrawState drawState) {
+    static void packVertices(ByteBuffer destination, ByteBuffer source, MeshData.DrawState drawState) {
         VertexFormat format = drawState.format();
         TerrainBufferPacker.packVertices(destination, source, drawState.vertexCount(), format.getVertexSize(),
                 format.getOffset(VertexFormatElement.POSITION), format.getOffset(VertexFormatElement.COLOR),
-                format.getOffset(VertexFormatElement.UV0));
+                format.getOffset(VertexFormatElement.UV0), format.getOffset(VertexFormatElement.UV2));
     }
 
     private static void packIndices(ByteBuffer destination, ByteBuffer source, MeshData.DrawState drawState,
