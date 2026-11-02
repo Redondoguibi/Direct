@@ -178,6 +178,8 @@ struct InteropRenderer {
     ID3D12Device* device;
     ID3D12CommandQueue* queue;
     ID3D12Fence* fence;
+    ID3D12Fence* cpuCopyFence;
+    UINT64 cpuCopyFenceValue;
     ID3D12Fence* glDoneFence;
     HANDLE fenceEvent;
     HANDLE watchdogEvent;
@@ -860,6 +862,7 @@ void destroyInteropRenderer(InteropRenderer* renderer) {
     closeHandle(renderer->sharedGlDoneFenceHandle);
     closeHandle(renderer->sharedFenceHandle);
     release(renderer->glDoneFence);
+    release(renderer->cpuCopyFence);
     release(renderer->fence);
     release(renderer->queue);
     release(renderer->device);
@@ -1388,7 +1391,9 @@ bool initializeInteropRenderer(InteropRenderer* renderer, jint width, jint heigh
     }
     bool sharedFenceAvailable = false;
     bool sharedGlDoneFenceAvailable = false;
-    if (!createFenceWithOptionalSharedHandle(renderer->device, &renderer->fence,
+    if (FAILED(renderer->device->CreateFence(0, D3D12_FENCE_FLAG_NONE,
+                IID_PPV_ARGS(&renderer->cpuCopyFence)))
+            || !createFenceWithOptionalSharedHandle(renderer->device, &renderer->fence,
                 &renderer->sharedFenceHandle, &sharedFenceAvailable)
             || !createFenceWithOptionalSharedHandle(renderer->device, &renderer->glDoneFence,
                 &renderer->sharedGlDoneFenceHandle, &sharedGlDoneFenceAvailable)) {
@@ -1704,11 +1709,12 @@ bool submitUploads(InteropRenderer* renderer) {
     return true;
 }
 
-void copyToInteropTexture(InteropRenderer* renderer) {
+bool copyToInteropTexture(InteropRenderer* renderer) {
     renderer->d3d11On12->AcquireWrappedResources(&renderer->wrappedColor, 1);
     renderer->d3d11Context->CopyResource(renderer->interopTexture, renderer->wrappedColor);
     renderer->d3d11On12->ReleaseWrappedResources(&renderer->wrappedColor, 1);
     renderer->d3d11Context->Flush();
+    return SUCCEEDED(renderer->d3d11Device->GetDeviceRemovedReason());
 }
 
 bool recordExtensionPasses(InteropRenderer* renderer, FrameSlot& slot, UINT64 frameIndex,
@@ -1840,7 +1846,22 @@ bool renderInteropFrame(InteropRenderer* renderer, const float* viewProjection,
         ID3D12CommandList* extensionLists[] = {renderer->extensionList};
         renderer->queue->ExecuteCommandLists(1, extensionLists);
     }
-    copyToInteropTexture(renderer);
+    if (!gpu) {
+        if (renderer->cpuCopyFenceValue >= kFenceError - 1) {
+            throwJava(env, "DX12 CPU-copy fence timeline has exhausted its values.");
+            return false;
+        }
+        const UINT64 copyReadyValue = ++renderer->cpuCopyFenceValue;
+        if (FAILED(renderer->queue->Signal(renderer->cpuCopyFence, copyReadyValue))
+                || !waitFence(renderer, renderer->cpuCopyFence, copyReadyValue)) {
+            throwJava(env, "DX12 CPU fallback could not wait for terrain rendering before the D3D11On12 copy.");
+            return false;
+        }
+    }
+    if (!copyToInteropTexture(renderer)) {
+        throwJava(env, "D3D11On12 reported device removal while copying the completed terrain image.");
+        return false;
+    }
 
     HRESULT signalResult;
     {
