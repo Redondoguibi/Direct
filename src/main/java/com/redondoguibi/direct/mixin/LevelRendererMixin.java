@@ -1,6 +1,12 @@
 package com.redondoguibi.direct.mixin;
 
 import org.joml.Matrix4f;
+import java.nio.ByteBuffer;
+
+import org.lwjgl.opengl.GL11;
+import org.lwjgl.system.MemoryStack;
+import com.llamalad7.mixinextras.injector.wrapmethod.WrapMethod;
+import com.llamalad7.mixinextras.injector.wrapoperation.Operation;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
@@ -17,11 +23,27 @@ import net.minecraft.client.renderer.RenderType;
 
 @Mixin(LevelRenderer.class)
 abstract class LevelRendererMixin {
-    @Inject(method = "renderSectionLayer", at = @At("HEAD"), cancellable = true)
-    private void direct$replaceVanillaBaseLayers(RenderType renderType, double x, double y, double z,
-            Matrix4f frustumMatrix, Matrix4f projectionMatrix, CallbackInfo callback) {
-        if (Dx12GlInterop.shouldSkipVanillaLayer(renderType)) {
-            callback.cancel();
+    // Even when DX12 replaces the terrain color, vanilla must still populate OpenGL's
+    // depth buffer: clouds, entities, translucent blocks and later GL passes depend on it.
+    // Cancelling these calls leaves those passes with no terrain occlusion.
+    @WrapMethod(method = "renderSectionLayer")
+    private void direct$preserveVanillaDepth(RenderType renderType, double x, double y, double z,
+            Matrix4f frustumMatrix, Matrix4f projectionMatrix, Operation<Void> original) {
+        if (!Dx12GlInterop.shouldSkipVanillaLayer(renderType)) {
+            original.call(renderType, x, y, z, frustumMatrix, projectionMatrix);
+            return;
+        }
+        try (MemoryStack stack = MemoryStack.stackPush()) {
+            ByteBuffer colorMask = stack.malloc(4);
+            GL11.glGetBooleanv(GL11.GL_COLOR_WRITEMASK, colorMask);
+            GL11.glColorMask(false, false, false, false);
+            try {
+                // Keep vanilla's depth test, depth writes and cutout discard intact.
+                original.call(renderType, x, y, z, frustumMatrix, projectionMatrix);
+            } finally {
+                GL11.glColorMask(colorMask.get(0) != 0, colorMask.get(1) != 0,
+                        colorMask.get(2) != 0, colorMask.get(3) != 0);
+            }
         }
     }
 
@@ -32,7 +54,7 @@ abstract class LevelRendererMixin {
         Dx12GlInterop.captureLevelMatrices(camera, frustumMatrix, projectionMatrix);
     }
 
-    // Replacement mode must draw Direct before vanilla's first base layer, so those layers can be skipped.
+    // Replacement composites Direct before the base layers; vanilla then writes depth without color.
     @Inject(method = "renderLevel",
             at = @At(value = "INVOKE",
                     target = "Lnet/minecraft/client/renderer/LevelRenderer;renderSectionLayer("
