@@ -103,6 +103,8 @@ public final class Dx12GlInterop {
     private static long pendingReadyValue;
     private static long pendingFrameIndex;
     private static boolean pendingFrameUsesGpuSemaphore;
+    private static boolean blockAtlasAnimationDirty;
+    private static long lastAnimatedAtlasUploadNanos;
     private static int blockAtlasId = -1;
 
     private Dx12GlInterop() {
@@ -346,10 +348,18 @@ public final class Dx12GlInterop {
         pendingFrameUsesGpuSemaphore = false;
         startedAtNanos = 0;
         blockAtlasId = -1;
+        blockAtlasAnimationDirty = false;
+        lastAnimatedAtlasUploadNanos = 0L;
     }
 
     public static void blockAtlasUpdated() {
         blockAtlasDirty = true;
+        blockAtlasAnimationDirty = false;
+    }
+
+    /** Animated sprites advanced; the atlas is re-read at most once per animation interval. */
+    public static void blockAtlasAnimationUpdated() {
+        blockAtlasAnimationDirty = true;
     }
 
     private static void resolvePendingFrame() {
@@ -513,7 +523,15 @@ public final class Dx12GlInterop {
             blockAtlasDirty = true;
         }
         if (!blockAtlasDirty) {
-            return;
+            if (!blockAtlasAnimationDirty) {
+                return;
+            }
+            long now = System.nanoTime();
+            long intervalNanos = ClientConfig.ANIMATED_ATLAS_REFRESH_MILLIS.get() * 1_000_000L;
+            if (now - lastAnimatedAtlasUploadNanos < intervalNanos) {
+                return;
+            }
+            lastAnimatedAtlasUploadNanos = now;
         }
         int previousActiveTexture = GL11.glGetInteger(GL13.GL_ACTIVE_TEXTURE);
         GL13.glActiveTexture(GL13.GL_TEXTURE0);
@@ -549,6 +567,7 @@ public final class Dx12GlInterop {
             NativeDx12.updateTerrainAtlas(levels.toArray(ByteBuffer[]::new), baseWidth, baseHeight,
                     ClientConfig.COMPRESS_BLOCK_ATLAS.get(), ClientConfig.BC7_ENCODER_THREADS.get());
             blockAtlasDirty = false;
+            blockAtlasAnimationDirty = false;
         } finally {
             GL11.glPixelStorei(GL11.GL_PACK_ALIGNMENT, previousPackAlignment);
             GL15.glBindBuffer(GL30.GL_PIXEL_PACK_BUFFER, previousPackBuffer);

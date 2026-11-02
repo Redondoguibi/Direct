@@ -9,7 +9,8 @@ package com.redondoguibi.direct.api;
  * @param nativeTerrain whether the terrain path uses native D3D12
  * @param shaderPasses whether extension HLSL passes can be dispatched
  * @param bindlessDescriptors whether the selected adapter supports the required descriptor tier
- * @param renderPasses whether native D3D12 render-pass commands are available
+ * @param renderPasses whether native D3D12 render-pass commands are used; always {@code false} because
+ *        Direct binds targets explicitly (a render pass cannot span its separate command lists)
  * @param pipelineLibrary whether the D3D12 pipeline library is available
  * @param gpuInteropSemaphores whether GPU-side OpenGL/D3D12 semaphores are active
  * @param wglInterop whether {@code WGL_NV_DX_interop2} is available

@@ -37,6 +37,12 @@ public final class ClientConfig {
                     "Disable to force the CPU synchronization fallback.")
             .define("useGpuSemaphoreSync", true);
 
+    public static final ModConfigSpec.IntValue ANIMATED_ATLAS_REFRESH_MILLIS = BUILDER
+            .comment("Minimum interval between DX12 block-atlas refreshes caused by animated sprites.",
+                    "Each refresh re-reads the whole atlas and re-encodes it when BC7 is enabled, so lower",
+                    "values cost CPU time. Animated blocks (water, lava, fire) update at this rate.")
+            .defineInRange("animatedAtlasRefreshMillis", 250, 50, 2000);
+
     public static final ModConfigSpec.IntValue BC7_ENCODER_THREADS = BUILDER
             .comment("Maximum CPU threads used by the BC7 block-atlas encoder.",
                     "Lower values leave more CPU time for Minecraft; applied on resource reload.")

@@ -31,7 +31,7 @@ abstract class TextureAtlasMixin {
     private void direct$markAnimatedAtlasDirty(CallbackInfo callback) {
         TextureAtlas atlas = (TextureAtlas) (Object) this;
         if (!animatedTextures.isEmpty() && atlas.location().equals(InventoryMenu.BLOCK_ATLAS)) {
-            Dx12GlInterop.blockAtlasUpdated();
+            Dx12GlInterop.blockAtlasAnimationUpdated();
         }
     }
 }

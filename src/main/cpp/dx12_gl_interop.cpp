@@ -225,8 +225,6 @@ struct InteropRenderer {
     ID3D12GraphicsCommandList* opaqueList;
     ID3D12GraphicsCommandList* cutoutList;
     ID3D12GraphicsCommandList* extensionList;
-    ID3D12GraphicsCommandList4* opaquePassList;
-    ID3D12GraphicsCommandList4* cutoutPassList;
     bool uploadOpen;
     // Render/JNI-thread-owned upload bookkeeping. RecordWorker only records command lists
     // from the immutable visible-section snapshot and must never mutate these containers.
@@ -253,7 +251,7 @@ struct InteropRenderer {
 };
 
 bool recordTerrainList(InteropRenderer* renderer, ID3D12CommandAllocator* allocator,
-        ID3D12GraphicsCommandList* list, ID3D12GraphicsCommandList4* passList, PassRole role);
+        ID3D12GraphicsCommandList* list, PassRole role);
 
 InteropRenderer* g_interopRenderer;
 
@@ -320,11 +318,8 @@ void inspectAdapter(InteropRenderer* renderer) {
             &options, sizeof(options))) && options.ResourceBindingTier >= D3D12_RESOURCE_BINDING_TIER_2) {
         renderer->featureFlags |= 2u;
     }
-    ID3D12GraphicsCommandList4* commandList4 = nullptr;
-    if (SUCCEEDED(renderer->opaqueList->QueryInterface(IID_PPV_ARGS(&commandList4)))) {
-        renderer->featureFlags |= 4u;
-        commandList4->Release();
-    }
+    // Render passes are not used: opaque and cutout are recorded into separate command lists for
+    // parallel recording, and a render pass may not span command lists.
 }
 
 // Creates a usable timeline fence. Exporting a Win32 handle is optional: if it fails,
@@ -442,7 +437,7 @@ void recordWorkerLoop(InteropRenderer* renderer) {
         FrameSlot* slot = worker->slot;
         lock.unlock();
         const bool result = recordTerrainList(renderer, slot->cutout, renderer->cutoutList,
-                renderer->cutoutPassList, PassRole::Cutout);
+                PassRole::Cutout);
         lock.lock();
         worker->result = result;
         worker->pending = false;
@@ -676,8 +671,10 @@ void deleteSection(TerrainSection* section) {
 
 void retireSection(InteropRenderer* renderer, TerrainSection* section) {
     if (section->page != nullptr && section->allocationSize != 0) {
+        // A fence value of 0 would be reclaimed by the next releaseCompleted() while the GPU may
+        // still be reading this range. Tie the range to the last submitted frame instead.
         renderer->pendingRetireAllocations.push_back(
-                {0, section->page, section->allocationOffset, section->allocationSize});
+                {renderer->lastSignaledValue, section->page, section->allocationOffset, section->allocationSize});
     }
     section->page = nullptr;
     delete section;
@@ -760,6 +757,11 @@ bool createSizeResources(InteropRenderer* renderer, JNIEnv* env) {
             renderer->rtvHeap->GetCPUDescriptorHandleForHeapStart());
     renderer->device->CreateDepthStencilView(renderer->depthTarget, nullptr,
             renderer->dsvHeap->GetCPUDescriptorHandleForHeapStart());
+    // Create*View returns void; a failed descriptor creation surfaces as device removal.
+    if (FAILED(renderer->device->GetDeviceRemovedReason())) {
+        throwJava(env, "DX12 terrain color/depth descriptors could not be created.");
+        return false;
+    }
 
     D3D11_RESOURCE_FLAGS flags = {};
     flags.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
@@ -819,8 +821,6 @@ void destroyInteropRenderer(InteropRenderer* renderer) {
     releaseSizeResources(renderer);
     release(renderer->atlas);
     release(renderer->extensionList);
-    release(renderer->cutoutPassList);
-    release(renderer->opaquePassList);
     release(renderer->cutoutList);
     release(renderer->opaqueList);
     release(renderer->uploadList);
@@ -1144,6 +1144,11 @@ bool createExtensionResources(InteropRenderer* renderer, JNIEnv* env) {
         rtvHandle.ptr += renderer->extensionRtvIncrement;
         srvHandle.ptr += renderer->extensionSrvIncrement;
     }
+    // Create*View returns void; a failed descriptor creation surfaces as device removal.
+    if (FAILED(renderer->device->GetDeviceRemovedReason())) {
+        throwJava(env, "Direct extension pass descriptors could not be created.");
+        return false;
+    }
     return true;
 }
 
@@ -1289,12 +1294,6 @@ bool createCommandObjects(InteropRenderer* renderer) {
             || FAILED(renderer->cutoutList->Close())
             || FAILED(renderer->extensionList->Close())) {
         return false;
-    }
-    // Render passes exigem ID3D12GraphicsCommandList4 (Windows 10 1809+); sem ela usa OMSetRenderTargets.
-    if (FAILED(renderer->opaqueList->QueryInterface(IID_PPV_ARGS(&renderer->opaquePassList)))
-            || FAILED(renderer->cutoutList->QueryInterface(IID_PPV_ARGS(&renderer->cutoutPassList)))) {
-        release(renderer->opaquePassList);
-        release(renderer->cutoutPassList);
     }
     return true;
 }
@@ -1474,39 +1473,17 @@ void collectVisibleSections(InteropRenderer* renderer, double cameraX, double ca
     }
 }
 
-// Opaco abre o render pass (clear) e o suspende; cutout o retoma e descarta o depth no fim.
-void beginTerrainPass(InteropRenderer* renderer, ID3D12GraphicsCommandList* list,
-        ID3D12GraphicsCommandList4* passList, PassRole role) {
+// Opaco limpa o alvo; cutout preserva cor e depth.
+// Um render pass não pode atravessar command lists (o runtime descarta a lista), e opaco/cutout
+// são gravados em listas distintas para paralelismo. Por isso o alvo é ligado com OMSetRenderTargets.
+void beginTerrainPass(InteropRenderer* renderer, ID3D12GraphicsCommandList* list, PassRole role) {
     const D3D12_CPU_DESCRIPTOR_HANDLE rtv = renderer->rtvHeap->GetCPUDescriptorHandleForHeapStart();
     const D3D12_CPU_DESCRIPTOR_HANDLE dsv = renderer->dsvHeap->GetCPUDescriptorHandleForHeapStart();
     const bool clear = role != PassRole::Cutout;
-    if (passList != nullptr) {
-        D3D12_RENDER_PASS_RENDER_TARGET_DESC color = {};
-        color.cpuDescriptor = rtv;
-        color.BeginningAccess.Type = clear ? D3D12_RENDER_PASS_BEGINNING_ACCESS_TYPE_CLEAR
-                : D3D12_RENDER_PASS_BEGINNING_ACCESS_TYPE_PRESERVE;
-        color.BeginningAccess.Clear.ClearValue.Format = kColorFormat;
-        std::memcpy(color.BeginningAccess.Clear.ClearValue.Color, kClearColor, sizeof(kClearColor));
-        color.EndingAccess.Type = D3D12_RENDER_PASS_ENDING_ACCESS_TYPE_PRESERVE;
-        D3D12_RENDER_PASS_DEPTH_STENCIL_DESC depth = {};
-        depth.cpuDescriptor = dsv;
-        depth.DepthBeginningAccess.Type = clear ? D3D12_RENDER_PASS_BEGINNING_ACCESS_TYPE_CLEAR
-                : D3D12_RENDER_PASS_BEGINNING_ACCESS_TYPE_PRESERVE;
-        depth.DepthBeginningAccess.Clear.ClearValue.Format = kDepthFormat;
-        depth.DepthBeginningAccess.Clear.ClearValue.DepthStencil.Depth = 1.0f;
-        depth.DepthEndingAccess.Type = role == PassRole::Opaque ? D3D12_RENDER_PASS_ENDING_ACCESS_TYPE_PRESERVE
-                : D3D12_RENDER_PASS_ENDING_ACCESS_TYPE_DISCARD;
-        depth.StencilBeginningAccess.Type = D3D12_RENDER_PASS_BEGINNING_ACCESS_TYPE_NO_ACCESS;
-        depth.StencilEndingAccess.Type = D3D12_RENDER_PASS_ENDING_ACCESS_TYPE_NO_ACCESS;
-        const D3D12_RENDER_PASS_FLAGS flags = role == PassRole::Opaque ? D3D12_RENDER_PASS_FLAG_SUSPENDING_PASS
-                : role == PassRole::Cutout ? D3D12_RENDER_PASS_FLAG_RESUMING_PASS : D3D12_RENDER_PASS_FLAG_NONE;
-        passList->BeginRenderPass(1, &color, &depth, flags);
-    } else {
-        list->OMSetRenderTargets(1, &rtv, FALSE, &dsv);
-        if (clear) {
-            list->ClearRenderTargetView(rtv, kClearColor, 0, nullptr);
-            list->ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
-        }
+    list->OMSetRenderTargets(1, &rtv, FALSE, &dsv);
+    if (clear) {
+        list->ClearRenderTargetView(rtv, kClearColor, 0, nullptr);
+        list->ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
     }
     if (role == PassRole::ClearOnly) {
         return;
@@ -1610,11 +1587,11 @@ bool prepareTerrainIndirectCommands(InteropRenderer* renderer, FrameSlot& slot, 
 }
 
 bool recordTerrainList(InteropRenderer* renderer, ID3D12CommandAllocator* allocator,
-        ID3D12GraphicsCommandList* list, ID3D12GraphicsCommandList4* passList, PassRole role) {
+        ID3D12GraphicsCommandList* list, PassRole role) {
     if (FAILED(allocator->Reset()) || FAILED(list->Reset(allocator, nullptr))) {
         return false;
     }
-    beginTerrainPass(renderer, list, passList, role);
+    beginTerrainPass(renderer, list, role);
     const UINT firstLayer = role == PassRole::Opaque ? 0 : 1;
     const UINT lastLayer = role == PassRole::Opaque ? 1 : kLayerCount;
     if (role != PassRole::ClearOnly) {
@@ -1650,23 +1627,17 @@ bool recordTerrainList(InteropRenderer* renderer, ID3D12CommandAllocator* alloca
             }
         }
     }
-    if (passList != nullptr) {
-        passList->EndRenderPass();
-    }
     return SUCCEEDED(list->Close());
 }
 
 // Grava opaco na thread de render e cutout em paralelo na thread de gravação.
 bool recordTerrain(InteropRenderer* renderer, FrameSlot& slot, bool drawTerrain) {
     if (!drawTerrain) {
-        return recordTerrainList(renderer, slot.opaque, renderer->opaqueList, renderer->opaquePassList,
-                PassRole::ClearOnly);
+        return recordTerrainList(renderer, slot.opaque, renderer->opaqueList, PassRole::ClearOnly);
     }
     if (!renderer->workerRunning) {
-        return recordTerrainList(renderer, slot.opaque, renderer->opaqueList, renderer->opaquePassList,
-                PassRole::Opaque)
-                && recordTerrainList(renderer, slot.cutout, renderer->cutoutList, renderer->cutoutPassList,
-                        PassRole::Cutout);
+        return recordTerrainList(renderer, slot.opaque, renderer->opaqueList, PassRole::Opaque)
+                && recordTerrainList(renderer, slot.cutout, renderer->cutoutList, PassRole::Cutout);
     }
     RecordWorker& worker = renderer->worker;
     {
@@ -1675,8 +1646,7 @@ bool recordTerrain(InteropRenderer* renderer, FrameSlot& slot, bool drawTerrain)
         worker.pending = true;
     }
     worker.condition.notify_all();
-    const bool opaque = recordTerrainList(renderer, slot.opaque, renderer->opaqueList, renderer->opaquePassList,
-            PassRole::Opaque);
+    const bool opaque = recordTerrainList(renderer, slot.opaque, renderer->opaqueList, PassRole::Opaque);
     std::unique_lock<std::mutex> lock(worker.mutex);
     worker.condition.wait(lock, [&worker] { return !worker.pending; });
     return opaque && worker.result;
@@ -1835,7 +1805,7 @@ bool renderInteropFrame(InteropRenderer* renderer, const float* viewProjection,
         throwJava(env, "DX12 terrain command lists could not be recorded.");
         return false;
     }
-    // Ambas as listas na mesma submissão: o render pass suspenso no opaco é retomado pelo cutout.
+    // Ambas as listas na mesma submissão e na mesma fila: o cutout preserva a cor/depth do opaco.
     ID3D12CommandList* lists[] = {renderer->opaqueList, renderer->cutoutList};
     renderer->queue->ExecuteCommandLists(drawTerrain ? 2 : 1, lists);
     if (!recordExtensionPasses(renderer, slot, frameIndex, elapsedSeconds, passUniforms)) {
@@ -1935,6 +1905,10 @@ bool uploadAtlas(InteropRenderer* renderer, const void* const* levelData, jsize 
                 &upload)
             || FAILED(upload->Map(0, &noRead, &mapped))
             || !ensureUploadOpen(renderer)) {
+        // A mapped resource must be unmapped before Release.
+        if (upload != nullptr && mapped != nullptr) {
+            upload->Unmap(0, nullptr);
+        }
         release(upload);
         release(atlas);
         throwJava(env, "DX12 terrain atlas texture upload failed.");
