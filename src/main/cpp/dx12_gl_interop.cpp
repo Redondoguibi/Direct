@@ -70,12 +70,20 @@ VertexOutput vsMain(VertexInput input) {
     float3 local = float3(input.position.xyz) * (1.0 / 1024.0) - 16.0;
     output.position = mul(viewProjection, float4(local + sectionOffset, 1.0));
     output.color = input.color;
-    // OpenGL glGetTexImage returns atlas rows from bottom to top; D3D12 samples from the top row.
-    output.uv = float2(input.uv.x, 1.0 - input.uv.y);
+    // glGetTexImage's first (bottom) row is uploaded as D3D12 row 0, so vanilla atlas UVs
+    // address the same texels without a vertical flip.
+    output.uv = input.uv;
     return output;
 }
 float4 psMain(VertexOutput input) : SV_Target {
-    float4 result = atlasTextures[atlasIndex].Sample(atlasSampler, input.uv) * input.color;
+    float4 texel;
+    // The vanilla cutout layer (0.1 alpha cutoff) does not use mipmaps.
+    if (alphaCutoff > 0.05 && alphaCutoff < 0.2) {
+        texel = atlasTextures[atlasIndex].SampleLevel(atlasSampler, input.uv, 0);
+    } else {
+        texel = atlasTextures[atlasIndex].Sample(atlasSampler, input.uv);
+    }
+    float4 result = texel * input.color;
 #ifdef DIRECT_CUTOUT
     clip(result.a - alphaCutoff);
 #endif
@@ -988,7 +996,7 @@ bool createTerrainPipelines(InteropRenderer* renderer, JNIEnv* env) {
     description.SampleMask = UINT_MAX;
     // Preserve the original terrain winding convention used by the D3D12 pipeline.
     description.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
-    description.RasterizerState.CullMode = D3D12_CULL_MODE_BACK;
+    description.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
     description.RasterizerState.FrontCounterClockwise = FALSE;
     description.RasterizerState.DepthClipEnable = TRUE;
     description.DepthStencilState.DepthEnable = TRUE;
@@ -1001,11 +1009,11 @@ bool createTerrainPipelines(InteropRenderer* renderer, JNIEnv* env) {
     description.DSVFormat = kDepthFormat;
     description.SampleDesc.Count = 1;
     description.PS = {opaqueBytecode->GetBufferPointer(), opaqueBytecode->GetBufferSize()};
-    HRESULT result = createCachedPipeline(renderer, L"direct.terrain.opaque.v1", description,
+    HRESULT result = createCachedPipeline(renderer, L"direct.terrain.opaque.v3", description,
             &renderer->opaquePipeline);
     if (SUCCEEDED(result)) {
         description.PS = {cutoutBytecode->GetBufferPointer(), cutoutBytecode->GetBufferSize()};
-        result = createCachedPipeline(renderer, L"direct.terrain.cutout.v1", description,
+        result = createCachedPipeline(renderer, L"direct.terrain.cutout.v3", description,
                 &renderer->cutoutPipeline);
     }
     release(vertexBytecode);

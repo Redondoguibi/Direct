@@ -664,21 +664,9 @@ public final class Dx12GlInterop {
         }
     }
 
-    /** Queue a non-blocking GL completion fence for the CPU-synchronized interop fallback. */
     private static void queueCpuGlSync(long value) {
-        if (pendingGlSync != 0) {
-            finishPendingGlSync();
-        }
-        long sync = GL32.glFenceSync(GL32.GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
-        if (sync == 0) {
-            // The sync object could not be created; preserve correctness with the old blocking fallback.
-            GL11.glFinish();
-            NativeDx12.signalInteropFence(value);
-            return;
-        }
-        pendingGlSync = sync;
-        pendingGlFenceValue = value;
-        GL11.glFlush();
+        GL11.glFinish();
+        NativeDx12.signalInteropFence(value);
     }
 
     /** Polls without stalling the render thread. A false result means vanilla should render this frame. */
