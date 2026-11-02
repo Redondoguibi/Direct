@@ -163,6 +163,7 @@ struct RecordWorker {
     std::thread thread;
     std::mutex mutex;
     std::condition_variable condition;
+    // mutex protects every cross-thread field below, including the published result.
     FrameSlot* slot;
     bool pending;
     bool stop;
@@ -225,6 +226,8 @@ struct InteropRenderer {
     ID3D12GraphicsCommandList4* opaquePassList;
     ID3D12GraphicsCommandList4* cutoutPassList;
     bool uploadOpen;
+    // Render/JNI-thread-owned upload bookkeeping. RecordWorker only records command lists
+    // from the immutable visible-section snapshot and must never mutate these containers.
     std::vector<D3D12_RESOURCE_BARRIER> uploadBarriers;
     std::vector<ArenaPage*> uploadPages;
     std::vector<ID3D12Resource*> pendingRetire;
@@ -322,17 +325,30 @@ void inspectAdapter(InteropRenderer* renderer) {
     }
 }
 
-bool createSharedFence(ID3D12Device* device, ID3D12Fence** fence, HANDLE* sharedHandle) {
+// Creates a usable timeline fence. Exporting a Win32 handle is optional: if it fails,
+// the local fence remains valid for CPU synchronization, but GPU semaphore interop is unavailable.
+bool createFenceWithOptionalSharedHandle(ID3D12Device* device, ID3D12Fence** fence,
+        HANDLE* sharedHandle, bool* sharedHandleAvailable) {
+    *fence = nullptr;
     *sharedHandle = nullptr;
-    if (SUCCEEDED(device->CreateFence(0, D3D12_FENCE_FLAG_SHARED, IID_PPV_ARGS(fence)))) {
-        if (FAILED(device->CreateSharedHandle(*fence, nullptr, GENERIC_ALL, nullptr, sharedHandle))) {
-            *sharedHandle = nullptr;
-            OutputDebugStringA("Direct: shared fence handle export failed; retaining the fence for CPU-sync fallback.\n");
-        }
-        // The fence remains owned by the renderer and is released during teardown.
+    *sharedHandleAvailable = false;
+
+    HRESULT result = device->CreateFence(0, D3D12_FENCE_FLAG_SHARED, IID_PPV_ARGS(fence));
+    if (FAILED(result)) {
+        // Some drivers can create a local timeline fence even when a shareable fence is unsupported.
+        result = device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(fence));
+        return SUCCEEDED(result);
+    }
+
+    result = device->CreateSharedHandle(*fence, nullptr, GENERIC_ALL, nullptr, sharedHandle);
+    if (FAILED(result)) {
+        *sharedHandle = nullptr;
+        OutputDebugStringA("Direct: shared fence handle export failed; retaining the local fence for CPU-sync fallback.\n");
         return true;
     }
-    return SUCCEEDED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(fence)));
+
+    *sharedHandleAvailable = true;
+    return true;
 }
 
 // Espera com timeout; timeout e device removal são propagados ao Java para voltar ao vanilla.
@@ -621,7 +637,14 @@ bool ensureUploadOpen(InteropRenderer* renderer) {
         return true;
     }
     FrameSlot& slot = renderer->slots[renderer->slotIndex];
-    if (!waitFence(renderer, renderer->fence, slot.fenceValue)
+    // Java polls the frame slot before queuing uploads. Never block the render thread here:
+    // if a caller misses that readiness check, defer the upload instead of waiting on an event.
+    const UINT64 completed = renderer->fence->GetCompletedValue();
+    if (completed == kFenceError) {
+        renderer->gpuSyncFault.store(true);
+        return false;
+    }
+    if (slot.fenceValue > completed
             || FAILED(slot.upload->Reset())
             || FAILED(renderer->uploadList->Reset(slot.upload, nullptr))) {
         return false;
@@ -1363,10 +1386,20 @@ bool initializeInteropRenderer(InteropRenderer* renderer, jint width, jint heigh
     if (!createSizeResources(renderer, env)) {
         return false;
     }
-    if (!createSharedFence(renderer->device, &renderer->fence, &renderer->sharedFenceHandle)
-            || !createSharedFence(renderer->device, &renderer->glDoneFence, &renderer->sharedGlDoneFenceHandle)) {
-        throwJava(env, "DX12/OpenGL interop could not create a Direct3D 12 fence.");
+    bool sharedFenceAvailable = false;
+    bool sharedGlDoneFenceAvailable = false;
+    if (!createFenceWithOptionalSharedHandle(renderer->device, &renderer->fence,
+                &renderer->sharedFenceHandle, &sharedFenceAvailable)
+            || !createFenceWithOptionalSharedHandle(renderer->device, &renderer->glDoneFence,
+                &renderer->sharedGlDoneFenceHandle, &sharedGlDoneFenceAvailable)) {
+        throwJava(env, "DX12/OpenGL interop could not create its D3D12 timeline fences.");
         return false;
+    }
+    if (!sharedFenceAvailable) {
+        OutputDebugStringA("Direct: optional output-fence handle was not exported; the output fence remains CPU-polled.\n");
+    }
+    if (!sharedGlDoneFenceAvailable) {
+        OutputDebugStringA("Direct: OpenGL completion-fence handle was not exported; using polled GLsync CPU synchronization.\n");
     }
     renderer->fenceEvent = CreateEvent(nullptr, FALSE, FALSE, nullptr);
     renderer->watchdogEvent = CreateEvent(nullptr, FALSE, FALSE, nullptr);

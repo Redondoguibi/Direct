@@ -210,6 +210,9 @@ public final class Dx12GlInterop {
                 blockAtlasDirty = true;
             } else if (currentWidth != width || currentHeight != height) {
                 discardPendingFrame();
+                if (!lastSubmittedFrameReady("resize")) {
+                    return;
+                }
                 resize(currentWidth, currentHeight);
             }
             resolvePendingFrame();
@@ -240,6 +243,9 @@ public final class Dx12GlInterop {
             DirectRenderApi.PassSnapshot passSnapshot = DirectRenderApi.snapshotState();
             List<DirectRenderPass> passes = passSnapshot.passes();
             if (passSnapshot.revision() != configuredPassRevision) {
+                if (!lastSubmittedFrameReady("pass reconfiguration")) {
+                    return;
+                }
                 String[] sources = NO_PASS_SOURCES;
                 if (!passes.isEmpty()) {
                     sources = new String[passes.size()];
@@ -305,6 +311,7 @@ public final class Dx12GlInterop {
         if (glDoneSemaphore != 0 || interopObject != 0) {
             GL11.glFinish();
         }
+        // Drain and delete the single outstanding GLsync before closing the WGL/D3D12 resources.
         finishPendingGlSync();
         if (glDoneSemaphore != 0) {
             EXTSemaphore.glDeleteSemaphoresEXT(glDoneSemaphore);
@@ -434,6 +441,25 @@ public final class Dx12GlInterop {
         startedAtNanos = System.nanoTime();
     }
 
+    /**
+     * Polls the last submitted D3D12 frame before operations that replace resources or PSOs.
+     * The native operations retain a defensive wait, but the render thread never enters it
+     * while the previous frame is still executing.
+     */
+    private static boolean lastSubmittedFrameReady(String operation) {
+        if (!initialized || frameIndex == 0) {
+            return true;
+        }
+        int state = NativeDx12.pollInteropFence(frameIndex);
+        if (state < 0) {
+            throw new IllegalStateException("D3D12 fence failed before " + operation + ".");
+        }
+        if (state == 0) {
+            DirectStatusOverlay.setStatus("D3D12 / waiting before " + operation);
+            return false;
+        }
+        return true;
+    }
     private static void resize(int frameWidth, int frameHeight) {
         GL11.glFinish();
         finishPendingGlSync();
@@ -651,6 +677,7 @@ public final class Dx12GlInterop {
             return true;
         }
         if (result == GL32.GL_WAIT_FAILED) {
+            // finishPendingGlSync deletes the failed GLsync before CPU-signaling the native timeline.
             finishPendingGlSync();
             return true;
         }
