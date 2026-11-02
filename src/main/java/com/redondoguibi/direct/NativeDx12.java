@@ -27,7 +27,7 @@ final class NativeDx12 {
 
     static native boolean isCurrentFrameSlotReady();
 
-    static native void waitInteropFence(long value);
+    static native int pollInteropFence(long value);
 
     static native void signalInteropFence(long value);
 
