@@ -79,7 +79,7 @@ VertexOutput vsMain(VertexInput input) {
     output.uv = input.uv;
     return output;
 }
-struct PixelOutput { float4 color : SV_Target0; float depth : SV_Target1; };
+struct PixelOutput { float4 color : SV_Target0; };
 PixelOutput psMain(VertexOutput input) {
     float4 texel;
     // The vanilla cutout layer (0.1 alpha cutoff) does not use mipmaps.
@@ -98,7 +98,6 @@ PixelOutput psMain(VertexOutput input) {
     }
     PixelOutput output;
     output.color = float4(result.rgb, 1.0);
-    output.depth = input.position.z;
     return output;
 }
 )";
@@ -167,6 +166,7 @@ struct FrameSlot {
     UINT opaqueIndirectCount;
     UINT cutoutIndirectCount;
     bool indirectReady;
+    bool timestampValid;
     UINT64 fenceValue;
 };
 
@@ -224,7 +224,6 @@ struct InteropRenderer {
     ID3D11Resource* wrappedColor;
     ID3D11Texture2D* interopDepth;
     ID3D11Resource* wrappedDepth;
-    ID3D12Resource* depthExport;
     ID3D12Resource* lightmap;
     std::vector<jlong> visibleKeys;
     bool useVisibleKeys;
@@ -740,7 +739,6 @@ void releaseSizeResources(InteropRenderer* renderer) {
         renderer->d3d11Context->Flush();
     }
     releaseExtensionResources(renderer);
-    release(renderer->depthExport);
     release(renderer->interopDepth);
     release(renderer->depthTarget);
     release(renderer->colorTarget);
@@ -782,7 +780,7 @@ bool createSizeResources(InteropRenderer* renderer, JNIEnv* env) {
     colorClear.Format = kColorFormat;
     std::memcpy(colorClear.Color, kClearColor, sizeof(kClearColor));
     D3D12_RESOURCE_DESC depth = texture;
-    depth.Format = kDepthFormat;
+    depth.Format = DXGI_FORMAT_R32_TYPELESS;
     depth.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL | D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE;
     D3D12_CLEAR_VALUE depthClear = {};
     depthClear.Format = kDepthFormat;
@@ -794,22 +792,12 @@ bool createSizeResources(InteropRenderer* renderer, JNIEnv* env) {
         throwJava(env, "DX12 terrain color/depth target creation failed.");
         return false;
     }
-    D3D12_RESOURCE_DESC exportDesc = texture;
-    exportDesc.Format = DXGI_FORMAT_R32_FLOAT;
-    D3D12_CLEAR_VALUE exportClear = {};
-    exportClear.Format = exportDesc.Format;
-    exportClear.Color[0] = 1.0f;
-    if (FAILED(renderer->device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &exportDesc,
-            D3D12_RESOURCE_STATE_RENDER_TARGET, &exportClear, IID_PPV_ARGS(&renderer->depthExport)))) {
-        throwJava(env, "Could not allocate the terrain depth export target.");
-        return false;
-    }
-    D3D12_CPU_DESCRIPTOR_HANDLE depthRtv = renderer->rtvHeap->GetCPUDescriptorHandleForHeapStart();
-    depthRtv.ptr += renderer->device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
-    renderer->device->CreateRenderTargetView(renderer->depthExport, nullptr, depthRtv);
     renderer->device->CreateRenderTargetView(renderer->colorTarget, nullptr,
             renderer->rtvHeap->GetCPUDescriptorHandleForHeapStart());
-    renderer->device->CreateDepthStencilView(renderer->depthTarget, nullptr,
+    D3D12_DEPTH_STENCIL_VIEW_DESC depthView = {};
+    depthView.Format = kDepthFormat;
+    depthView.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D;
+    renderer->device->CreateDepthStencilView(renderer->depthTarget, &depthView,
             renderer->dsvHeap->GetCPUDescriptorHandleForHeapStart());
     // Create*View returns void; a failed descriptor creation surfaces as device removal.
     if (FAILED(renderer->device->GetDeviceRemovedReason())) {
@@ -825,8 +813,9 @@ bool createSizeResources(InteropRenderer* renderer, JNIEnv* env) {
         throwJava(env, "DX12 terrain target could not be wrapped for the OpenGL bridge.");
         return false;
     }
-    if (FAILED(renderer->d3d11On12->CreateWrappedResource(renderer->depthExport, &flags,
-            D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_RENDER_TARGET,
+    flags.BindFlags = D3D11_BIND_DEPTH_STENCIL;
+    if (FAILED(renderer->d3d11On12->CreateWrappedResource(renderer->depthTarget, &flags,
+            D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_DEPTH_WRITE,
             IID_PPV_ARGS(&renderer->wrappedDepth)))) {
         throwJava(env, "Could not wrap the terrain depth image.");
         return false;
@@ -1069,19 +1058,16 @@ bool createTerrainPipelines(InteropRenderer* renderer, JNIEnv* env) {
     description.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_LESS_EQUAL;
     description.InputLayout = {elements, ARRAYSIZE(elements)};
     description.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
-    description.NumRenderTargets = 2;
+    description.NumRenderTargets = 1;
     description.RTVFormats[0] = kColorFormat;
-    description.RTVFormats[1] = DXGI_FORMAT_R32_FLOAT;
-    description.BlendState.IndependentBlendEnable = TRUE;
-    description.BlendState.RenderTarget[1] = description.BlendState.RenderTarget[0];
     description.DSVFormat = kDepthFormat;
     description.SampleDesc.Count = 1;
     description.PS = {opaqueBytecode->GetBufferPointer(), opaqueBytecode->GetBufferSize()};
-    HRESULT result = createCachedPipeline(renderer, L"direct.terrain.opaque.v4", description,
+    HRESULT result = createCachedPipeline(renderer, L"direct.terrain.opaque.v5", description,
             &renderer->opaquePipeline);
     if (SUCCEEDED(result)) {
         description.PS = {cutoutBytecode->GetBufferPointer(), cutoutBytecode->GetBufferSize()};
-        result = createCachedPipeline(renderer, L"direct.terrain.cutout.v4", description,
+        result = createCachedPipeline(renderer, L"direct.terrain.cutout.v5", description,
                 &renderer->cutoutPipeline);
     }
     release(vertexBytecode);
@@ -1589,13 +1575,9 @@ void beginTerrainPass(InteropRenderer* renderer, ID3D12GraphicsCommandList* list
     const D3D12_CPU_DESCRIPTOR_HANDLE rtv = renderer->rtvHeap->GetCPUDescriptorHandleForHeapStart();
     const D3D12_CPU_DESCRIPTOR_HANDLE dsv = renderer->dsvHeap->GetCPUDescriptorHandleForHeapStart();
     const bool clear = role != PassRole::Cutout;
-    list->OMSetRenderTargets(2, &rtv, TRUE, &dsv);
+    list->OMSetRenderTargets(1, &rtv, TRUE, &dsv);
     if (clear) {
         list->ClearRenderTargetView(rtv, kClearColor, 0, nullptr);
-        D3D12_CPU_DESCRIPTOR_HANDLE depthRtv = rtv;
-        depthRtv.ptr += renderer->device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
-        const float clearDepth[4] = {1, 1, 1, 1};
-        list->ClearRenderTargetView(depthRtv, clearDepth, 0, nullptr);
         list->ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
     }
     if (role == PassRole::ClearOnly) {
@@ -1968,6 +1950,7 @@ bool renderInteropFrame(InteropRenderer* renderer, const float* viewProjection,
         return false;
     }
     slot.fenceValue = dxReadyValue;
+    slot.timestampValid = renderer->profiling;
     renderer->slotIndex = (renderer->slotIndex + 1) % kFramesInFlight;
     for (ID3D12Resource* resource : renderer->pendingRetire) {
         renderer->retired.push_back({dxReadyValue, resource});
@@ -2636,14 +2619,14 @@ Java_com_redondoguibi_direct_NativeDx12_frameMetrics(JNIEnv* env, jclass) {
     if (!renderer) return nullptr;
     double gpuMs = -1;
     const UINT index = (renderer->slotIndex + kFramesInFlight - 1) % kFramesInFlight;
-    if (renderer->profiling && renderer->slots[index].fenceValue > 0
+    if (renderer->profiling && renderer->slots[index].timestampValid && renderer->slots[index].fenceValue > 0
             && renderer->fence->GetCompletedValue() >= renderer->slots[index].fenceValue) {
         const UINT query = index * 2;
         const D3D12_RANGE range = {query * sizeof(UINT64), (query + 2) * sizeof(UINT64)};
         void* data = nullptr;
         if (SUCCEEDED(renderer->timestampReadback->Map(0, &range, &data))) {
             const auto* values = static_cast<const UINT64*>(data) + query;
-            gpuMs = static_cast<double>(values[1] - values[0]) * 1000.0 / renderer->timestampFrequency;
+            if(values[1]>=values[0])gpuMs = static_cast<double>(values[1] - values[0]) * 1000.0 / renderer->timestampFrequency;
             const D3D12_RANGE noWrite = {0,0};
             renderer->timestampReadback->Unmap(0, &noWrite);
         }
@@ -2651,8 +2634,11 @@ Java_com_redondoguibi_direct_NativeDx12_frameMetrics(JNIEnv* env, jclass) {
     UINT draws = 0;
     for (const auto& visible : renderer->visible)
         for (UINT layer = 0; layer < kLayerCount; ++layer) draws += visible.section->layerIndexCounts[layer] != 0;
-    const double values[] = {gpuMs, static_cast<double>(renderer->visible.size()), static_cast<double>(draws)};
-    jdoubleArray result = env->NewDoubleArray(3);
-    if (result) env->SetDoubleArrayRegion(result, 0, 3, values);
+    UINT64 uploadReserved=0;
+    for(const auto& frame:renderer->slots)uploadReserved+=frame.uploadCapacity;
+    const double values[] = {gpuMs, static_cast<double>(renderer->visible.size()), static_cast<double>(draws),
+        static_cast<double>(renderer->terrainArenaBytes),static_cast<double>(uploadReserved)};
+    jdoubleArray result = env->NewDoubleArray(5);
+    if (result) env->SetDoubleArrayRegion(result, 0, 5, values);
     return result;
 }

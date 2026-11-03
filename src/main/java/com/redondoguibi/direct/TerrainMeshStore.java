@@ -226,6 +226,7 @@ public final class TerrainMeshStore {
     public static boolean hasCaptureFault() {
         return captureFaulted;
     }
+    static long[] pendingMetrics(){synchronized(LOCK){return new long[]{pendingBytes,PENDING.size(),activeCaptures};}}
 
     /** Closes a capture if SectionCompiler.compile exits exceptionally before its return hook. */
     public static void finishCaptureForCurrentThread() {
@@ -240,6 +241,7 @@ public final class TerrainMeshStore {
     }
 
     public static void uploadPending() {
+        long uploadStart=RendererMetrics.recording?System.nanoTime():0;
         final int maxUpdates = ClientConfig.MAX_MESH_UPLOADS_PER_FRAME.get();
         final long maxBytes = ClientConfig.MAX_MESH_UPLOAD_MIB_PER_FRAME.get() * 1024L * 1024L;
         int uploaded = 0;
@@ -283,6 +285,7 @@ public final class TerrainMeshStore {
             uploadedBytes += update.byteSize();
         }
 
+        if(RendererMetrics.recording){RendererMetrics.uploadNanos+=System.nanoTime()-uploadStart;RendererMetrics.uploadSections+=uploaded;RendererMetrics.uploadBytes+=uploadedBytes;}
         synchronized (LOCK) {
             long quietNanos = System.nanoTime() - lastCaptureActivityNanos;
             if (captureEnabled && !captureFaulted && successfulCaptures > 0 && PENDING.isEmpty()

@@ -4,11 +4,11 @@ Direct provides the D3D12 backend and a versioned Java extension API. A shader m
 
 ## Dependency and API version
 
-Compile against the Direct mod JAR as a `compileOnly` dependency and declare Direct as a required NeoForge dependency in the shader mod's `neoforge.mods.toml`. Use the API version, not the Direct mod version, for compatibility checks:
+For a Direct-only extension, compile against its JAR as `compileOnly` and declare a required NeoForge dependency. An independent manager such as Raydiance must instead keep Direct optional and isolate API discovery so it can run without Direct. Use the API version, not the Direct mod version, for compatibility checks:
 
 ```java
 DirectRenderService service = DirectRenderService.getInstance();
-String apiVersion = service.apiVersion(); // 1.0.0
+String apiVersion = service.apiVersion(); // 1.1.0
 DirectRenderCapabilities caps = service.capabilities();
 ```
 
@@ -80,10 +80,14 @@ Pass ids must match `[a-z0-9_.-]{1,96}` and be unique. At most eight passes may 
 3. Pass outputs are transitioned from render-target to pixel-shader-resource state before the next pass reads them. Direct transitions the final output to copy-source, copies it into the terrain color target, and restores the interop target state before handing it to D3D11On12/WGL. Extensions must not issue barriers or mutate target state.
 4. The final D3D12 color image is copied to the WGL-importable D3D11 texture and composited after vanilla solid/cutout layers, before entity rendering. Vanilla depth remains intact, so entities and later translucent/weather/GUI layers render above the Direct terrain. The existing OpenGL swap chain presents the frame.
 5. Three frame slots protect upload and terrain command allocators/resources until their D3D12 fences complete. Direct polls the D3D12 ready fence without blocking and composites only a completed output on a later render hook. If that output is still pending, it is discarded and its GL-done timeline value is CPU-signaled because GL did not read it; vanilla remains visible. When `GL_EXT_semaphore_win32` is available, the D3D12 queue waits on GL's prior-frame signal; otherwise Direct polls a `GLsync` and CPU-signals the fence after GL has completed the read. In this CPU fallback, Direct also waits on a D3D12 fence before the D3D11On12 copy and only exposes the output after that copy has been flushed. No OpenGL semaphore wait is issued, so a missing D3D12 signal cannot hang the GL stream. Frame-scoped texture handles expire at the end of their frame.
-6. On resize, device removal, invalid HLSL, or interop failure, Direct tears down native state and continues through vanilla rendering. Transient initialization/render failures are retried after a short cooldown; missing WGL interop remains disabled until the config is toggled or the client restarts. A pass must not cache frame handles or assume consecutive frame ids imply resource identity.
+6. On resize, device removal, or interop failure, Direct tears down native state and continues through vanilla rendering. Transient initialization/render failures are retried after a short cooldown; missing WGL interop remains disabled until the config is toggled or the client restarts. A pass must not cache frame handles or assume consecutive frame ids imply resource identity.
 
 `DirectFrameRenderEvent` is a read-only notification before/after the pass chain. `DirectFrameContext` exposes dimensions, time, render distance, pass id/index, and opaque color/depth target descriptions only. Texture handles never contain a D3D12 or OpenGL pointer.
 
 ## Capability checks
 
 `DirectRenderCapabilities` reports the detected adapter label and whether the active device is hardware-backed, native terrain/pass support, bindless descriptor tier, pipeline-library availability, GPU semaphore synchronization, WGL interop, and depth sampling. `renderPasses` is always `false`: Direct binds render targets explicitly because a D3D12 render pass cannot span the separate opaque and cutout command lists. Optional features must be guarded by these values. The native renderer still requires Windows x86-64 and `WGL_NV_DX_interop2`; without it, Direct does not try an alternate import path.
+
+## Integration status
+
+Direct mod 1.2.1 exposes API 1.1.0. See [integration findings](integracao-raydiance-lus.md) for the tested JAR pair, Intel fence-import limitation and unimplemented DX12 material effects.

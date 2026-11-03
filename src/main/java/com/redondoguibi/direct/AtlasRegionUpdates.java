@@ -11,6 +11,7 @@ import java.util.concurrent.Executors;
 import org.lwjgl.opengl.GL11;
 import org.lwjgl.opengl.GL15;
 import org.lwjgl.opengl.GL30;
+import org.lwjgl.opengl.GL32;
 
 /** Render-thread readback of changed sprite rectangles; CPU compression runs on private pixel copies. */
 final class AtlasRegionUpdates {
@@ -28,8 +29,16 @@ final class AtlasRegionUpdates {
     private long pendingGeneration;
     private long lastCapture;
     private int framebuffer;
+    private int readbackBuffer;
+    private long readbackFence;
+    private List<Patch> readbackPatches;
+    private long readbackGeneration;
+    private boolean readbackCompressed;
 
     void reset() {
+        if (readbackFence != 0) GL32.glDeleteSync(readbackFence);
+        if (readbackBuffer != 0) GL15.glDeleteBuffers(readbackBuffer);
+        readbackFence=0;readbackBuffer=0;readbackPatches=null;
         generation++;
         dirty.clear();
         buffers.clear();
@@ -46,8 +55,27 @@ final class AtlasRegionUpdates {
     void mark(int x, int y, int width, int height) {
         dirty.put((long) x << 32 | Integer.toUnsignedLong(y), new Region(x, y, width, height));
     }
+    boolean hasPendingWork(){return readbackFence!=0||pending!=null||!dirty.isEmpty();}
 
     void update(int atlas, int intervalMillis, int threads) {
+        if(readbackFence!=0){
+            int status=GL32.glClientWaitSync(readbackFence,0,0);
+            if(status==GL32.GL_TIMEOUT_EXPIRED)return;
+            if(status==GL32.GL_WAIT_FAILED)throw new IllegalStateException("Atlas readback synchronization failed");
+            int oldPack=GL11.glGetInteger(GL30.GL_PIXEL_PACK_BUFFER_BINDING);
+            long mapStart=System.nanoTime();
+            GL15.glBindBuffer(GL30.GL_PIXEL_PACK_BUFFER,readbackBuffer);
+            try{
+                long bytes=0;for(Patch patch:readbackPatches)bytes+=(long)patch.region.width*patch.region.height*4;
+                ByteBuffer mapped=GL30.glMapBufferRange(GL30.GL_PIXEL_PACK_BUFFER,0,bytes,GL30.GL_MAP_READ_BIT);
+                if(mapped==null)throw new IllegalStateException("Cannot map completed atlas readback");
+                try{for(Patch patch:readbackPatches){int size=patch.region.width*patch.region.height*4;ByteBuffer slice=mapped.slice();slice.limit(size);patch.pixels.clear();patch.pixels.put(slice);patch.pixels.flip();mapped.position(mapped.position()+size);}}
+                finally{if(!GL15.glUnmapBuffer(GL30.GL_PIXEL_PACK_BUFFER))throw new IllegalStateException("Atlas readback became invalid");}
+            }finally{RendererMetrics.atlasReadNanos+=System.nanoTime()-mapStart;GL15.glBindBuffer(GL30.GL_PIXEL_PACK_BUFFER,oldPack);GL32.glDeleteSync(readbackFence);readbackFence=0;}
+            List<Patch> ready=readbackPatches;readbackPatches=null;boolean compressed=readbackCompressed;
+            pendingGeneration=readbackGeneration;
+            pending=CompletableFuture.supplyAsync(()->{for(Patch patch:ready)if(compressed)NativeDx12.encodeAtlasRegion(patch.pixels,patch.encoded,patch.region.width,patch.region.height,threads);return ready;},encoder);
+        }
         if (pending != null) {
             if (!pending.isDone()) return;
             var patches = pendingGeneration == generation ? pending.join() : List.<Patch>of();
@@ -111,19 +139,25 @@ final class AtlasRegionUpdates {
                         buffers.put(key, patch);
                     }
                     if (patches.contains(patch)) continue;
-                    GL11.glReadPixels(r.x, r.y, r.width, r.height, GL11.GL_RGBA, GL11.GL_UNSIGNED_BYTE, patch.pixels);
                     patches.add(patch);
                 }
             }
-            dirty.clear();
-            pendingGeneration = generation;
-            pending = CompletableFuture.supplyAsync(() -> {
-                for (Patch patch : patches) {
-                    if (compressed) NativeDx12.encodeAtlasRegion(patch.pixels, patch.encoded,
-                            patch.region.width, patch.region.height, threads);
+            if(!patches.isEmpty()){
+                long bytes=0;for(Patch patch:patches)bytes+=(long)patch.region.width*patch.region.height*4;
+                if(readbackBuffer==0)readbackBuffer=GL15.glGenBuffers();
+                GL15.glBindBuffer(GL30.GL_PIXEL_PACK_BUFFER,readbackBuffer);
+                GL15.glBufferData(GL30.GL_PIXEL_PACK_BUFFER,bytes,GL15.GL_STREAM_READ);
+                int previousLevel=-1;long offset=0;
+                for(Patch patch:patches){
+                    if(previousLevel!=patch.level){GL30.glFramebufferTexture2D(GL30.GL_READ_FRAMEBUFFER,GL30.GL_COLOR_ATTACHMENT0,GL11.GL_TEXTURE_2D,atlas,patch.level);previousLevel=patch.level;}
+                    Region r=patch.region;GL11.glReadPixels(r.x,r.y,r.width,r.height,GL11.GL_RGBA,GL11.GL_UNSIGNED_BYTE,offset);
+                    offset+=(long)r.width*r.height*4;
                 }
-                return patches;
-            }, encoder);
+                readbackFence=GL32.glFenceSync(GL32.GL_SYNC_GPU_COMMANDS_COMPLETE,0);
+                if(readbackFence==0)throw new IllegalStateException("Could not create atlas readback fence");
+                GL11.glFlush();readbackPatches=patches;readbackGeneration=generation;readbackCompressed=compressed;
+            }
+            dirty.clear();
         } finally {
             RendererMetrics.atlasReadNanos += System.nanoTime() - started;
             GL11.glBindTexture(GL11.GL_TEXTURE_2D, bound);

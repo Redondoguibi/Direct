@@ -78,7 +78,7 @@ public final class ClientConfig {
             .defineInRange("maxPendingMeshMiB", 128, 64, 2048);
 
     public static final ModConfigSpec.BooleanValue PROFILE_RENDERER = BUILDER
-            .comment("Log optional CPU/GPU renderer costs and draw counts every 60 seconds; no FPS recording.")
+            .comment("Record optional CPU/GPU costs, FPS and recent frame-time percentiles every 60 seconds.","Appends logs/direct-performance.csv; bounded 16384-sample window, no per-frame disk writes.")
             .define("profileRenderer", false);
 
     public static final ModConfigSpec SPEC = BUILDER.build();

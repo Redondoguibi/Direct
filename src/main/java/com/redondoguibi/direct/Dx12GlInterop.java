@@ -177,16 +177,30 @@ public final class Dx12GlInterop {
         if (!shouldCompositeBeforeVanilla() || pendingReadyValue == 0) return;
         long started = System.nanoTime();
         try {
-            NativeDx12.waitInteropFrame(pendingReadyValue);
+            // Compilation may have changed the visible meshes after submission. An image
+            // that cannot be displayed must not stall vanilla waiting for its completion.
+            if (!java.util.Arrays.equals(visibleKeys, 0, visibleCount, submittedVisibleKeys, 0, submittedVisibleCount)
+                    || !TerrainMeshStore.canReplaceVisible(visibleKeys, visibleCount)
+                    || !PENDING_VIEW.matches(CAPTURED_VIEW, CAPTURED_PROJECTION, cameraX, cameraY, cameraZ)) {
+                discardPendingFrame();replacementFrame=false;
+                if(RendererMetrics.recording)RendererMetrics.discardedBeforeWait++;
+                return;
+            }
+            long waitStart=System.nanoTime();
+            boolean completed=NativeDx12.waitInteropFrame(pendingReadyValue);
+            if(RendererMetrics.recording)RendererMetrics.dxWaitNanos+=System.nanoTime()-waitStart;
+            if(!completed)
+                throw new IllegalStateException("D3D12 did not complete the current terrain frame.");
             if (ClientConfig.PROFILE_RENDERER.get()) {
                 double[] metrics = NativeDx12.frameMetrics();
                 if (metrics != null && metrics[0] >= 0) {
                     RendererMetrics.gpuNanos += (long) (metrics[0] * 1e6);
                     RendererMetrics.nativeDraws += (long) metrics[2];
                     RendererMetrics.nativeFrames++;
+                    if(metrics.length>=5){RendererMetrics.gpuArenaBytes=(long)metrics[3];RendererMetrics.uploadRingBytes=(long)metrics[4];}
                 }
             }
-            if (!java.util.Arrays.equals(visibleKeys, 0, visibleCount, submittedVisibleKeys, 0, submittedVisibleCount) || !TerrainMeshStore.canReplaceVisible(visibleKeys, visibleCount)) {
+            if (!TerrainMeshStore.canReplaceVisible(visibleKeys, visibleCount)) {
                 discardPendingFrame();
                 replacementFrame = false;
                 return;
@@ -239,7 +253,9 @@ public final class Dx12GlInterop {
         try {
             if (!pollCpuGlSync()) {
                 if (!shouldCompositeBeforeVanilla()) return;
+                long waitStart=System.nanoTime();
                 int result = GL32.glClientWaitSync(pendingGlSync, GL32.GL_SYNC_FLUSH_COMMANDS_BIT, 5_000_000_000L);
+                if(RendererMetrics.recording)RendererMetrics.glWaitNanos+=System.nanoTime()-waitStart;
                 if (result == GL32.GL_TIMEOUT_EXPIRED || result == GL32.GL_WAIT_FAILED)
                     throw new IllegalStateException("OpenGL did not release the shared terrain image.");
                 if (!pollCpuGlSync()) return;
@@ -426,11 +442,11 @@ public final class Dx12GlInterop {
         configuredPassRevision = -1L;
         configuredPasses = List.of();
         lastFrameSucceeded = false;
-        if (glDoneSemaphore != 0 || interopObject != 0) {
+        if (pendingGlSync != 0) {
+            finishPendingGlSync();
+        } else if (glDoneSemaphore != 0 || interopObject != 0) {
             GL11.glFinish();
         }
-        // Drain and delete the single outstanding GLsync before closing the WGL/D3D12 resources.
-        finishPendingGlSync();
         if (glDoneSemaphore != 0) {
             EXTSemaphore.glDeleteSemaphoresEXT(glDoneSemaphore);
             glDoneSemaphore = 0;
@@ -875,13 +891,10 @@ public final class Dx12GlInterop {
             disableGpuSemaphore("The driver does not expose a shared D3D12 fence semaphore; using polled GLsync.");
             return;
         }
-        drainGlErrors();
-        int doneSemaphore = EXTSemaphore.glGenSemaphoresEXT();
-        EXTSemaphoreWin32.glImportSemaphoreWin32HandleEXT(doneSemaphore,
-                EXTSemaphoreWin32.GL_HANDLE_TYPE_D3D12_FENCE_EXT, sharedGlDoneFenceHandle);
-        int error = GL11.glGetError();
+        var imported = InteropSemaphore.importFence(sharedGlDoneFenceHandle);
+        int doneSemaphore = imported.semaphore();
+        int error = imported.error();
         if (error != GL11.GL_NO_ERROR) {
-            EXTSemaphore.glDeleteSemaphoresEXT(doneSemaphore);
             String reason = "The OpenGL driver rejected the shared D3D12 fence import (GL error 0x"
                     + Integer.toHexString(error) + "); using polled GLsync for CPU-to-D3D12 synchronization.";
             disableGpuSemaphore(reason);
@@ -909,13 +922,18 @@ public final class Dx12GlInterop {
     }
 
     private static void drainGlErrors() {
-        for (int attempt = 0; attempt < 64 && GL11.glGetError() != GL11.GL_NO_ERROR; attempt++) {
-            // descarta erros antigos do Minecraft para não culpar o semáforo
+        int error;
+        for (int attempt = 0; attempt < 64 && (error=GL11.glGetError()) != GL11.GL_NO_ERROR; attempt++) {
+            Direct.LOGGER.warn("Pre-existing OpenGL error before semaphore signaling: 0x{}",Integer.toHexString(error));
         }
     }
 
     private static void disableGpuSemaphore(String reason) {
         gpuSemaphoreInterop = false;
+        var previous=DirectRenderApi.service().capabilities();
+        DirectRenderApi.updateCapabilities(new DirectRenderCapabilities(previous.backendName(),previous.adapterName(),
+                previous.hardwareAdapter(),previous.nativeTerrain(),previous.shaderPasses(),previous.bindlessDescriptors(),
+                previous.renderPasses(),previous.pipelineLibrary(),false,previous.wglInterop(),previous.depthInput()));
         if (!reportedSemaphoreFallback) {
             Direct.LOGGER.warn("{}", reason);
             reportedSemaphoreFallback = true;

@@ -1,0 +1,14 @@
+gradle.projectsEvaluated {
+    def mod = gradle.rootProject
+    mod.tasks.register('terrainLookupBenchmark', JavaExec) {
+        dependsOn mod.tasks.named('testClasses')
+        classpath = mod.sourceSets.test.runtimeClasspath + mod.configurations.clientLegacyClasspath
+        mainClass = 'com.redondoguibi.direct.TerrainLookupBenchmark'
+    }
+    mod.tasks.register('nativeDepthCostBenchmark', JavaExec) {
+        dependsOn mod.tasks.named('testClasses')
+        classpath = mod.sourceSets.test.runtimeClasspath + mod.configurations.clientLegacyClasspath
+        mainClass = 'com.redondoguibi.direct.NativeDepthCostBenchmark'
+        args mod.providers.gradleProperty('benchmarkLibrary').get()
+    }
+}

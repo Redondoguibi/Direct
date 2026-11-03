@@ -20,6 +20,8 @@ The native DLL links Windows SDK libraries (`d3d11`, `d3d12`, `dxgi`, and `d3dco
 
 ## Renderer and capabilities
 
+Direct 1.2.4 uses a single terrain color target and copies the actual D32 depth buffer through 11On12, eliminating the former shader-written depth export target. Invalidated frames are rejected before the CPU waits for their completion. See [measured workload and validation limits](docs/dx12-terrain-performance.md).
+
 - Terrain section meshes are captured from vanilla compilation and uploaded into D3D12 vertex/index buffers. Each packed vertex occupies 16 bytes (uint16 position, packed vanilla light coordinates in the spare position word, RGBA8 color, and unorm16 UVs); source indices are expanded to 32-bit indices. The active native pipelines cover the `solid`, `cutout_mipped`, and `cutout` layers.
 - Opaque and cutout command lists use two native D3D12 PSOs, a shared root signature, an atlas SRV descriptor heap, and a 64-slot shader-indexed descriptor table (63 atlas versions plus the lightmap). A D3D12 pipeline library caches PSOs in memory for the active renderer lifetime.
 - Opaque and cutout command lists can be recorded concurrently; the renderer falls back to one recording thread if worker creation fails. Both lists bind the color/depth targets explicitly with `OMSetRenderTargets` instead of `BeginRenderPass`: a D3D12 render pass may not span command lists, and the runtime removes a command list that violates this.

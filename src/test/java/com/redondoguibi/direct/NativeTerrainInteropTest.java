@@ -71,6 +71,7 @@ class NativeTerrainInteropTest {
             NativeDx12.waitInteropFrame(1);
             assertTrue(NativeDx12.frameMetrics()[0] >= 0);
             assertEquals(1, NativeDx12.frameMetrics()[2]);
+            NativeDx12.setProfilingEnabled(false);
             var objects = stack.pointers(colorObject, depthObject);
             assertTrue(WGLNVDXInterop.wglDXLockObjectsNV(device, objects));
             GL11.glBindTexture(GL11.GL_TEXTURE_2D, color);
@@ -97,6 +98,8 @@ class NativeTerrainInteropTest {
             new Matrix4f().translate(.1f, 0, 0).get(constants);
             NativeDx12.renderInterop(constants, 0, 0, 0, 256, 1, 0, new float[0], false, false);
             NativeDx12.waitInteropFrame(2);
+            NativeDx12.setProfilingEnabled(true);
+            assertEquals(-1,NativeDx12.frameMetrics()[0],"An unprofiled frame must not expose stale GPU timestamps");
             assertTrue(WGLNVDXInterop.wglDXLockObjectsNV(device, objects));
             GL11.glBindTexture(GL11.GL_TEXTURE_2D, color);
             GL11.glGetTexImage(GL11.GL_TEXTURE_2D, 0, GL11.GL_RGBA, GL11.GL_UNSIGNED_BYTE, colors);
@@ -191,7 +194,8 @@ class NativeTerrainInteropTest {
             assertTrue(WGLNVDXInterop.wglDXUnregisterObjectNV(device, colorObject)); colorObject = 0;
             assertTrue(WGLNVDXInterop.wglDXUnregisterObjectNV(device, depthObject)); depthObject = 0;
             long[] resized = NativeDx12.resizeInterop(16, 16);
-            colorObject = register(device, resized[0], GL11.glGenTextures());
+            int resizedColor=GL11.glGenTextures();
+            colorObject = register(device, resized[0], resizedColor);
             int resizedDepth = GL11.glGenTextures();
             depthObject = register(device, resized[1], resizedDepth);
             NativeDx12.clearTerrain();
@@ -205,6 +209,41 @@ class NativeTerrainInteropTest {
             assertEquals(1f, cleared.get(8 * 16 + 8), 1e-5);
             assertTrue(WGLNVDXInterop.wglDXUnlockObjectsNV(device, resizedObjects));
             GL11.glFinish(); NativeDx12.signalInteropFence(8);
+            // Real asynchronous GL PBO -> CPU -> D3D12 atlas -> WGL color round trip.
+            int glAtlas=GL11.glGenTextures();
+            AtlasRegionUpdates updates=new AtlasRegionUpdates();
+            try{
+                GL11.glBindTexture(GL11.GL_TEXTURE_2D,glAtlas);
+                GL11.glTexImage2D(GL11.GL_TEXTURE_2D,0,GL11.GL_RGBA8,4,4,0,GL11.GL_RGBA,GL11.GL_UNSIGNED_BYTE,red);
+                NativeDx12.updateTerrainAtlas(new ByteBuffer[]{atlas},4,4,false,1);
+                updates.mark(0,0,4,4);updates.update(glAtlas,0,1);
+                long deadline=System.nanoTime()+5_000_000_000L;
+                while(updates.hasPendingWork()&&System.nanoTime()<deadline){updates.update(glAtlas,0,1);Thread.yield();}
+                assertFalse(updates.hasPendingWork(),"asynchronous atlas update must complete");
+                light.rewind();NativeDx12.updateLightmap(light);
+                NativeDx12.updateTerrainSection(1,0,0,0,vertices,4,indices,new int[]{6,0,0});
+                NativeDx12.setVisibleSections(new long[]{1},1,true);
+                NativeDx12.renderInterop(constants,0,0,0,256,8,0,new float[0],false,true);
+                assertTrue(NativeDx12.waitInteropFrame(9));
+                assertTrue(WGLNVDXInterop.wglDXLockObjectsNV(device,resizedObjects));
+                GL11.glBindTexture(GL11.GL_TEXTURE_2D,resizedColor);ByteBuffer result=stack.malloc(16*16*4);
+                GL11.glGetTexImage(GL11.GL_TEXTURE_2D,0,GL11.GL_RGBA,GL11.GL_UNSIGNED_BYTE,result);
+                int pixel=(8*16+8)*4;assertTrue(Byte.toUnsignedInt(result.get(pixel))>240,"async patch must reach terrain");
+                assertTrue(Byte.toUnsignedInt(result.get(pixel+1))<10);assertTrue(Byte.toUnsignedInt(result.get(pixel+2))<10);
+                assertTrue(WGLNVDXInterop.wglDXUnlockObjectsNV(device,resizedObjects));GL11.glFinish();NativeDx12.signalInteropFence(9);
+                // Discard a submitted image without sampling or waiting. Completion of
+                // the following frame must still be ordered, and retain correct depth/color.
+                NativeDx12.renderInterop(constants,0,0,0,256,9,0,new float[0],false,true);
+                NativeDx12.signalInteropFence(10);
+                NativeDx12.renderInterop(constants,0,0,0,256,10,0,new float[0],false,true);
+                assertTrue(NativeDx12.waitInteropFrame(11));
+                assertTrue(WGLNVDXInterop.wglDXLockObjectsNV(device,resizedObjects));
+                GL11.glBindTexture(GL11.GL_TEXTURE_2D,resizedColor);GL11.glGetTexImage(GL11.GL_TEXTURE_2D,0,GL11.GL_RGBA,GL11.GL_UNSIGNED_BYTE,result);
+                assertTrue(Byte.toUnsignedInt(result.get(pixel))>240);
+                GL11.glBindTexture(GL11.GL_TEXTURE_2D,resizedDepth);GL11.glGetTexImage(GL11.GL_TEXTURE_2D,0,GL11.GL_RED,GL11.GL_FLOAT,cleared);
+                assertEquals(.25f,cleared.get(8*16+8),1e-5);
+                assertTrue(WGLNVDXInterop.wglDXUnlockObjectsNV(device,resizedObjects));GL11.glFinish();NativeDx12.signalInteropFence(11);
+            }finally{updates.close();GL11.glDeleteTextures(glAtlas);}
             assertFalse(NativeDx12.hasInteropGpuSyncFault());
             assertEquals(GL11.GL_NO_ERROR, GL11.glGetError());
         } finally {
