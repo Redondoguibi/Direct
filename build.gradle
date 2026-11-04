@@ -54,6 +54,13 @@ tasks.register('buildNativeRenderer', Exec) {
     commandLine 'cmake', '--build', nativeBuildDirectory.get().asFile.absolutePath, '--config', 'Release'
 }
 
+tasks.register('nativeSmokeTest', Exec) {
+    dependsOn tasks.named('buildNativeRenderer')
+    onlyIf { isWindowsHost }
+    commandLine 'ctest', '--test-dir', nativeBuildDirectory.get().asFile.absolutePath,
+            '-C', 'Release', '--output-on-failure'
+}
+
 tasks.named('processResources') {
     dependsOn tasks.named('buildNativeRenderer')
 }
@@ -144,6 +151,10 @@ configurations {
 }
 
 dependencies {
+    testImplementation platform('org.junit:junit-bom:5.11.4')
+    testImplementation 'org.junit.jupiter:junit-jupiter'
+    testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
+
     // Example optional mod dependency with JEI
     // The JEI API is declared for compile time use, while the full JEI artifact is used at runtime
     // compileOnly "mezz.jei:jei-${mc_version}-common-api:${jei_version}"
@@ -165,6 +176,36 @@ dependencies {
     // For more info:
     // http://www.gradle.org/docs/current/userguide/artifact_dependencies_tutorial.html
     // http://www.gradle.org/docs/current/userguide/dependency_management.html
+}
+
+tasks.withType(Test).configureEach {
+    useJUnitPlatform()
+}
+
+// Use the game's existing math/GL libraries for renderer regression tests.
+sourceSets.test.compileClasspath += sourceSets.main.compileClasspath
+sourceSets.test.runtimeClasspath += sourceSets.main.runtimeClasspath
+tasks.named('test', Test) {
+    useJUnitPlatform { excludeTags 'graphics' }
+}
+tasks.register('graphicsTest', Test) {
+    description = 'Renders the actual compositor shaders in a hidden OpenGL window (requires a graphics driver).'
+    group = 'verification'
+    testClassesDirs = sourceSets.test.output.classesDirs
+    classpath = sourceSets.test.runtimeClasspath + configurations.clientLegacyClasspath
+    useJUnitPlatform { includeTags 'graphics' }
+    shouldRunAfter tasks.named('test')
+}
+
+tasks.named('javadoc', Javadoc).configure {
+    source = fileTree('src/main/java/com/redondoguibi/direct/api') {
+        include '**/*.java'
+    }
+    classpath = sourceSets.main.compileClasspath
+}
+
+java {
+    withJavadocJar()
 }
 
 // This block of code expands all declared replace properties in the specified resource targets.

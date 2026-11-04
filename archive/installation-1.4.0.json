@@ -1,0 +1,25 @@
+{
+  "installedAt": "2026-11-03T18:46:47.304876",
+  "instance": "C:\\Users\\Sistemas\\curseforge\\minecraft\\Instances\\Direct",
+  "backup": "C:\\Criando Mods\\mod\\Direct\\archive\\modpack-before-1.4.0-20261103-184647.zip",
+  "jars": {
+    "direct-1.4.0.jar": "34a617f0133054420b8f2a1d453df040da8f6ffc3c4a06d193001950f3075216",
+    "raydiance-1.4.0.jar": "a6e3dae2cb94dfb602019050d46551fde356b8abbfc5e6a4a9b2131b83bf9c42"
+  },
+  "preservedSettings": {
+    "C:\\Users\\Sistemas\\curseforge\\minecraft\\Instances\\Direct\\config\\direct-client.toml": "2d95d90346479d66ec85dd2f0ab7ce08227f0503916dfdf975e23d7145299438",
+    "C:\\Users\\Sistemas\\curseforge\\minecraft\\Instances\\Direct\\config\\raydiance-client.toml": "87c30e8dd8f2945f96ba44eb33ad292d06d4dd55c44648db25ad8f4e827ed2f1",
+    "C:\\Users\\Sistemas\\curseforge\\minecraft\\Instances\\Direct\\config\\raydiance\\profiles.json": "9d4f7fcd8d32eef9215a956455228c20191395b0dc5e5ad80e0ebad44c75aaf9"
+  },
+  "minecraftOpenedByAgent": false,
+  "inGameValidated": false,
+  "supersededPreValidationJarSha256": "c050238dc870672f4fb2ae702049eb4cc734316bd2c338bc129ca022df1ba60e",
+  "finalizedAt": "2026-11-03T18:56:27.448731",
+  "disabledEffectsShaderVerified": true,
+  "initialSettingsHashes": {
+    "C:\\Users\\Sistemas\\curseforge\\minecraft\\Instances\\Direct\\config\\direct-client.toml": "d87fc2d0b91f950f735a4d5a00c5666331e3f2c58ddfa6d73ff2cb3b24c995f8",
+    "C:\\Users\\Sistemas\\curseforge\\minecraft\\Instances\\Direct\\config\\raydiance-client.toml": "94c92c741b9236531b129ceed507fd49a70529f437fbfd1200ca83f75d24c014",
+    "C:\\Users\\Sistemas\\curseforge\\minecraft\\Instances\\Direct\\config\\raydiance\\profiles.json": "9d4f7fcd8d32eef9215a956455228c20191395b0dc5e5ad80e0ebad44c75aaf9"
+  },
+  "userLaunchObserved": "User-confirmed manual close during startup, before entering world. Final optimized Direct JAR installed afterward."
+}

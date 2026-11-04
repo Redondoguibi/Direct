@@ -1,5 +1,6 @@
 package com.redondoguibi.direct.mixin;
 
+
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
@@ -17,7 +18,8 @@ abstract class TextureAtlasMixin {
             at = @At("RETURN"))
     private void direct$markAtlasDirty(SpriteLoader.Preparations preparations, CallbackInfo callback) {
         if (((TextureAtlas) (Object) this).location().equals(InventoryMenu.BLOCK_ATLAS)) {
-            Dx12GlInterop.blockAtlasUpdated();
+            Dx12GlInterop.blockAtlasUpdated((TextureAtlas)(Object)this);
         }
     }
+
 }

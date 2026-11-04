@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuite name="com.redondoguibi.direct.NativeMaterialsInteropTest" tests="1" skipped="0" failures="1" errors="0" timestamp="2026-11-03T23:07:46.885Z" hostname="DESKTOP-1EOIJJB" time="0.816">
+  <properties/>
+  <testcase name="wrappedTargetsExposeActualCurrentColorAndDepth()" classname="com.redondoguibi.direct.NativeMaterialsInteropTest" time="0.816">
+    <failure message="org.opentest4j.AssertionFailedError: expected: &lt;255&gt; but was: &lt;0&gt;" type="org.opentest4j.AssertionFailedError">org.opentest4j.AssertionFailedError: expected: &lt;255&gt; but was: &lt;0&gt;
+	at app//org.junit.jupiter.api.AssertionFailureBuilder.build(AssertionFailureBuilder.java:151)
+	at app//org.junit.jupiter.api.AssertionFailureBuilder.buildAndThrow(AssertionFailureBuilder.java:132)
+	at app//org.junit.jupiter.api.AssertEquals.failNotEqual(AssertEquals.java:197)
+	at app//org.junit.jupiter.api.AssertEquals.assertEquals(AssertEquals.java:150)
+	at app//org.junit.jupiter.api.AssertEquals.assertEquals(AssertEquals.java:145)
+	at app//org.junit.jupiter.api.Assertions.assertEquals(Assertions.java:531)
+	at app//com.redondoguibi.direct.NativeMaterialsInteropTest.wrappedTargetsExposeActualCurrentColorAndDepth(NativeMaterialsInteropTest.java:46)
+	at java.base@21.0.12.1/java.lang.reflect.Method.invoke(Method.java:580)
+	at java.base@21.0.12.1/java.util.ArrayList.forEach(ArrayList.java:1596)
+	at java.base@21.0.12.1/java.util.ArrayList.forEach(ArrayList.java:1596)
+</failure>
+  </testcase>
+  <system-out><![CDATA[WGL wrapped native color/depth accepted=true/true; GL error=0x0
+Wrapped depth GL internal format=0x1908
+]]></system-out>
+  <system-err><![CDATA[]]></system-err>
+</testsuite>

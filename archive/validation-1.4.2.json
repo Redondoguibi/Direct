@@ -1,0 +1,28 @@
+{
+  "version": "1.4.2",
+  "suites": {
+    "test": {
+      "tests": 35,
+      "failures": 0,
+      "errors": 0,
+      "skipped": 0
+    },
+    "graphicsTest": {
+      "tests": 17,
+      "failures": 0,
+      "errors": 0,
+      "skipped": 0
+    },
+    "validateLus": {
+      "tests": 1,
+      "failures": 0,
+      "errors": 0,
+      "skipped": 0
+    }
+  },
+  "nativeSmoke": "1/1 passed",
+  "minecraftStartedByAgent": false,
+  "inGameValidated": false,
+  "jarSha256": "80f318e29c196f42f346b2ea145053fc382abf9ec9ad381194f04baf27520757",
+  "nativeDllSha256": "338f8fa50467d2214e9855a91c78c5ec9997c1911ab14b2f3133758dfbeb2843"
+}

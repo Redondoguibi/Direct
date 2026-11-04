@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuite name="com.redondoguibi.direct.NativeMaterialsInteropTest" tests="3" skipped="0" failures="0" errors="0" timestamp="2026-11-04T20:00:26.395Z" hostname="DESKTOP-1EOIJJB" time="2.976">
+  <properties/>
+  <testcase name="sceneRoundTripPreservesRowsDepthAndGlState()" classname="com.redondoguibi.direct.NativeMaterialsInteropTest" time="1.703"/>
+  <testcase name="sortedGlassRespectsEntityOcclusionAndReturnsDepth()" classname="com.redondoguibi.direct.NativeMaterialsInteropTest" time="0.755"/>
+  <testcase name="materialControlsChangeOnlyTheirSurfacesAndZeroRestoresOutput()" classname="com.redondoguibi.direct.NativeMaterialsInteropTest" time="0.516"/>
+  <system-out><![CDATA[]]></system-out>
+  <system-err><![CDATA[]]></system-err>
+</testsuite>

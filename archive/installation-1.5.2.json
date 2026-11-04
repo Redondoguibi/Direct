@@ -1,0 +1,36 @@
+{
+  "version": "1.5.2",
+  "apiVersion": "1.4.0",
+  "jar": "C:\\Users\\Sistemas\\curseforge\\minecraft\\Instances\\Direct\\mods\\direct-1.5.2.jar",
+  "sha256": "e3b0fc2db71179f148384be1e16cf37760003faafa27caebabe9ce472b7bec06",
+  "backup": "C:\\Criando Mods\\mod\\Direct\\archive\\modpack-before-1.5.2-20261104-141230.zip",
+  "suites": {
+    "test": {
+      "tests": 36,
+      "failures": 0,
+      "errors": 0,
+      "skipped": 0
+    },
+    "graphicsTest": {
+      "tests": 25,
+      "failures": 0,
+      "errors": 0,
+      "skipped": 0
+    },
+    "validateLus": {
+      "tests": 1,
+      "failures": 0,
+      "errors": 0,
+      "skipped": 0
+    }
+  },
+  "nativeSmoke": "1/1 passed",
+  "settingsPreserved": {
+    "C:\\Users\\Sistemas\\curseforge\\minecraft\\Instances\\Direct\\config\\direct-client.toml": "9aa653bb8e419d43aad569d8f6f31fda4864fca68f7379c84edb2f110ebbe070",
+    "C:\\Users\\Sistemas\\curseforge\\minecraft\\Instances\\Direct\\config\\raydiance-client.toml": "2887605bdcca374275d7d95a62c30858eecf842c416886c6f5c34c9948810193"
+  },
+  "raydianceUnchanged": true,
+  "lusUnchanged": true,
+  "minecraftStartedByAgent": false,
+  "inGameValidated": false
+}

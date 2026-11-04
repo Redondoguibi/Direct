@@ -1,0 +1,10 @@
+{
+  "version": "1.4.1",
+  "jarSha256": "90da416b091c74295a4da60f1763ca1248953b71a16edcbbdbedabb7fed59303",
+  "backup": "C:\\Criando Mods\\mod\\Direct\\archive\\modpack-before-1.4.1-20261103-194608.zip",
+  "settingsPreserved": {
+    "C:\\Users\\Sistemas\\curseforge\\minecraft\\Instances\\Direct\\config\\direct-client.toml": "2d95d90346479d66ec85dd2f0ab7ce08227f0503916dfdf975e23d7145299438",
+    "C:\\Users\\Sistemas\\curseforge\\minecraft\\Instances\\Direct\\config\\raydiance-client.toml": "3e4cb308c5fdb1eba652341a40e31a4eca2a570f0f3e93d97dfe10b4daa97ea4"
+  },
+  "worldValidated": false
+}

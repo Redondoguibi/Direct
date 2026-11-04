@@ -1,0 +1,13 @@
+{
+  "version": "1.4.2",
+  "jar": "C:\\Users\\Sistemas\\curseforge\\minecraft\\Instances\\Direct\\mods\\direct-1.4.2.jar",
+  "jarSha256": "80f318e29c196f42f346b2ea145053fc382abf9ec9ad381194f04baf27520757",
+  "backup": "C:\\Criando Mods\\mod\\Direct\\archive\\modpack-before-1.4.2-20261103-220130.zip",
+  "settingsPreserved": {
+    "C:\\Users\\Sistemas\\curseforge\\minecraft\\Instances\\Direct\\config\\direct-client.toml": "50934944b7d9d2bc417e51f84c279e3d3e60d3666b29e00c4b599a39d793f4c4",
+    "C:\\Users\\Sistemas\\curseforge\\minecraft\\Instances\\Direct\\config\\raydiance-client.toml": "a209539125a7d6b35e2163949e847a5bf354e16d6d4c1aa114b1440e14d9826c"
+  },
+  "raydianceUnchangedSha256": "a6e3dae2cb94dfb602019050d46551fde356b8abbfc5e6a4a9b2131b83bf9c42",
+  "worldValidated": false,
+  "newColorRouteSelectedOnNextBackendInitialization": true
+}

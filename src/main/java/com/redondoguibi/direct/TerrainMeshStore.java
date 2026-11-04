@@ -4,12 +4,14 @@ import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.util.HashMap;
 import java.util.Map;
-import java.util.concurrent.ConcurrentLinkedQueue;
 
+import com.mojang.blaze3d.systems.RenderSystem;
 import com.mojang.blaze3d.vertex.DefaultVertexFormat;
 import com.mojang.blaze3d.vertex.MeshData;
 import com.mojang.blaze3d.vertex.VertexFormat;
 import com.mojang.blaze3d.vertex.VertexFormatElement;
+
+import it.unimi.dsi.fastutil.longs.Long2LongOpenHashMap;
 
 import net.minecraft.client.renderer.RenderType;
 import net.minecraft.client.renderer.chunk.SectionCompiler;
@@ -18,54 +20,103 @@ import net.minecraft.core.SectionPos;
 
 public final class TerrainMeshStore {
     // Precisa bater com o input layout nativo: posição uint16 x4, cor RGBA8, UV unorm16 x2.
-    private static final int OUTPUT_VERTEX_SIZE = 16;
-    private static final float POSITION_SCALE = 1024.0f;
-    private static final float POSITION_ORIGIN = -16.0f;
-    private static final int LAYER_COUNT = 3;
+    private static final int OUTPUT_VERTEX_SIZE = 20;
+    private static final int LAYER_COUNT = 4;
     private static final Object LOCK = new Object();
-    private static final ConcurrentLinkedQueue<SectionMesh> UPDATES = new ConcurrentLinkedQueue<>();
-    private static final Map<Long, Long> VERSIONS = new HashMap<>(); // guardado por LOCK
-    private static final ThreadLocal<long[]> CAPTURE_TOKEN = ThreadLocal.withInitial(() -> new long[2]);
-    private static long generation; // guardado por LOCK
+    // Coalesce pending work by section; guarded by LOCK with VERSIONS and generation.
+    private static final PendingUploadQueue<SectionMesh> PENDING = new PendingUploadQueue<>(SectionMesh::byteSize);
+    // Retains invalidation versions only while that section has captures in flight; the last finish evicts it.
+    private static final Long2LongOpenHashMap VERSIONS = new Long2LongOpenHashMap(); // guarded by LOCK
+    private static final Map<Long, Integer> IN_FLIGHT = new HashMap<>();
+    private static final ThreadLocal<CaptureToken> CAPTURE_TOKEN = ThreadLocal.withInitial(CaptureToken::new);
+    private static final java.util.Set<Long> NATIVE_PRESENT=new java.util.HashSet<>();
+    private static final TerrainOwnership<SectionMesh> OWNERSHIP = new TerrainOwnership<>();
+    private static RenderType[] layers;
+    private static long generation; // guarded by LOCK
+    private static int activeCaptures; // guarded by LOCK
+    private static long successfulCaptures; // guarded by LOCK
+    private static long lastCaptureActivityNanos; // guarded by LOCK
+    private static boolean reportedPendingBudgetOverrun; // guarded by LOCK
     private static volatile boolean captureEnabled;
+    private static volatile boolean captureFaulted;
+    private static volatile boolean captureReady;
+    private static volatile boolean replacementSafe = true;
+
+    static {
+        VERSIONS.defaultReturnValue(0L);
+    }
 
     private TerrainMeshStore() {
     }
 
-    /** HEAD de SectionCompiler.compile: fixa geração/versão antes da compilação começar. */
+    /** Fast gate for vanilla-only hooks; does not touch ownership maps or thread locals. */
+    public static boolean isCaptureEnabled() { return captureEnabled && !captureFaulted; }
+
+    /** HEAD of SectionCompiler.compile: captures an epoch/version token and tracks in-flight work. */
     public static void beginCapture(SectionPos sectionPos) {
-        long[] token = CAPTURE_TOKEN.get();
+        CaptureToken token = CAPTURE_TOKEN.get();
+        if (token.active) {
+            finishCapture(token);
+        }
+        token.active = false;
+        if (!captureEnabled || captureFaulted) {
+            return;
+        }
+        long key = sectionPos.asLong();
         synchronized (LOCK) {
-            token[0] = generation;
-            token[1] = VERSIONS.getOrDefault(sectionPos.asLong(), 0L);
+            token.key = key;
+            token.slot = OWNERSHIP.begin(key);
+            token.generation = generation;
+            token.version = VERSIONS.get(key);
+            token.active = true;
+            IN_FLIGHT.merge(key, 1, Integer::sum);
+            activeCaptures++;
+            captureReady = false;
+            lastCaptureActivityNanos = System.nanoTime();
         }
     }
 
-    public static void capture(SectionPos sectionPos, SectionCompiler.Results results) {
-        if (!captureEnabled || results == null) {
+    public static void capture(SectionPos sectionPos, SectionCompiler.Results results,net.minecraft.client.renderer.chunk.RenderChunkRegion region) {
+        CaptureToken token = CAPTURE_TOKEN.get();
+        if (!token.active) {
             return;
         }
-        long[] token = CAPTURE_TOKEN.get();
-        long captureGeneration = token[0];
-        long captureVersion = token[1];
+        boolean processed = false;
         long key = sectionPos.asLong();
         BlockPos origin = sectionPos.origin();
         try {
-            RenderType[] layers = supportedLayers();
-            Map<RenderType, MeshData> rendered = results.renderedLayers;
+            if (!captureEnabled || captureFaulted || results == null) {
+                return;
+            }
+            synchronized(LOCK){
+                if(generation!=token.generation||VERSIONS.get(key)!=token.version)return;
+            }
+            RenderType[] supported = supportedLayers();
+            var rendered = results.renderedLayers;
             long vertexCount = 0;
             long indexCount = 0;
-            for (RenderType layer : layers) {
-                MeshData mesh = rendered.get(layer);
-                if (isSupported(mesh)) {
-                    vertexCount += mesh.drawState().vertexCount();
-                    indexCount += mesh.drawState().indexCount();
+            MeshData[] meshes = new MeshData[LAYER_COUNT];
+            for (int layerIndex = 0; layerIndex < LAYER_COUNT; layerIndex++) {
+                MeshData mesh = rendered.get(supported[layerIndex]);
+                if (mesh == null) {
+                    continue;
                 }
+                if (!isSupported(mesh)) {
+                    // Keep vanilla rendering available when another mod injects an incompatible base-layer mesh.
+                    return;
+                }
+                if (!hasValidBuffers(mesh)) {
+                    throw new IllegalStateException("Vanilla terrain mesh has inconsistent buffer bounds.");
+                }
+                meshes[layerIndex] = mesh;
+                vertexCount += mesh.drawState().vertexCount();
+                indexCount += mesh.drawState().indexCount();
             }
             if (vertexCount == 0 || indexCount == 0
                     || vertexCount > Integer.MAX_VALUE / OUTPUT_VERTEX_SIZE
                     || indexCount > Integer.MAX_VALUE / Integer.BYTES) {
-                publish(captureGeneration, captureVersion, SectionMesh.empty(key));
+                // Empty compilation is retired by the vanilla commit hook.
+                processed = true;
                 return;
             }
 
@@ -76,49 +127,41 @@ public final class TerrainMeshStore {
             int[] layerIndexCounts = new int[LAYER_COUNT];
             int vertexBase = 0;
             for (int layerIndex = 0; layerIndex < LAYER_COUNT; layerIndex++) {
-                MeshData mesh = rendered.get(layers[layerIndex]);
-                if (!isSupported(mesh)) {
+                MeshData mesh = meshes[layerIndex];
+                if (mesh == null) {
                     continue;
                 }
                 MeshData.DrawState drawState = mesh.drawState();
-                ByteBuffer sourceVertices = mesh.vertexBuffer().duplicate().order(ByteOrder.nativeOrder());
-                ByteBuffer sourceIndices = mesh.indexBuffer().duplicate().order(ByteOrder.nativeOrder());
-                VertexFormat format = drawState.format();
-                int stride = format.getVertexSize();
-                int positionOffset = format.getOffset(VertexFormatElement.POSITION);
-                int colorOffset = format.getOffset(VertexFormatElement.COLOR);
-                int uvOffset = format.getOffset(VertexFormatElement.UV0);
-                for (int vertex = 0; vertex < drawState.vertexCount(); vertex++) {
-                    int offset = sourceVertices.position() + vertex * stride;
-                    vertices.putShort(packPosition(sourceVertices.getFloat(offset + positionOffset)));
-                    vertices.putShort(packPosition(sourceVertices.getFloat(offset + positionOffset + Float.BYTES)));
-                    vertices.putShort(packPosition(sourceVertices.getFloat(offset + positionOffset + 2 * Float.BYTES)));
-                    vertices.putShort((short) 0);
-                    vertices.putInt(sourceVertices.getInt(offset + colorOffset));
-                    vertices.putShort(packUnorm16(sourceVertices.getFloat(offset + uvOffset)));
-                    vertices.putShort(packUnorm16(sourceVertices.getFloat(offset + uvOffset + Float.BYTES)));
-                }
-                int indexSize = drawState.indexType().bytes;
-                for (int index = 0; index < drawState.indexCount(); index++) {
-                    int sourceIndex = sourceIndices.position() + index * indexSize;
-                    int value = indexSize == Short.BYTES
-                            ? Short.toUnsignedInt(sourceIndices.getShort(sourceIndex))
-                            : sourceIndices.getInt(sourceIndex);
-                    indices.putInt(value + vertexBase);
-                }
+                packVerticesV2(vertices, mesh.vertexBuffer(), drawState, origin, region,token.workspace);
+                packIndices(indices, mesh.indexBuffer(), drawState, vertexBase);
                 layerIndexCounts[layerIndex] = drawState.indexCount();
                 vertexBase += drawState.vertexCount();
             }
             vertices.flip();
             indices.flip();
-            publish(captureGeneration, captureVersion, new SectionMesh(key, origin.getX(), origin.getY(),
-                    origin.getZ(), vertices, vertexBase, indices, layerIndexCounts));
-        } catch (IllegalArgumentException | IndexOutOfBoundsException exception) {
+            synchronized (LOCK) {
+                if(generation==token.generation&&VERSIONS.get(key)==token.version)
+                    OWNERSHIP.stage(token.slot,new SectionMesh(key,origin.getX(),origin.getY(),origin.getZ(),vertices,vertexBase,indices,layerIndexCounts,null),rendered.values());
+            }
+            processed = true;
+        } catch (RuntimeException exception) {
+            captureFaulted = true;
+            captureEnabled = false;
+            captureReady = false;
+            synchronized (LOCK) {
+                LOCK.notifyAll();
+            }
             Direct.LOGGER.error("Could not extract vanilla terrain mesh for section {}.", sectionPos, exception);
-            publish(captureGeneration, captureVersion, SectionMesh.empty(key));
+        } finally {
+            synchronized (LOCK) {
+                if (processed && token.generation == generation) {
+                    successfulCaptures++;
+                }
+                lastCaptureActivityNanos = System.nanoTime();
+            }
+            finishCapture(token);
         }
     }
-
     /** Seção saiu da distância/foi reposicionada: remove e invalida compilações em andamento. */
     public static void remove(SectionPos sectionPos) {
         if (!captureEnabled) {
@@ -126,8 +169,14 @@ public final class TerrainMeshStore {
         }
         long key = sectionPos.asLong();
         synchronized (LOCK) {
-            VERSIONS.merge(key, 1L, Long::sum);
-            UPDATES.add(SectionMesh.empty(key));
+            captureReady = false;
+            OWNERSHIP.remove(key);
+            lastCaptureActivityNanos = System.nanoTime();
+            VERSIONS.addTo(key, 1L);
+            if(NATIVE_PRESENT.contains(key)||PENDING.containsKey(key))enqueuePendingLocked(SectionMesh.empty(key));
+            if (IN_FLIGHT.getOrDefault(key, 0) == 0) {
+                VERSIONS.remove(key);
+            }
         }
     }
 
@@ -135,7 +184,14 @@ public final class TerrainMeshStore {
         synchronized (LOCK) {
             generation++;
             VERSIONS.clear();
-            UPDATES.clear();
+            PENDING.clear();
+            OWNERSHIP.clear();NATIVE_PRESENT.clear();
+            successfulCaptures = 0L;
+            replacementSafe = true;
+            captureReady = false;
+            lastCaptureActivityNanos = System.nanoTime();
+            reportedPendingBudgetOverrun = false;
+            LOCK.notifyAll();
         }
         if (NativeLibrary.isLoaded()) {
             NativeDx12.clearTerrain();
@@ -143,12 +199,69 @@ public final class TerrainMeshStore {
     }
 
     public static void setCaptureEnabled(boolean enabled) {
+        if (enabled) {
+            captureFaulted = false;
+            replacementSafe = true;
+        }
+        captureReady = false;
         captureEnabled = enabled;
+        synchronized (LOCK) {
+            if (!enabled) {
+                LOCK.notifyAll();
+            }
+        }
+    }
+
+    /** True only after captures are drained and the terrain set has been quiet for a short grace period. */
+    public static boolean isCaptureReady() {
+        return captureReady && replacementSafe && captureEnabled && !captureFaulted;
+    }
+
+    public static boolean canReplaceVisible(long[] keys, int count) {
+        synchronized (LOCK) {
+            if (!captureEnabled || captureFaulted || !replacementSafe) return false;
+            for (int i = 0; i < count; i++) {
+                long key = keys[i];
+                if (!OWNERSHIP.current(key)) return false;
+            }
+            return true;
+        }
+    }
+
+    public static boolean hasCaptureFault() {
+        return captureFaulted;
+    }
+    static long[] pendingMetrics(){synchronized(LOCK){return new long[]{PENDING.bytes(),PENDING.size(),activeCaptures};}}
+
+    /** Closes a capture if SectionCompiler.compile exits exceptionally before its return hook. */
+    public static void finishCaptureForCurrentThread() {
+        CaptureToken token = CAPTURE_TOKEN.get();
+        if (token.active) {
+            finishCapture(token);
+        }
+    }
+
+    public static void clearCaptureFault() {
+        captureFaulted = false;
     }
 
     public static void uploadPending() {
-        SectionMesh update;
-        while ((update = UPDATES.poll()) != null) {
+        long uploadStart=RendererMetrics.recording?System.nanoTime():0;
+        final int maxUpdates = ClientConfig.MAX_MESH_UPLOADS_PER_FRAME.get();
+        final long maxBytes = ClientConfig.MAX_MESH_UPLOAD_MIB_PER_FRAME.get() * 1024L * 1024L;
+        int uploaded = 0;
+        long uploadedBytes = 0L;
+
+        while (uploaded < maxUpdates) {
+            SectionMesh update;
+            synchronized (LOCK) {
+                update=PENDING.poll(maxBytes-uploadedBytes,uploaded==0,
+                        candidate->candidate.vertices()==null||OWNERSHIP.accepts(candidate.key(),candidate.receipt()));
+                LOCK.notifyAll();
+            }
+            if (update == null) {
+                break;
+            }
             if (update.vertices() == null) {
                 NativeDx12.removeTerrainSection(update.key());
             } else {
@@ -156,22 +269,35 @@ public final class TerrainMeshStore {
                         update.sectionZ(), update.vertices(), update.vertexCount(), update.indices(),
                         update.layerIndexCounts());
             }
+            synchronized (LOCK) {
+                if(update.vertices()==null)NATIVE_PRESENT.remove(update.key());else NATIVE_PRESENT.add(update.key());
+                OWNERSHIP.nativeUploaded(update.key(),update.receipt());
+            }
+            uploaded++;
+            uploadedBytes += update.byteSize();
+        }
+
+        if(RendererMetrics.recording){RendererMetrics.uploadNanos+=System.nanoTime()-uploadStart;RendererMetrics.uploadSections+=uploaded;RendererMetrics.uploadBytes+=uploadedBytes;}
+        synchronized (LOCK) {
+            long quietNanos = System.nanoTime() - lastCaptureActivityNanos;
+            if (captureEnabled && !captureFaulted && successfulCaptures > 0 && PENDING.isEmpty()
+                    && activeCaptures == 0 && quietNanos >= 750_000_000L) {
+                captureReady = true;
+            }
+            if (PENDING.bytes() < (long) ClientConfig.MAX_PENDING_MESH_MIB.get() * 1024L * 1024L) {
+                reportedPendingBudgetOverrun = false;
+            }
         }
     }
 
-    /** Posição local da seção em [-16, 48) com precisão de 1/1024 de bloco. */
-    private static short packPosition(float value) {
-        int packed = Math.round((value - POSITION_ORIGIN) * POSITION_SCALE);
-        return (short) Math.max(0, Math.min(0xFFFF, packed));
-    }
-
-    private static short packUnorm16(float value) {
-        return (short) Math.round(Math.max(0.0f, Math.min(1.0f, value)) * 0xFFFF);
-    }
-
     private static RenderType[] supportedLayers() {
-        // A ordem precisa bater com kLayerAlphaCutoff no nativo.
-        return new RenderType[] {RenderType.solid(), RenderType.cutoutMipped(), RenderType.cutout()};
+        RenderType[] cached = layers;
+        if (cached == null) {
+            // A ordem precisa bater com kLayerAlphaCutoff no nativo.
+            cached = new RenderType[] {RenderType.solid(), RenderType.cutoutMipped(), RenderType.cutout(), RenderType.translucent()};
+            layers = cached;
+        }
+        return cached;
     }
 
     private static boolean isSupported(MeshData mesh) {
@@ -179,19 +305,132 @@ public final class TerrainMeshStore {
                 && mesh.drawState().mode() == VertexFormat.Mode.QUADS;
     }
 
-    private static void publish(long captureGeneration, long captureVersion, SectionMesh mesh) {
-        synchronized (LOCK) {
-            if (generation != captureGeneration || VERSIONS.getOrDefault(mesh.key(), 0L) != captureVersion) {
-                return;
-            }
-            UPDATES.add(mesh);
+    private static boolean hasValidBuffers(MeshData mesh) {
+        MeshData.DrawState drawState = mesh.drawState();
+        VertexFormat format = drawState.format();
+        int stride = format.getVertexSize();
+        int indexSize = drawState.indexType().bytes;
+        int positionOffset = format.getOffset(VertexFormatElement.POSITION);
+        int colorOffset = format.getOffset(VertexFormatElement.COLOR);
+        int uvOffset = format.getOffset(VertexFormatElement.UV0);
+        ByteBuffer indexBuffer = mesh.indexBuffer();
+        boolean validIndices = indexBuffer == null
+                ? TerrainIndexPacker.hasValidSequentialQuadIndices(drawState.vertexCount(), drawState.indexCount())
+                : (long) drawState.indexCount() * indexSize <= indexBuffer.remaining();
+        return drawState.vertexCount() >= 0 && drawState.indexCount() >= 0
+                && stride > 0 && positionOffset >= 0 && colorOffset >= 0 && uvOffset >= 0
+                && positionOffset + 3 * Float.BYTES <= stride
+                && colorOffset + Integer.BYTES <= stride
+                && uvOffset + 2 * Float.BYTES <= stride
+                && (indexSize == Short.BYTES || indexSize == Integer.BYTES)
+                && (long) drawState.vertexCount() * stride <= mesh.vertexBuffer().remaining()
+                && validIndices;
+    }
+
+    static void packVertices(ByteBuffer destination, ByteBuffer source, MeshData.DrawState drawState) {
+        VertexFormat format = drawState.format();
+        TerrainBufferPacker.packVertices(destination, source, drawState.vertexCount(), format.getVertexSize(),
+                format.getOffset(VertexFormatElement.POSITION), format.getOffset(VertexFormatElement.COLOR),
+                format.getOffset(VertexFormatElement.UV0), format.getOffset(VertexFormatElement.UV2));
+    }
+
+    private static void packVerticesV2(ByteBuffer destination,ByteBuffer source,MeshData.DrawState drawState,BlockPos origin,net.minecraft.client.renderer.chunk.RenderChunkRegion region,CaptureWorkspace<net.minecraft.world.level.block.state.BlockState> workspace){
+        var format=drawState.format();int stride=format.getVertexSize(),position=format.getOffset(VertexFormatElement.POSITION),normal=format.getOffset(VertexFormatElement.NORMAL),uv=format.getOffset(VertexFormatElement.UV0);
+        int quads=(drawState.vertexCount()+3)/4;
+        byte[] materials=workspace.materials(quads);
+        ByteBuffer input=source.duplicate().order(ByteOrder.nativeOrder());var block=new BlockPos.MutableBlockPos();
+        for(int q=0;q<quads;q++){
+            int first=q*4,n=Math.min(4,drawState.vertexCount()-first);float x=0,y=0,z=0,u=0,v=0;
+            for(int i=0;i<n;i++){int base=input.position()+(first+i)*stride,at=base+position;x+=input.getFloat(at);y+=input.getFloat(at+4);z+=input.getFloat(at+8);u+=input.getFloat(base+uv);v+=input.getFloat(base+uv+4);}
+            // Sprite identity also covers flowing/waterlogged faces without classifying the
+            // surrounding glass/wood model as water. Resource reload publishes a new UV snapshot.
+            if(TerrainMaterials.waterSprite(u/n,v/n)){materials[q]=TerrainMaterials.WATER;continue;}
+            int at=input.position()+first*stride+normal;
+            block.set(origin.getX()+(int)Math.floor(x/n-input.get(at)/127f*.02f),origin.getY()+(int)Math.floor(y/n-input.get(at+1)/127f*.02f),origin.getZ()+(int)Math.floor(z/n-input.get(at+2)/127f*.02f));
+            var state=region.getBlockState(block);materials[q]=workspace.material(state,TerrainMaterials::classify);
+        }
+        TerrainBufferPacker.packVertices20(destination,source,drawState.vertexCount(),stride,position,format.getOffset(VertexFormatElement.COLOR),format.getOffset(VertexFormatElement.UV0),format.getOffset(VertexFormatElement.UV2),normal,materials);
+    }
+
+    private static void packIndices(ByteBuffer destination, ByteBuffer source, MeshData.DrawState drawState,
+            int vertexBase) {
+        int indexCount = drawState.indexCount();
+        int indexSize = drawState.indexType().bytes;
+        if (source == null) {
+            TerrainIndexPacker.packSequentialQuadIndices(destination, indexCount, vertexBase);
+            return;
+        }
+        TerrainBufferPacker.packIndices(destination, source, indexCount, indexSize, vertexBase);
+    }
+
+    public static void vanillaUploaded(MeshData source,com.mojang.blaze3d.vertex.VertexBuffer buffer){
+        if(!isCaptureEnabled())return;
+        synchronized(LOCK){if(isCaptureEnabled())OWNERSHIP.uploaded(source,buffer);}
+    }
+    public static void vanillaCommitted(net.minecraft.client.renderer.chunk.SectionRenderDispatcher.RenderSection section){
+        if(!captureEnabled||captureFaulted)return;
+        long key=SectionPos.of(section.getOrigin()).asLong();
+        var compiled=section.getCompiled();
+        var buffers=new java.util.ArrayList<com.mojang.blaze3d.vertex.VertexBuffer>();
+        for(var layer:supportedLayers())if(!compiled.isEmpty(layer))buffers.add(section.getBuffer(layer));
+        synchronized(LOCK){
+            var receipt=OWNERSHIP.commit(key,buffers);
+            var mesh=receipt==null?null:receipt.take();
+            if(mesh!=null)enqueuePendingLocked(new SectionMesh(key,mesh.sectionX(),mesh.sectionY(),mesh.sectionZ(),mesh.vertices(),mesh.vertexCount(),mesh.indices(),mesh.layerIndexCounts(),receipt));
+            else if(receipt==null&&(NATIVE_PRESENT.contains(key)||PENDING.containsKey(key)))enqueuePendingLocked(SectionMesh.empty(key));
+        }
+    }
+    static boolean owns(long key){synchronized(LOCK){return captureEnabled&&!captureFaulted&&OWNERSHIP.current(key);}}
+    static long[] shadowKeys(){synchronized(LOCK){return OWNERSHIP.nativeKeys();}}
+
+    /** Must be called while holding LOCK. */
+    private static void enqueuePendingLocked(SectionMesh mesh) {
+        long key = mesh.key();
+        PENDING.put(key,mesh);
+        long budget=(long)ClientConfig.MAX_PENDING_MESH_MIB.get()*1024*1024;
+        if(PENDING.bytes()>budget&&!reportedPendingBudgetOverrun){
+            Direct.LOGGER.warn("Committed Direct terrain queue exceeds its soft budget ({} MiB); keeping per-section fallback while uploads drain.",ClientConfig.MAX_PENDING_MESH_MIB.get());
+            reportedPendingBudgetOverrun=true;
         }
     }
 
+    private static void finishCapture(CaptureToken token) {
+        synchronized (LOCK) {
+            if (!token.active) {
+                return;
+            }
+            token.active = false;
+            token.workspace.clearStates();
+            activeCaptures = Math.max(0, activeCaptures - 1);
+            int inFlight = IN_FLIGHT.getOrDefault(token.key, 0);
+            if (inFlight <= 1) {
+                IN_FLIGHT.remove(token.key);
+                VERSIONS.remove(token.key);
+            } else {
+                IN_FLIGHT.put(token.key, inFlight - 1);
+            }
+            lastCaptureActivityNanos = System.nanoTime();
+            LOCK.notifyAll();
+        }
+    }
+
+    private static final class CaptureToken {
+        final CaptureWorkspace<net.minecraft.world.level.block.state.BlockState> workspace=new CaptureWorkspace<>();
+        long key;
+        long generation;
+        long version;
+        boolean active;
+        TerrainOwnership.Slot slot;
+    }
+
     private record SectionMesh(long key, int sectionX, int sectionY, int sectionZ,
-            ByteBuffer vertices, int vertexCount, ByteBuffer indices, int[] layerIndexCounts) {
+            ByteBuffer vertices, int vertexCount, ByteBuffer indices, int[] layerIndexCounts,Object receipt) {
+        long byteSize() {
+            return vertices == null ? 0L : (long) vertices.remaining() + indices.remaining();
+        }
+
         static SectionMesh empty(long key) {
-            return new SectionMesh(key, 0, 0, 0, null, 0, null, null);
+            return new SectionMesh(key, 0, 0, 0, null, 0, null, null,null);
         }
     }
 }
