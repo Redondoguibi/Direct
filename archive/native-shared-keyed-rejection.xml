@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuite name="com.redondoguibi.direct.NativeMaterialsInteropTest" tests="1" skipped="0" failures="1" errors="0" timestamp="2026-11-04T20:01:29.650Z" hostname="DESKTOP-1EOIJJB" time="2.52">
+  <properties/>
+  <testcase name="materialControlsChangeOnlyTheirSurfacesAndZeroRestoresOutput()" classname="com.redondoguibi.direct.NativeMaterialsInteropTest" time="2.52">
+    <failure message="java.lang.IllegalStateException: Could not register terrain color for OpenGL; Win32 error=127" type="java.lang.IllegalStateException">java.lang.IllegalStateException: Could not register terrain color for OpenGL; Win32 error=127
+	at com.redondoguibi.direct.InteropColorTarget.register(InteropColorTarget.java:84)
+	at com.redondoguibi.direct.InteropColorTarget.create(InteropColorTarget.java:69)
+	at com.redondoguibi.direct.NativeMaterialsInteropTestBase.registerTargets(NativeMaterialsInteropTest.java:17)
+	at com.redondoguibi.direct.NativeMaterialsInteropTestBase.open(NativeMaterialsInteropTest.java:28)
+	at java.base/java.lang.reflect.Method.invoke(Method.java:580)
+	at java.base/java.util.ArrayList.forEach(ArrayList.java:1596)
+	at java.base/java.util.ArrayList.forEach(ArrayList.java:1596)
+</failure>
+  </testcase>
+  <system-out><![CDATA[]]></system-out>
+  <system-err><![CDATA[]]></system-err>
+</testsuite>

@@ -10,7 +10,7 @@ import java.util.List;
  */
 public interface DirectRenderService {
     /** Current public API semantic version. */
-    String API_VERSION = "1.3.0";
+    String API_VERSION = "1.4.0";
 
     /**
      * Returns the active service. The service is available on the client after client setup.
@@ -75,6 +75,16 @@ public interface DirectRenderService {
      */
     default void requestTerrainEffects(String owner, DirectTerrainEffects settings) {
         throw new UnsupportedOperationException("Geometry effects unavailable");
+    }
+    /**
+     * Atomically requests geometry and materials for the same owner (API 1.4).
+     * @param owner stable owner id
+     * @param settings geometry settings
+     * @param materials material settings
+     */
+    default void requestTerrainEffects(String owner, DirectTerrainEffects settings, DirectMaterialEffects materials) {
+        if (!DirectMaterialEffects.NONE.equals(materials)) throw new UnsupportedOperationException("Material effects unavailable");
+        requestTerrainEffects(owner, settings);
     }
     /**
      * Releases the client's request without disabling terrain. Release on unload/disable.

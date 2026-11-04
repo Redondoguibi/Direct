@@ -12,6 +12,7 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 abstract class VertexBufferMixin {
     @Inject(method="upload",at=@At("RETURN"))
     private void direct$uploaded(MeshData mesh,CallbackInfo ci){
+        if(!TerrainMeshStore.isCaptureEnabled())return;
         var buffer=(VertexBuffer)(Object)this;
         if(!buffer.isInvalid())TerrainMeshStore.vanillaUploaded(mesh,buffer);
     }

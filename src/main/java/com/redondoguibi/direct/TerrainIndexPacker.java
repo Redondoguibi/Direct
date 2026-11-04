@@ -22,10 +22,9 @@ final class TerrainIndexPacker {
         if ((long) indexCount * Integer.BYTES > destination.remaining()) {
             throw new IllegalArgumentException("Destination buffer is too small for sequential quad indices.");
         }
-        for (int index = 0; index < indexCount; index++) {
-            int value = index / QUAD_INDEX_PATTERN.length * 4
-                    + QUAD_INDEX_PATTERN[index % QUAD_INDEX_PATTERN.length];
-            destination.putInt(value + vertexBase);
+        for (int base = vertexBase, remaining=indexCount; remaining>0; remaining-=6,base+=4) {
+            destination.putInt(base).putInt(base+1).putInt(base+2)
+                    .putInt(base+2).putInt(base+3).putInt(base);
         }
     }
 }

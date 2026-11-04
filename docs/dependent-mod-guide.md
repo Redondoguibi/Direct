@@ -8,11 +8,14 @@ For a Direct-only extension, compile against its JAR as `compileOnly` and declar
 
 ```java
 DirectRenderService service = DirectRenderService.getInstance();
-String apiVersion = service.apiVersion(); // 1.3.0
+String apiVersion = service.apiVersion(); // 1.4.0
 DirectRenderCapabilities caps = service.capabilities();
 ```
 
 `DirectRenderService.API_VERSION` follows SemVer independently of Direct's release version. A consumer requiring API 1.x should reject an unknown major version and should check `capabilities()` before using optional facilities. The service and registration event are client-only.
+
+API 1.4 adds the optional `material-lighting` feature and the three-argument
+`requestTerrainEffects(owner, geometry, materials)` overload. See [material settings](materiais-1.5.0.md).
 
 ## Registering a pass
 

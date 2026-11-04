@@ -1,4 +1,12 @@
-# Validação Direct 1.4.0 / API 1.3.0
+# Validação Direct 1.5.0 / API 1.4.0
+
+Na 1.5.0 passaram 36 testes unitários, 19 gráficos, validateLus (1) e smoke WARP (1/1).
+Veja [cobertura de materiais e limitações](materiais-1.5.0.md).
+
+Na 1.4.2 passaram 35 testes unitários, 17 gráficos, validateLus (1 teste adicional)
+e smoke WARP (1/1). As rotas de cor compartilhada e copiada são exercitadas; o teste
+de rejeição de armazenamento após resize confirma fallback com pixels preservados.
+Veja [mudança de interop, medições e pendências](interop-cor-1.4.2.md).
 
 Java e DLL são distribuídos juntos. Build, JUnit, testes gráficos de GPU e smoke WARP:
 

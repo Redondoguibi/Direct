@@ -24,6 +24,6 @@ abstract class RenderSectionMixin {
 
     @Inject(method = "reset", at = @At("HEAD"))
     private void direct$removeTerrain(CallbackInfo callback) {
-        TerrainMeshStore.remove(SectionPos.of(getOrigin()));
+        if(TerrainMeshStore.isCaptureEnabled())TerrainMeshStore.remove(SectionPos.of(getOrigin()));
     }
 }

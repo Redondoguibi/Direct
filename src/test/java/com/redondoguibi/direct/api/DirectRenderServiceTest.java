@@ -41,6 +41,24 @@ class DirectRenderServiceTest {
         assertEquals(DirectTerrainEffects.NONE,DirectRenderApi.terrainEffects());
     }
 
+    @Test void materialsFollowOwnerAndLegacyReplacementClearsThem() {
+        var materials=new DirectMaterialEffects(.2f,.3f,.4f,.5f);
+        try {
+            service.requestTerrainEffects("z.material",DirectTerrainEffects.NONE,materials);
+            service.requestTerrainEffects("a.material",DirectTerrainEffects.NONE);
+            assertEquals(DirectMaterialEffects.NONE,DirectRenderApi.terrainSettings().materials());
+            service.releaseTerrainEffects("a.material");
+            assertEquals(materials,DirectRenderApi.terrainSettings().materials());
+            assertThrows(IllegalArgumentException.class,()->new DirectMaterialEffects(0,Float.NaN,0,0));
+            assertThrows(IllegalArgumentException.class,()->new DirectMaterialEffects(0,0,0,1.01f));
+            assertThrows(NullPointerException.class,()->service.requestTerrainEffects("z.material",DirectTerrainEffects.NONE,null));
+            assertEquals(materials,DirectRenderApi.terrainSettings().materials());
+            service.requestTerrainEffects("z.material",DirectTerrainEffects.NONE);
+            assertEquals(DirectMaterialEffects.NONE,DirectRenderApi.terrainSettings().materials());
+        } finally {service.releaseTerrainEffects("a.material");service.releaseTerrainEffects("z.material");}
+        assertEquals(DirectMaterialEffects.NONE,DirectRenderApi.terrainSettings().materials());
+    }
+
     @AfterEach
     void clearPasses() {
         for (DirectRenderPass pass : service.passes()) {

@@ -40,6 +40,8 @@ constexpr UINT kDrawConstantCount = 5;
 constexpr UINT kMaxExtensionPasses = 8;
 constexpr UINT kPassUniformFloatCount = 60;
 constexpr UINT kPassConstantCount = 64;
+constexpr UINT kGeometryConstantCount = 68;
+constexpr UINT kGeometryConstantBytes = 512; // CBV allocation remains 256-byte aligned.
 constexpr jsize kMaxAtlasLevels = 16;
 constexpr float kSectionRadius = 13.8564f; // sqrt(3) * 8
 constexpr float kClearColor[4] = {0.0f, 0.0f, 0.0f, 0.0f};
@@ -67,7 +69,7 @@ cbuffer DrawConstants : register(b1) { float3 sectionOffset; float alphaCutoff; 
 Texture2D atlasTextures[ATLAS_SLOTS] : register(t0);
 SamplerState atlasSampler : register(s0);
 SamplerState lightSampler : register(s1);
-cbuffer GeometryConstants : register(b2) { float4x4 shadowVP; float4 strengths; float4 sunTime; float4 geometryParams; float4x4 inverseVP; float4x4 worldVP; float4 cameraPhase; };
+cbuffer GeometryConstants : register(b2) { float4x4 shadowVP; float4 strengths; float4 sunTime; float4 geometryParams; float4x4 inverseVP; float4x4 worldVP; float4 cameraPhase; float4 materials; };
 Texture2D SceneColor : register(t64);
 Texture2D<float> SceneDepth : register(t65);
 Texture2D<float> ShadowMap : register(t66);
@@ -81,7 +83,7 @@ struct VertexInput { uint4 position : POSITION; float4 color : COLOR; float2 uv 
 };
 struct VertexOutput { float4 position : SV_Position; float4 color : COLOR; float2 uv : TEXCOORD0; float distance : TEXCOORD1;
 #if DIRECT_GEOMETRY
-    float3 world:TEXCOORD2; float3 normal:TEXCOORD3; nointerpolation uint material:TEXCOORD4;
+    float3 world:TEXCOORD2; float3 normal:TEXCOORD3; nointerpolation uint material:TEXCOORD4; float4 surface:TEXCOORD5;
 #endif
 };
 VertexOutput vsMain(VertexInput input) {
@@ -98,6 +100,7 @@ VertexOutput vsMain(VertexInput input) {
         world.xz+=float2(wave,sin(wave+sunTime.w))*strengths.w*.06*weight;
     }
     output.world=world;output.normal=input.normal.xyz;output.material=material;
+    output.surface=float4(input.color.rgb,saturate(float(input.position.w >> 8)/240.0));
 #endif
     output.position = mul(viewProjection, float4(world, 1.0));
     float2 lightUv = float2(input.position.w & 255, input.position.w >> 8) / 256.0;
@@ -109,6 +112,26 @@ VertexOutput vsMain(VertexInput input) {
     output.uv = input.uv;
     return output;
 }
+#if DIRECT_GEOMETRY
+float3 materialColor(VertexOutput input,float3 color,float3 albedo,float sunVisibility){
+    float3 n=input.normal/max(length(input.normal),.00001);
+    float sky=smoothstep(.5,1,input.surface.w);
+    float wet=materials.y*geometryParams.z*sky*saturate(n.y);
+    if(input.material==4||input.material==5||input.material==6)wet=0;
+    color*=1-wet*.22;
+    float gloss=materials.x*(input.material==7?.65:input.material==4?.45:input.material==5?.5:.04)+wet*.35;
+    if(gloss>0 && geometryParams.y>.02){
+        float3 view=-input.world/max(length(input.world),.00001);
+        float3 light=sunTime.xyz/max(length(sunTime.xyz),.00001);
+        float3 halfVector=view+light;halfVector/=max(length(halfVector),.00001);
+        float exponent=input.material==7?48:input.material==4||input.material==5?96:24;
+        float highlight=pow(saturate(dot(n,halfVector)),exponent)*saturate(dot(n,light));
+        color+=float3(1,.94,.82)*highlight*gloss*sky*geometryParams.y*(1-geometryParams.z*.85)*sunVisibility;
+    }
+    if(input.material==6 && materials.z>0)color=lerp(color,max(color,albedo),materials.z);
+    return color;
+}
+#endif
 struct PixelOutput { float4 color : SV_Target0; };
 PixelOutput psMain(VertexOutput input) {
     float4 texel;
@@ -122,21 +145,24 @@ PixelOutput psMain(VertexOutput input) {
 #ifdef DIRECT_CUTOUT
     clip(result.a - alphaCutoff);
 #endif
-    if (input.distance > fogParams.x) {
-        float fog = input.distance < fogParams.y ? smoothstep(fogParams.x, fogParams.y, input.distance) : 1.0;
-        result.rgb = lerp(result.rgb, fogColor.rgb, fog * fogColor.a);
-    }
 #if DIRECT_GEOMETRY
+    float sunVisibility=1;
     if(strengths.x>0 && geometryParams.x>.5 && geometryParams.y>.02){
         float4 lightClip=mul(shadowVP,float4(input.world,1));float3 q=lightClip.xyz/lightClip.w;
         float2 uv=q.xy*float2(.5,-.5)+.5;
         if(all(uv>0)&&all(uv<1)&&q.z>0&&q.z<1){
             float visibility=ShadowMap.SampleCmpLevelZero(shadowSampler,uv,q.z-.0012);
             float edge=saturate(min(min(uv.x,uv.y),min(1-uv.x,1-uv.y))*12);
+            sunVisibility=1-(1-visibility)*edge;
             result.rgb*=1-(1-visibility)*strengths.x*.65*geometryParams.y*(1-geometryParams.z*.7)*edge;
         }
     }
+    if(any(materials.xyz>0))result.rgb=materialColor(input,result.rgb,texel.rgb*input.surface.rgb*colorModulator.rgb,sunVisibility);
 #endif
+    if (input.distance > fogParams.x) {
+        float fog = input.distance < fogParams.y ? smoothstep(fogParams.x, fogParams.y, input.distance) : 1.0;
+        result.rgb = lerp(result.rgb, fogColor.rgb, fog * fogColor.a);
+    }
     PixelOutput output;
     output.color = float4(result.rgb, 1.0);
     return output;
@@ -149,8 +175,9 @@ float3 worldFromDepth(float2 uv,float d){float4 p=mul(inverseVP,float4(uv*float2
 float4 psTranslucent(VertexOutput input):SV_Target0 {
     float4 base=atlasTextures[atlasIndex].Sample(atlasSampler,input.uv)*input.color*colorModulator;
     clip(base.a-.001);
-    if(input.material==5 && (strengths.y>0 || strengths.z>0)){
-        uint width,height;SceneColor.GetDimensions(width,height);float2 uv=input.position.xy/float2(width,height);
+    if(any(materials.xyz>0))base.rgb=materialColor(input,base.rgb,base.rgb,1);
+    if(input.material==5 && (strengths.y>0 || strengths.z>0 || materials.w>0)){
+        uint width,height;SceneDepth.GetDimensions(width,height);float2 uv=input.position.xy/float2(width,height);
         float3 normal=normalize(cross(ddx(input.world),ddy(input.world)));
         if(dot(normal,-input.world)<0)normal=-normal;
         float2 wave=float2(sin((input.world.x+cameraPhase.x)*1304*phaseUnit+sunTime.w),cos((input.world.z+cameraPhase.z)*1499*phaseUnit+sunTime.w*1.2));
@@ -161,6 +188,14 @@ float4 psTranslucent(VertexOutput input):SV_Target0 {
             float sceneD=SceneDepth.Load(int3(clamp(int2(refracted*float2(width,height)),int2(0,0),int2(width-1,height-1)),0));
             if(sceneD<input.position.z)refracted=uv;
             base.rgb=lerp(base.rgb,SceneColor.SampleLevel(atlasSampler,refracted,0).rgb,strengths.y*.4);
+        }
+        if(materials.w>0){
+            int2 pixel=clamp(int2(input.position.xy),int2(0,0),int2(width-1,height-1));
+            float sceneD=SceneDepth.Load(int3(pixel,0));
+            float thickness=sceneD>=1?32:sceneD>input.position.z?min(length(worldFromDepth(uv,sceneD)-input.world),64):0;
+            float3 transmission=exp(-float3(.22,.08,.035)*thickness*materials.w);
+            base.rgb*=transmission;
+            base.a=1-(1-base.a)*dot(transmission,float3(.333333,.333333,.333334));
         }
         if(strengths.z>0){
             float3 reflected=fogColor.rgb;float3 direction=reflect(view,normal);bool hit=false;
@@ -205,11 +240,15 @@ struct TerrainSection {
     D3D12_VERTEX_BUFFER_VIEW vertexView;
     D3D12_INDEX_BUFFER_VIEW indexView;
     std::vector<TransparentQuad> transparent;
+    mutable std::vector<UINT> transparentOrder;
+    mutable double sortCamera[3];
+    mutable bool transparentOrderValid=false;
 };
 
 struct VisibleSection {
     const TerrainSection* section;
     float offset[3];
+    float sortDepth;
 };
 
 struct TerrainIndirectCommand {
@@ -353,7 +392,8 @@ struct InteropRenderer {
     UINT64 timestampFrequency;
     bool profiling;
     float geometrySettings[10];
-    float geometryConstants[64];
+    float geometryConstants[kGeometryConstantCount];
+    float materialSettings[4];
     float cameraOffset[3];
     ID3D12Resource* shadowMap;
     ID3D12DescriptorHeap* shadowDsv;
@@ -384,6 +424,8 @@ struct InteropRenderer {
     UINT atlasIndex;
     UINT nextAtlasSlot;
     std::vector<VisibleSection> visible;
+    std::vector<const TerrainSection*> transparentSections;
+    std::vector<double> transparentDistances;
     UINT64 translucentIndexBytes;
     float viewProjection[28];
     RecordWorker worker;
@@ -1574,7 +1616,7 @@ bool createUploadRingBuffers(InteropRenderer* renderer, UINT64 capacity, JNIEnv*
         slot.uploadMapped = static_cast<uint8_t*>(mapped);
         slot.uploadCapacity = capacity;
         slot.uploadOffset = 0;
-        if (!createBuffer(renderer, D3D12_HEAP_TYPE_UPLOAD, (kMaxExtensionPasses + 1) * 256,
+        if (!createBuffer(renderer, D3D12_HEAP_TYPE_UPLOAD, kMaxExtensionPasses * 256 + kGeometryConstantBytes,
                 D3D12_RESOURCE_STATE_GENERIC_READ, &slot.passConstants)) {
             throwJava(env, "Direct could not allocate extension constant buffers.");
             return false;
@@ -1723,34 +1765,30 @@ void collectVisibleSections(InteropRenderer* renderer, double cameraX, double ca
         float renderDistance) {
     renderer->visible.clear();
     renderer->translucentIndexBytes=0;
-    renderer->visible.reserve(renderer->sectionList.size());
+    renderer->visible.reserve(renderer->useVisibleKeys?renderer->visibleKeys.size():renderer->sectionList.size());
     Plane frustum[6];
     extractFrustum(renderer->viewProjection, frustum);
     const double maxDistanceSquared = static_cast<double>(renderDistance) * renderDistance;
-    std::vector<const TerrainSection*> selected;
-    if (renderer->useVisibleKeys) {
-        selected.reserve(renderer->visibleKeys.size());
-        for (jlong key : renderer->visibleKeys) {
-            auto it = renderer->sections.find(key);
-            if (it != renderer->sections.end()) selected.push_back(it->second);
-        }
-    } else selected.assign(renderer->sectionList.begin(), renderer->sectionList.end());
-    for (const TerrainSection* section : selected) {
-        const double ox = section->x - cameraX;
-        const double oy = section->y - cameraY;
-        const double oz = section->z - cameraZ;
-        const double cx = ox + 8.0;
-        const double cy = oy + 8.0;
-        const double cz = oz + 8.0;
-        if (!renderer->exactVisibleCoverage && (cx * cx + cy * cy + cz * cz > maxDistanceSquared
-                || !sphereVisible(frustum, static_cast<float>(cx), static_cast<float>(cy),
-                        static_cast<float>(cz), kSectionRadius))) {
-            continue;
-        }
-        renderer->visible.push_back({section, {static_cast<float>(ox), static_cast<float>(oy),
-                static_cast<float>(oz)}});
+    auto append = [&](const TerrainSection* section) {
+        const double ox=section->x-cameraX,oy=section->y-cameraY,oz=section->z-cameraZ;
+        const double cx=ox+8,cy=oy+8,cz=oz+8;
+        if(!renderer->exactVisibleCoverage&&(cx*cx+cy*cy+cz*cz>maxDistanceSquared
+                ||!sphereVisible(frustum,static_cast<float>(cx),static_cast<float>(cy),static_cast<float>(cz),kSectionRadius)))return;
+        const auto* m=renderer->viewProjection;
+        double clipZ=m[2]*cx+m[6]*cy+m[10]*cz+m[14];
+        double clipW=m[3]*cx+m[7]*cy+m[11]*cz+m[15];
+        float depth=clipW>0?static_cast<float>(clipZ/clipW):-std::numeric_limits<float>::max();
+        renderer->visible.push_back({section,{static_cast<float>(ox),static_cast<float>(oy),static_cast<float>(oz)},depth});
         if(!section->transparent.empty())renderer->translucentIndexBytes=((renderer->translucentIndexBytes+255)&~UINT64(255))+section->transparent.size()*24;
-    }
+    };
+    if(renderer->useVisibleKeys){
+        for(jlong key:renderer->visibleKeys){auto it=renderer->sections.find(key);if(it!=renderer->sections.end())append(it->second);}
+    }else for(const auto* section:renderer->sectionList)append(section);
+    // Opaque/cutout only: early depth rejection avoids shading hidden distant surfaces.
+    // Translucency retains its independent back-to-front ordering later in the frame.
+    auto nearer=[](const VisibleSection& a,const VisibleSection& b){return a.sortDepth<b.sortDepth;};
+    if(!std::is_sorted(renderer->visible.begin(),renderer->visible.end(),nearer))
+        std::stable_sort(renderer->visible.begin(),renderer->visible.end(),nearer);
 }
 
 // Opaco limpa o alvo; cutout preserva cor e depth.
@@ -1920,7 +1958,8 @@ bool recordTerrain(InteropRenderer* renderer, FrameSlot& slot, bool drawTerrain)
     if (!drawTerrain) {
         return recordTerrainList(renderer, slot.opaque, renderer->opaqueList, PassRole::ClearOnly);
     }
-    if (!renderer->workerRunning) {
+    if (!renderer->workerRunning || slot.indirectReady) {
+        // Two ExecuteIndirect calls do not justify waking and joining a recording worker.
         return recordTerrainList(renderer, slot.opaque, renderer->opaqueList, PassRole::Opaque)
                 && recordTerrainList(renderer, slot.cutout, renderer->cutoutList, PassRole::Cutout);
     }
@@ -2056,22 +2095,29 @@ bool recordExtensionPasses(InteropRenderer* renderer, FrameSlot& slot, UINT64 fr
 
 D3D12_CPU_DESCRIPTOR_HANDLE materialSrv(InteropRenderer* r,UINT slot){auto handle=r->srvHeap->GetCPUDescriptorHandleForHeapStart();handle.ptr+=static_cast<SIZE_T>(slot)*r->srvIncrement;return handle;}
 void setDepthSrv(InteropRenderer* r,ID3D12Resource* resource,UINT slot){D3D12_SHADER_RESOURCE_VIEW_DESC view={};view.Format=DXGI_FORMAT_R32_FLOAT;view.ViewDimension=D3D12_SRV_DIMENSION_TEXTURE2D;view.Shader4ComponentMapping=D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;view.Texture2D.MipLevels=1;r->device->CreateShaderResourceView(resource,&view,materialSrv(r,slot));}
-void releaseSceneSnapshots(InteropRenderer* r){
-    release(r->sceneColor);release(r->sceneDepth);setDepthSrv(r,nullptr,65);
+void releaseSceneColorSnapshot(InteropRenderer* r){
+    release(r->sceneColor);
     D3D12_SHADER_RESOURCE_VIEW_DESC srv={};srv.Format=kColorFormat;srv.ViewDimension=D3D12_SRV_DIMENSION_TEXTURE2D;srv.Shader4ComponentMapping=D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;srv.Texture2D.MipLevels=1;
     r->device->CreateShaderResourceView(nullptr,&srv,materialSrv(r,64));
 }
+void releaseSceneSnapshots(InteropRenderer* r){
+    releaseSceneColorSnapshot(r);release(r->sceneDepth);setDepthSrv(r,nullptr,65);
+}
 bool prepareGeometry(InteropRenderer* r,FrameSlot& slot,double x,double y,double z,JNIEnv* env){
     using namespace DirectX;
-    auto* c=r->geometryConstants;std::fill(c,c+64,0.0f);
+    auto* c=r->geometryConstants;std::fill(c,c+kGeometryConstantCount,0.0f);
+    std::memcpy(c+64,r->materialSettings,sizeof(r->materialSettings));
     for(UINT i=0;i<4;i++)c[16+i]=r->geometrySettings[i];
-    if(c[17]==0&&c[18]==0&&(r->sceneColor||r->sceneDepth))releaseSceneSnapshots(r);
+    if(c[17]==0&&c[18]==0){
+        if(c[67]==0&&(r->sceneColor||r->sceneDepth))releaseSceneSnapshots(r);
+        else if(r->sceneColor)releaseSceneColorSnapshot(r);
+    }
     for(UINT i=0;i<4;i++)c[20+i]=r->geometrySettings[5+i];
     c[25]=(std::max)(r->geometrySettings[6],0.0f);c[26]=r->geometrySettings[9];c[27]=r->geometrySettings[4];
-    r->terrainEffectsActive=c[19]>0||(c[16]>0&&c[25]>.02f);
+    r->terrainEffectsActive=c[19]>0||(c[16]>0&&c[25]>.02f)||(c[64]>0&&c[25]>.02f)||(c[65]>0&&c[26]>0)||c[66]>0;
     r->cameraOffset[0]=static_cast<float>(std::fmod(x,4096));r->cameraOffset[1]=static_cast<float>(std::fmod(y,4096));r->cameraOffset[2]=static_cast<float>(std::fmod(z,4096));
     std::memcpy(c+60,r->cameraOffset,12);
-    if(c[18]>0){XMFLOAT4X4 world;std::memcpy(&world,r->viewProjection,64);auto matrix=XMLoadFloat4x4(&world);XMFLOAT4X4 inverse;XMStoreFloat4x4(&inverse,XMMatrixInverse(nullptr,matrix));std::memcpy(c+28,&inverse,64);std::memcpy(c+44,&world,64);}
+    if(c[18]>0||c[67]>0){XMFLOAT4X4 world;std::memcpy(&world,r->viewProjection,64);auto matrix=XMLoadFloat4x4(&world);XMFLOAT4X4 inverse;XMStoreFloat4x4(&inverse,XMMatrixInverse(nullptr,matrix));std::memcpy(c+28,&inverse,64);std::memcpy(c+44,&world,64);}
     r->shadowRecorded=false;r->shadowDrawCount=0;
     if(c[16]>0 && c[25]>.02f){
         UINT size=r->geometrySettings[4]<.5f?512:r->geometrySettings[4]<1.5f?1024:2048;
@@ -2086,7 +2132,7 @@ bool prepareGeometry(InteropRenderer* r,FrameSlot& slot,double x,double y,double
         auto eye=XMVectorSet(c[20]*128,c[21]*128,c[22]*128,1);auto view=XMMatrixLookAtLH(eye,XMVectorZero(),XMVectorSet(0,0,1,0));auto projection=XMMatrixOrthographicLH(96,96,.1f,256);
         XMFLOAT4X4 shadow;XMStoreFloat4x4(&shadow,XMMatrixMultiply(view,projection));std::memcpy(c,&shadow,64);c[24]=1;
     }else if(r->shadowMap){release(r->shadowMap);release(r->shadowDsv);r->shadowSize=0;setDepthSrv(r,nullptr,66);}
-    std::memcpy(slot.passConstantsMapped+kMaxExtensionPasses*256,c,256);
+    std::memcpy(slot.passConstantsMapped+kMaxExtensionPasses*256,c,sizeof(r->geometryConstants));
     if(c[24]>.5f){
         auto* list=r->shadowList;if(FAILED(slot.shadow->Reset())||FAILED(list->Reset(slot.shadow,r->shadowPipeline))){throwJava(env,"Shadow command list reset failed");return false;}
         if(r->profiling)list->EndQuery(r->timestampHeap,D3D12_QUERY_TYPE_TIMESTAMP,r->slotIndex*2);
@@ -2571,8 +2617,14 @@ Java_com_redondoguibi_direct_NativeDx12_updateTerrainSectionV2(JNIEnv* env, jcla
         throwJava(env,"Terrain index references an invalid vertex");return;
     }
 
-    // Suballocate section data from reusable GPU pages and stage it through the current frame's upload ring.
-    const UINT64 totalBytes = static_cast<UINT64>(vertexBytes + indexBytes);
+    const bool compactIndices=vertexCount<=65536;
+    const UINT64 gpuIndexBytes=static_cast<UINT64>(indexCount)*(compactIndices?sizeof(UINT16):sizeof(UINT32));
+    auto writeIndices=[&](void* destination){
+        if(compactIndices){auto* output=static_cast<UINT16*>(destination);for(jlong i=0;i<indexCount;i++)output[i]=static_cast<UINT16>(allIndices[i]);}
+        else std::memcpy(destination,indices,static_cast<size_t>(indexBytes));
+    };
+    // Staging and the persistent arena both use the smallest exact index representation.
+    const UINT64 totalBytes = static_cast<UINT64>(vertexBytes) + gpuIndexBytes;
     ArenaPage* page = nullptr;
     UINT64 arenaOffset = 0;
     UINT64 arenaBytes = 0;
@@ -2606,7 +2658,7 @@ Java_com_redondoguibi_direct_NativeDx12_updateTerrainSectionV2(JNIEnv* env, jcla
     if (useUploadRing) {
         FrameSlot& uploadSlot = renderer->slots[renderer->slotIndex];
         std::memcpy(uploadSlot.uploadMapped + uploadOffset, vertices, static_cast<size_t>(vertexBytes));
-        std::memcpy(uploadSlot.uploadMapped + uploadOffset + vertexBytes, indices, static_cast<size_t>(indexBytes));
+        writeIndices(uploadSlot.uploadMapped + uploadOffset + vertexBytes);
         renderer->uploadList->CopyBufferRegion(page->resource, arenaOffset,
                 uploadSlot.uploadBuffer, uploadOffset, totalBytes);
     } else {
@@ -2623,7 +2675,7 @@ Java_com_redondoguibi_direct_NativeDx12_updateTerrainSectionV2(JNIEnv* env, jcla
             return;
         }
         std::memcpy(mapped, vertices, static_cast<size_t>(vertexBytes));
-        std::memcpy(static_cast<uint8_t*>(mapped) + vertexBytes, indices, static_cast<size_t>(indexBytes));
+        writeIndices(static_cast<uint8_t*>(mapped) + vertexBytes);
         const D3D12_RANGE writtenRange = {0, static_cast<SIZE_T>(totalBytes)};
         upload->Unmap(0, &writtenRange);
         renderer->uploadList->CopyBufferRegion(page->resource, arenaOffset, upload, 0, totalBytes);
@@ -2640,7 +2692,7 @@ Java_com_redondoguibi_direct_NativeDx12_updateTerrainSectionV2(JNIEnv* env, jcla
     section->allocationSize = arenaBytes;
     const D3D12_GPU_VIRTUAL_ADDRESS address = page->resource->GetGPUVirtualAddress() + arenaOffset;
     section->vertexView = {address, static_cast<UINT>(vertexBytes), kVertexStride};
-    section->indexView = {address + vertexBytes, static_cast<UINT>(indexBytes), DXGI_FORMAT_R32_UINT};
+    section->indexView = {address + vertexBytes, static_cast<UINT>(gpuIndexBytes), compactIndices?DXGI_FORMAT_R16_UINT:DXGI_FORMAT_R32_UINT};
     section->transparent.reserve(static_cast<size_t>(counts[3])/6);
     for(UINT q=0;q<static_cast<UINT>(counts[3]);q+=6){
         TransparentQuad quad={};
@@ -2935,6 +2987,14 @@ extern "C" JNIEXPORT void JNICALL Java_com_redondoguibi_direct_NativeDx12_setTer
     std::memcpy(r->geometrySettings,values,sizeof(values));
 }
 
+extern "C" JNIEXPORT void JNICALL Java_com_redondoguibi_direct_NativeDx12_setMaterialEffects(JNIEnv* env,jclass,jfloatArray settings){
+    auto* r=g_interopRenderer;if(!r)return;
+    if(!settings||env->GetArrayLength(settings)!=4){throwJava(env,"Expected four material strengths");return;}
+    float values[4];env->GetFloatArrayRegion(settings,0,4,values);
+    for(float value:values)if(!std::isfinite(value)||value<0||value>1){throwJava(env,"Material strength outside 0..1");return;}
+    std::memcpy(r->materialSettings,values,sizeof(values));
+}
+
 // Isolated functional probe; it never changes the active presentation path or frame timeline.
 extern "C" JNIEXPORT jlong JNICALL Java_com_redondoguibi_direct_NativeDx12_createDirectMemoryProbe(JNIEnv* env,jclass){
     auto* r=g_interopRenderer;if(!r){throwJava(env,"Interop not initialized");return 0;}
@@ -2999,11 +3059,12 @@ extern "C" JNIEXPORT jint JNICALL Java_com_redondoguibi_direct_NativeDx12_render
     r->d3d11On12->ReleaseWrappedResources(wrapped,2);r->d3d11Context->Flush();
     if(FAILED(r->d3d11Device->GetDeviceRemovedReason())){throwJava(env,"Scene import failed");return -1;}
     env->GetFloatArrayRegion(matrix,0,28,r->viewProjection);
-    std::memcpy(slot.passConstantsMapped+kMaxExtensionPasses*256,r->geometryConstants,256);
+    std::memcpy(slot.passConstantsMapped+kMaxExtensionPasses*256,r->geometryConstants,sizeof(r->geometryConstants));
     auto* list=r->translucentList;if(FAILED(slot.translucent->Reset())||FAILED(list->Reset(slot.translucent,r->translucentPipeline))){throwJava(env,"Translucent list reset failed");return -1;}
     if(r->profiling)list->EndQuery(r->timestampHeap,D3D12_QUERY_TYPE_TIMESTAMP,r->slotIndex*2);
-    if(r->geometrySettings[1]>0||r->geometrySettings[2]>0){
-        if(!r->sceneColor){
+    if(r->geometrySettings[1]>0||r->geometrySettings[2]>0||r->materialSettings[3]>0){
+        bool needsColor=r->geometrySettings[1]>0||r->geometrySettings[2]>0;
+        if(needsColor&&!r->sceneColor){
             auto desc=r->colorTarget->GetDesc();desc.Flags=D3D12_RESOURCE_FLAG_NONE;D3D12_HEAP_PROPERTIES heap={};heap.Type=D3D12_HEAP_TYPE_DEFAULT;
             if(FAILED(r->device->CreateCommittedResource(&heap,D3D12_HEAP_FLAG_NONE,&desc,D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,nullptr,IID_PPV_ARGS(&r->sceneColor)))){throwJava(env,"Water scene allocation failed");return -1;}
             D3D12_SHADER_RESOURCE_VIEW_DESC srv={};srv.Format=kColorFormat;srv.ViewDimension=D3D12_SRV_DIMENSION_TEXTURE2D;srv.Shader4ComponentMapping=D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;srv.Texture2D.MipLevels=1;r->device->CreateShaderResourceView(r->sceneColor,&srv,materialSrv(r,64));
@@ -3011,19 +3072,35 @@ extern "C" JNIEXPORT jint JNICALL Java_com_redondoguibi_direct_NativeDx12_render
         if(!r->sceneDepth){auto desc=r->depthTarget->GetDesc();desc.Flags=D3D12_RESOURCE_FLAG_NONE;D3D12_HEAP_PROPERTIES heap={};heap.Type=D3D12_HEAP_TYPE_DEFAULT;
             if(FAILED(r->device->CreateCommittedResource(&heap,D3D12_HEAP_FLAG_NONE,&desc,D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,nullptr,IID_PPV_ARGS(&r->sceneDepth)))){throwJava(env,"Water depth snapshot allocation failed");return -1;}}
         setDepthSrv(r,r->sceneDepth,65);
-        D3D12_RESOURCE_BARRIER copy[]={transition(r->sceneColor,D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,D3D12_RESOURCE_STATE_COPY_DEST),transition(r->colorTarget,D3D12_RESOURCE_STATE_RENDER_TARGET,D3D12_RESOURCE_STATE_COPY_SOURCE),transition(r->sceneDepth,D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,D3D12_RESOURCE_STATE_COPY_DEST),transition(r->depthTarget,D3D12_RESOURCE_STATE_DEPTH_WRITE,D3D12_RESOURCE_STATE_COPY_SOURCE)};list->ResourceBarrier(4,copy);list->CopyResource(r->sceneColor,r->colorTarget);list->CopyResource(r->sceneDepth,r->depthTarget);
-        D3D12_RESOURCE_BARRIER restore[]={transition(r->sceneColor,D3D12_RESOURCE_STATE_COPY_DEST,D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE),transition(r->colorTarget,D3D12_RESOURCE_STATE_COPY_SOURCE,D3D12_RESOURCE_STATE_RENDER_TARGET),transition(r->sceneDepth,D3D12_RESOURCE_STATE_COPY_DEST,D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE),transition(r->depthTarget,D3D12_RESOURCE_STATE_COPY_SOURCE,D3D12_RESOURCE_STATE_DEPTH_WRITE)};list->ResourceBarrier(4,restore);
+        if(needsColor){
+            D3D12_RESOURCE_BARRIER copy[]={transition(r->sceneColor,D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,D3D12_RESOURCE_STATE_COPY_DEST),transition(r->colorTarget,D3D12_RESOURCE_STATE_RENDER_TARGET,D3D12_RESOURCE_STATE_COPY_SOURCE)};
+            list->ResourceBarrier(2,copy);list->CopyResource(r->sceneColor,r->colorTarget);
+            D3D12_RESOURCE_BARRIER restore[]={transition(r->sceneColor,D3D12_RESOURCE_STATE_COPY_DEST,D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE),transition(r->colorTarget,D3D12_RESOURCE_STATE_COPY_SOURCE,D3D12_RESOURCE_STATE_RENDER_TARGET)};list->ResourceBarrier(2,restore);
+        }
+        D3D12_RESOURCE_BARRIER copyDepth[]={transition(r->sceneDepth,D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,D3D12_RESOURCE_STATE_COPY_DEST),transition(r->depthTarget,D3D12_RESOURCE_STATE_DEPTH_WRITE,D3D12_RESOURCE_STATE_COPY_SOURCE)};
+        list->ResourceBarrier(2,copyDepth);list->CopyResource(r->sceneDepth,r->depthTarget);
+        D3D12_RESOURCE_BARRIER restoreDepth[]={transition(r->sceneDepth,D3D12_RESOURCE_STATE_COPY_DEST,D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE),transition(r->depthTarget,D3D12_RESOURCE_STATE_COPY_SOURCE,D3D12_RESOURCE_STATE_DEPTH_WRITE)};list->ResourceBarrier(2,restoreDepth);
     }else if(r->sceneColor||r->sceneDepth){releaseSceneSnapshots(r);}
     auto rtv=r->rtvHeap->GetCPUDescriptorHandleForHeapStart();auto dsv=r->dsvHeap->GetCPUDescriptorHandleForHeapStart();
     list->OMSetRenderTargets(1,&rtv,FALSE,&dsv);ID3D12DescriptorHeap* heaps[]={r->srvHeap};list->SetDescriptorHeaps(1,heaps);list->SetGraphicsRootSignature(r->rootSignature);list->SetGraphicsRootDescriptorTable(2,r->srvHeap->GetGPUDescriptorHandleForHeapStart());list->SetGraphicsRootConstantBufferView(3,slot.passConstants->GetGPUVirtualAddress()+kMaxExtensionPasses*256);list->SetGraphicsRoot32BitConstants(0,28,r->viewProjection,0);list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     D3D12_VIEWPORT viewport={0,0,static_cast<float>(r->width),static_cast<float>(r->height),0,1};D3D12_RECT rect={0,0,static_cast<LONG>(r->width),static_cast<LONG>(r->height)};list->RSSetViewports(1,&viewport);list->RSSetScissorRects(1,&rect);
-    std::vector<const TerrainSection*> sections;for(auto& entry:r->visible)if(!entry.section->transparent.empty())sections.push_back(entry.section);
+    auto& sections=r->transparentSections;sections.clear();for(auto& entry:r->visible)if(!entry.section->transparent.empty())sections.push_back(entry.section);
     auto distance=[&](const TerrainSection* s){double x=s->x+8-cameraX,y=s->y+8-cameraY,z=s->z+8-cameraZ;return x*x+y*y+z*z;};
     std::stable_sort(sections.begin(),sections.end(),[&](auto* a,auto* b){return distance(a)>distance(b);});
     for(auto* section:sections){
-        std::vector<UINT> order(section->transparent.size());for(UINT i=0;i<order.size();i++)order[i]=i;
-        auto quadDistance=[&](UINT i){auto& q=section->transparent[i];double x=section->x+q.center[0]-cameraX,y=section->y+q.center[1]-cameraY,z=section->z+q.center[2]-cameraZ;return x*x+y*y+z*z;};
-        std::stable_sort(order.begin(),order.end(),[&](UINT a,UINT b){return quadDistance(a)>quadDistance(b);});
+        auto& order=section->transparentOrder;
+        if(!section->transparentOrderValid||section->sortCamera[0]!=cameraX||section->sortCamera[1]!=cameraY||section->sortCamera[2]!=cameraZ){
+            order.resize(section->transparent.size());
+            auto& distances=r->transparentDistances;distances.resize(order.size());
+            for(UINT i=0;i<order.size();i++){
+                order[i]=i;auto& q=section->transparent[i];
+                double x=section->x+q.center[0]-cameraX,y=section->y+q.center[1]-cameraY,z=section->z+q.center[2]-cameraZ;
+                distances[i]=x*x+y*y+z*z;
+            }
+            // Original quad index breaks ties exactly like a stable sort of the original mesh.
+            std::sort(order.begin(),order.end(),[&](UINT a,UINT b){return distances[a]!=distances[b]?distances[a]>distances[b]:a<b;});
+            section->sortCamera[0]=cameraX;section->sortCamera[1]=cameraY;section->sortCamera[2]=cameraZ;section->transparentOrderValid=true;
+        }
         UINT64 bytes=static_cast<UINT64>(order.size())*24,offset=0;if(!reserveUploadRange(r,bytes,256,&offset)){throwJava(env,"Translucent index budget exceeded; retain vanilla layer");return -1;}
         auto* dst=reinterpret_cast<UINT*>(slot.uploadMapped+offset);for(UINT i:order){std::memcpy(dst,section->transparent[i].indices.data(),24);dst+=6;}
         D3D12_INDEX_BUFFER_VIEW indices={slot.uploadBuffer->GetGPUVirtualAddress()+offset,static_cast<UINT>(bytes),DXGI_FORMAT_R32_UINT};list->IASetIndexBuffer(&indices);list->IASetVertexBuffers(0,1,&section->vertexView);

@@ -2,7 +2,6 @@ package com.redondoguibi.direct;
 
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
-import java.util.ArrayDeque;
 import java.util.HashMap;
 import java.util.Map;
 
@@ -25,8 +24,7 @@ public final class TerrainMeshStore {
     private static final int LAYER_COUNT = 4;
     private static final Object LOCK = new Object();
     // Coalesce pending work by section; guarded by LOCK with VERSIONS and generation.
-    private static final ArrayDeque<Long> PENDING_KEYS = new ArrayDeque<>();
-    private static final Map<Long, SectionMesh> PENDING = new HashMap<>();
+    private static final PendingUploadQueue<SectionMesh> PENDING = new PendingUploadQueue<>(SectionMesh::byteSize);
     // Retains invalidation versions only while that section has captures in flight; the last finish evicts it.
     private static final Long2LongOpenHashMap VERSIONS = new Long2LongOpenHashMap(); // guarded by LOCK
     private static final Map<Long, Integer> IN_FLIGHT = new HashMap<>();
@@ -35,7 +33,6 @@ public final class TerrainMeshStore {
     private static final TerrainOwnership<SectionMesh> OWNERSHIP = new TerrainOwnership<>();
     private static RenderType[] layers;
     private static long generation; // guarded by LOCK
-    private static long pendingBytes; // guarded by LOCK
     private static int activeCaptures; // guarded by LOCK
     private static long successfulCaptures; // guarded by LOCK
     private static long lastCaptureActivityNanos; // guarded by LOCK
@@ -51,6 +48,9 @@ public final class TerrainMeshStore {
 
     private TerrainMeshStore() {
     }
+
+    /** Fast gate for vanilla-only hooks; does not touch ownership maps or thread locals. */
+    public static boolean isCaptureEnabled() { return captureEnabled && !captureFaulted; }
 
     /** HEAD of SectionCompiler.compile: captures an epoch/version token and tracks in-flight work. */
     public static void beginCapture(SectionPos sectionPos) {
@@ -87,6 +87,9 @@ public final class TerrainMeshStore {
         try {
             if (!captureEnabled || captureFaulted || results == null) {
                 return;
+            }
+            synchronized(LOCK){
+                if(generation!=token.generation||VERSIONS.get(key)!=token.version)return;
             }
             RenderType[] supported = supportedLayers();
             var rendered = results.renderedLayers;
@@ -129,7 +132,7 @@ public final class TerrainMeshStore {
                     continue;
                 }
                 MeshData.DrawState drawState = mesh.drawState();
-                packVerticesV2(vertices, mesh.vertexBuffer(), drawState, origin, region);
+                packVerticesV2(vertices, mesh.vertexBuffer(), drawState, origin, region,token.workspace);
                 packIndices(indices, mesh.indexBuffer(), drawState, vertexBase);
                 layerIndexCounts[layerIndex] = drawState.indexCount();
                 vertexBase += drawState.vertexCount();
@@ -181,10 +184,8 @@ public final class TerrainMeshStore {
         synchronized (LOCK) {
             generation++;
             VERSIONS.clear();
-            PENDING_KEYS.clear();
             PENDING.clear();
             OWNERSHIP.clear();NATIVE_PRESENT.clear();
-            pendingBytes = 0L;
             successfulCaptures = 0L;
             replacementSafe = true;
             captureReady = false;
@@ -230,7 +231,7 @@ public final class TerrainMeshStore {
     public static boolean hasCaptureFault() {
         return captureFaulted;
     }
-    static long[] pendingMetrics(){synchronized(LOCK){return new long[]{pendingBytes,PENDING.size(),activeCaptures};}}
+    static long[] pendingMetrics(){synchronized(LOCK){return new long[]{PENDING.bytes(),PENDING.size(),activeCaptures};}}
 
     /** Closes a capture if SectionCompiler.compile exits exceptionally before its return hook. */
     public static void finishCaptureForCurrentThread() {
@@ -254,26 +255,12 @@ public final class TerrainMeshStore {
         while (uploaded < maxUpdates) {
             SectionMesh update;
             synchronized (LOCK) {
-                Long key = PENDING_KEYS.peekFirst();
-                if (key == null) {
-                    break;
-                }
-                SectionMesh candidate = PENDING.get(key);
-                long candidateBytes = candidate == null ? 0L : candidate.byteSize();
-                // Soft budget: allow one oversized section so it can never block the queue forever.
-                if (uploaded > 0 && candidateBytes > maxBytes - uploadedBytes) {
-                    break;
-                }
-                PENDING_KEYS.removeFirst();
-                update = PENDING.remove(key);
-                if (update != null) {
-                    pendingBytes = Math.max(0L, pendingBytes - update.byteSize());
-                    if(update.vertices()!=null&&!OWNERSHIP.accepts(key,update.receipt()))update=null;
-                }
+                update=PENDING.poll(maxBytes-uploadedBytes,uploaded==0,
+                        candidate->candidate.vertices()==null||OWNERSHIP.accepts(candidate.key(),candidate.receipt()));
                 LOCK.notifyAll();
             }
             if (update == null) {
-                continue;
+                break;
             }
             if (update.vertices() == null) {
                 NativeDx12.removeTerrainSection(update.key());
@@ -297,7 +284,7 @@ public final class TerrainMeshStore {
                     && activeCaptures == 0 && quietNanos >= 750_000_000L) {
                 captureReady = true;
             }
-            if (pendingBytes < (long) ClientConfig.MAX_PENDING_MESH_MIB.get() * 1024L * 1024L) {
+            if (PENDING.bytes() < (long) ClientConfig.MAX_PENDING_MESH_MIB.get() * 1024L * 1024L) {
                 reportedPendingBudgetOverrun = false;
             }
         }
@@ -347,12 +334,12 @@ public final class TerrainMeshStore {
                 format.getOffset(VertexFormatElement.UV0), format.getOffset(VertexFormatElement.UV2));
     }
 
-    private static void packVerticesV2(ByteBuffer destination,ByteBuffer source,MeshData.DrawState drawState,BlockPos origin,net.minecraft.client.renderer.chunk.RenderChunkRegion region){
+    private static void packVerticesV2(ByteBuffer destination,ByteBuffer source,MeshData.DrawState drawState,BlockPos origin,net.minecraft.client.renderer.chunk.RenderChunkRegion region,CaptureWorkspace<net.minecraft.world.level.block.state.BlockState> workspace){
         var format=drawState.format();int stride=format.getVertexSize(),position=format.getOffset(VertexFormatElement.POSITION),normal=format.getOffset(VertexFormatElement.NORMAL),uv=format.getOffset(VertexFormatElement.UV0);
-        byte[] materials=new byte[(drawState.vertexCount()+3)/4];
-        var cache=new java.util.IdentityHashMap<net.minecraft.world.level.block.state.BlockState,Byte>();
+        int quads=(drawState.vertexCount()+3)/4;
+        byte[] materials=workspace.materials(quads);
         ByteBuffer input=source.duplicate().order(ByteOrder.nativeOrder());var block=new BlockPos.MutableBlockPos();
-        for(int q=0;q<materials.length;q++){
+        for(int q=0;q<quads;q++){
             int first=q*4,n=Math.min(4,drawState.vertexCount()-first);float x=0,y=0,z=0,u=0,v=0;
             for(int i=0;i<n;i++){int base=input.position()+(first+i)*stride,at=base+position;x+=input.getFloat(at);y+=input.getFloat(at+4);z+=input.getFloat(at+8);u+=input.getFloat(base+uv);v+=input.getFloat(base+uv+4);}
             // Sprite identity also covers flowing/waterlogged faces without classifying the
@@ -360,7 +347,7 @@ public final class TerrainMeshStore {
             if(TerrainMaterials.waterSprite(u/n,v/n)){materials[q]=TerrainMaterials.WATER;continue;}
             int at=input.position()+first*stride+normal;
             block.set(origin.getX()+(int)Math.floor(x/n-input.get(at)/127f*.02f),origin.getY()+(int)Math.floor(y/n-input.get(at+1)/127f*.02f),origin.getZ()+(int)Math.floor(z/n-input.get(at+2)/127f*.02f));
-            var state=region.getBlockState(block);materials[q]=cache.computeIfAbsent(state,k->(byte)TerrainMaterials.classify(k));
+            var state=region.getBlockState(block);materials[q]=workspace.material(state,TerrainMaterials::classify);
         }
         TerrainBufferPacker.packVertices20(destination,source,drawState.vertexCount(),stride,position,format.getOffset(VertexFormatElement.COLOR),format.getOffset(VertexFormatElement.UV0),format.getOffset(VertexFormatElement.UV2),normal,materials);
     }
@@ -377,7 +364,8 @@ public final class TerrainMeshStore {
     }
 
     public static void vanillaUploaded(MeshData source,com.mojang.blaze3d.vertex.VertexBuffer buffer){
-        synchronized(LOCK){OWNERSHIP.uploaded(source,buffer);}
+        if(!isCaptureEnabled())return;
+        synchronized(LOCK){if(isCaptureEnabled())OWNERSHIP.uploaded(source,buffer);}
     }
     public static void vanillaCommitted(net.minecraft.client.renderer.chunk.SectionRenderDispatcher.RenderSection section){
         if(!captureEnabled||captureFaulted)return;
@@ -398,16 +386,9 @@ public final class TerrainMeshStore {
     /** Must be called while holding LOCK. */
     private static void enqueuePendingLocked(SectionMesh mesh) {
         long key = mesh.key();
-        SectionMesh previous = PENDING.get(key);
-        if (previous == null) {
-            PENDING_KEYS.addLast(key);
-        } else {
-            pendingBytes -= previous.byteSize();
-        }
-        PENDING.put(key, mesh);
-        pendingBytes += mesh.byteSize();
+        PENDING.put(key,mesh);
         long budget=(long)ClientConfig.MAX_PENDING_MESH_MIB.get()*1024*1024;
-        if(pendingBytes>budget&&!reportedPendingBudgetOverrun){
+        if(PENDING.bytes()>budget&&!reportedPendingBudgetOverrun){
             Direct.LOGGER.warn("Committed Direct terrain queue exceeds its soft budget ({} MiB); keeping per-section fallback while uploads drain.",ClientConfig.MAX_PENDING_MESH_MIB.get());
             reportedPendingBudgetOverrun=true;
         }
@@ -419,6 +400,7 @@ public final class TerrainMeshStore {
                 return;
             }
             token.active = false;
+            token.workspace.clearStates();
             activeCaptures = Math.max(0, activeCaptures - 1);
             int inFlight = IN_FLIGHT.getOrDefault(token.key, 0);
             if (inFlight <= 1) {
@@ -433,6 +415,7 @@ public final class TerrainMeshStore {
     }
 
     private static final class CaptureToken {
+        final CaptureWorkspace<net.minecraft.world.level.block.state.BlockState> workspace=new CaptureWorkspace<>();
         long key;
         long generation;
         long version;

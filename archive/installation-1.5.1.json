@@ -1,0 +1,37 @@
+{
+  "version": "1.5.1",
+  "apiVersion": "1.4.0",
+  "jar": "C:\\Users\\Sistemas\\curseforge\\minecraft\\Instances\\Direct\\mods\\direct-1.5.1.jar",
+  "sha256": "988d8a097c6ac3a549c33a619f6ceb624df26a64aeaf4297697bd3b76b8770df",
+  "backup": "C:\\Criando Mods\\mod\\Direct\\archive\\modpack-before-1.5.1-20261104-131744.zip",
+  "suites": {
+    "test": {
+      "tests": 36,
+      "failures": 0,
+      "errors": 0,
+      "skipped": 0
+    },
+    "graphicsTest": {
+      "tests": 23,
+      "failures": 0,
+      "errors": 0,
+      "skipped": 0
+    },
+    "validateLus": {
+      "tests": 1,
+      "failures": 0,
+      "errors": 0,
+      "skipped": 0
+    }
+  },
+  "nativeSmoke": "1/1 passed",
+  "settingsPreserved": {
+    "C:\\Users\\Sistemas\\curseforge\\minecraft\\Instances\\Direct\\config\\direct-client.toml": "9aa653bb8e419d43aad569d8f6f31fda4864fca68f7379c84edb2f110ebbe070",
+    "C:\\Users\\Sistemas\\curseforge\\minecraft\\Instances\\Direct\\config\\raydiance-client.toml": "863e93bd0ddf02d2416a28a54fb8fbbc09eedf6062950a1100f214ad5a8d092d"
+  },
+  "raydianceUnchangedSha256": "1218e1f68811255379afdf88193acaaadac5542ab6ab8fc493026d5e6ccd45a7",
+  "lusUnchanged": true,
+  "minecraftStartedByAgent": false,
+  "inGameValidated": false,
+  "benchmark": "archive/terrain-1024-comparison.txt"
+}

@@ -147,6 +147,7 @@ public final class Dx12GlInterop {
 
     /** Chamado pelo LevelRendererMixin com as matrizes reais do frame. */
     public static void captureLevelMatrices(Camera camera, Matrix4f viewRotation, Matrix4f projection) {
+        if(!ClientConfig.ENABLE_DX12.get()){matricesCaptured=false;return;}
         CAPTURED_VIEW.set(viewRotation);
         CAPTURED_PROJECTION.set(projection);
         Vec3 position = camera.getPosition();
@@ -168,7 +169,7 @@ public final class Dx12GlInterop {
         if(!ClientConfig.ENABLE_DX12.get()||!shouldCompositeBeforeVanilla()||!initialized||!lastFrameSucceeded||!replacementFrame)return false;
         var mc=Minecraft.getInstance();var target=mc.getMainRenderTarget();
         var effects=DirectRenderApi.terrainEffects();
-        if(!ClientConfig.DX12_TRANSLUCENCY.get()&&effects.water()==0&&effects.reflections()==0)return false;
+        if(!ClientConfig.DX12_TRANSLUCENCY.get()&&effects.water()==0&&effects.reflections()==0&&DirectRenderApi.terrainSettings().materials().waterAbsorption()==0)return false;
         if(Minecraft.useShaderTransparency()||GL11.glGetInteger(GL30.GL_DRAW_FRAMEBUFFER_BINDING)!=target.frameBufferId)return false;
         if(!PENDING_VIEW.matches(CAPTURED_VIEW,CAPTURED_PROJECTION,cameraX,cameraY,cameraZ)||!translucentCovered)return false;
         if(visibleTranslucentCount==0)return true;
@@ -216,6 +217,13 @@ public final class Dx12GlInterop {
 
     public static void captureVisibleSections(List<SectionRenderDispatcher.RenderSection> sections) {
         currentVisibleSections=sections;
+        // Stage only. Ownership is evaluated once, after native uploads, for this frame.
+        lastFrameSucceeded=false;
+        ownedBuffers.clear();
+    }
+
+    private static void selectUploadedSections() {
+        var sections=currentVisibleSections;
         visibleCount=0;visibleTranslucentCount=0;fallbackSections=fallbackBaseSections=0;translucentCovered=true;ownedBuffers.clear();
         if(!ClientConfig.ENABLE_DX12.get())return;
         if(visibleKeys.length<sections.size())visibleKeys=new long[sections.size()];
@@ -393,7 +401,7 @@ public final class Dx12GlInterop {
             }
             if (!lastSubmittedFrameReady("terrain resource updates")) return;
             TerrainMeshStore.uploadPending();
-            captureVisibleSections(currentVisibleSections);
+            selectUploadedSections();
             if(RendererMetrics.recording){RendererMetrics.ownershipFrames++;RendererMetrics.ownedSectionSamples+=visibleCount;RendererMetrics.fallbackSectionSamples+=fallbackSections;if(visibleCount>0&&fallbackBaseSections>0)RendererMetrics.mixedFrames++;}
             replacementFrame = shouldCompositeBeforeVanilla() && ClientConfig.TERRAIN_RENDER_DISTANCE_PERCENT.get() == 100;
             if (shouldCompositeBeforeVanilla() && (!replacementFrame||visibleCount==0)) {
@@ -462,9 +470,12 @@ public final class Dx12GlInterop {
                         index * DirectRenderApi.MAX_UNIFORM_FLOATS);
             }
             NativeDx12.setProfilingEnabled(ClientConfig.PROFILE_RENDERER.get());
-            var effects=DirectRenderApi.terrainEffects();
+            var terrainSettings=DirectRenderApi.terrainSettings();
+            var effects=terrainSettings.geometry();
+            var materials=terrainSettings.materials();
+            NativeDx12.setMaterialEffects(new float[]{materials.specular(),materials.wetness(),materials.emissive(),materials.waterAbsorption()});
             float angle=minecraft.level.getSunAngle(0);
-            NativeDx12.setTerrainEffects(new float[]{minecraft.level.dimensionType().hasSkyLight()?effects.shadows():0,effects.water(),effects.reflections(),effects.wind(),effects.quality(),-(float)Math.sin(angle),(float)Math.cos(angle),0,(minecraft.level.getGameTime()%240000)/20f,minecraft.level.getRainLevel(0)});
+            NativeDx12.setTerrainEffects(new float[]{minecraft.level.dimensionType().hasSkyLight()?effects.shadows():0,effects.water(),effects.reflections(),effects.wind(),effects.quality(),-(float)Math.sin(angle),minecraft.level.dimensionType().hasSkyLight()?(float)Math.cos(angle):0,0,(minecraft.level.getGameTime()%240000)/20f,minecraft.level.getRainLevel(0)});
             boolean useGpuSync = gpuSemaphoreInterop && ClientConfig.USE_GPU_SEMAPHORE_SYNC.get();
             long submittedAt = System.nanoTime();
             int renderResult = NativeDx12.renderInterop(MATRIX, cameraX, cameraY, cameraZ,
@@ -649,7 +660,7 @@ public final class Dx12GlInterop {
         if (interopDevice == 0) {
             throw new IllegalStateException("WGL_NV_DX_interop2 could not open the D3D11On12 device.");
         }
-        registerTexture(handles[1], handles[4]);
+        registerTexture(handles[1], handles[4], frameWidth, frameHeight);
         if (ClientConfig.USE_GPU_SEMAPHORE_SYNC.get()) {
             initializeGpuSemaphore(handles[3]);
         }
@@ -699,18 +710,25 @@ public final class Dx12GlInterop {
         if (sharedTexture == null || sharedTexture.length != 2 || sharedTexture[0] == 0 || sharedTexture[1] == 0) {
             throw new IllegalStateException("DX12/OpenGL interop resize did not return a shared texture.");
         }
-        registerTexture(sharedTexture[0], sharedTexture[1]);
+        registerTexture(sharedTexture[0], sharedTexture[1], frameWidth, frameHeight);
         width = frameWidth;
         height = frameHeight;
     }
 
-    private static void registerTexture(long sharedColor, long sharedDepth) {
+    private static void registerTexture(long sharedColor, long sharedDepth, int frameWidth, int frameHeight) {
         int active = GL11.glGetInteger(GL13.GL_ACTIVE_TEXTURE);
         GL13.glActiveTexture(GL13.GL_TEXTURE0);
         int bound = GL11.glGetInteger(GL11.GL_TEXTURE_BINDING_2D);
         try {
-            texture = GL11.glGenTextures();
-            interopObject = registerResource(sharedColor, texture);
+            var color = InteropColorTarget.create(interopDevice, sharedColor, frameWidth, frameHeight,
+                    ClientConfig.PREFER_DIRECT_COLOR_INTEROP.get());
+            texture = color.texture;
+            interopObject = color.object;
+            if (color.fallbackReason != null) {
+                Direct.LOGGER.warn("Native terrain color sharing rejected; using copied color: {}", color.fallbackReason);
+            }
+            Direct.LOGGER.info("DX12 terrain color interop: {}; depth uses the copied bridge.",
+                    color.direct ? "shared native target (no color export copy)" : "copied target");
             depthTexture = GL11.glGenTextures();
             depthInteropObject = registerResource(sharedDepth, depthTexture);
         } finally {

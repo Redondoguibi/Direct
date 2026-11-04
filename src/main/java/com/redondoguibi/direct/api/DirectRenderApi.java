@@ -28,25 +28,37 @@ public final class DirectRenderApi implements DirectRenderService {
     public record PassSnapshot(long revision, List<DirectRenderPass> passes) {
     }
     private static final Pattern PASS_ID = Pattern.compile("[a-z0-9_.-]{1,96}");
+    private static final TerrainSettings NO_TERRAIN_EFFECTS = new TerrainSettings(DirectTerrainEffects.NONE, DirectMaterialEffects.NONE);
     private static final DirectRenderApi INSTANCE = new DirectRenderApi();
     private final ConcurrentHashMap<String, DirectRenderPass> passes = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, String> failures = new ConcurrentHashMap<>();
     private final AtomicBoolean dirty = new AtomicBoolean(true);
     private volatile PassSnapshot passSnapshot = new PassSnapshot(0L, List.of());
     private volatile DirectRenderCapabilities capabilities = DirectRenderCapabilities.unavailable();
-    private final java.util.TreeMap<String,DirectTerrainEffects> terrainRequests=new java.util.TreeMap<>();
-    private volatile DirectTerrainEffects terrainSettings=DirectTerrainEffects.NONE;
-    /** Returns the immutable geometry settings for this render frame.
-     * @return selected owner's settings, or no effects
+    /** One immutable owner snapshot prevents mixed geometry/material settings.
+     * @param geometry geometry strengths
+     * @param materials material strengths
      */
-    public static DirectTerrainEffects terrainEffects(){return INSTANCE.terrainSettings;}
+    public record TerrainSettings(DirectTerrainEffects geometry, DirectMaterialEffects materials) {}
+    private final java.util.TreeMap<String,TerrainSettings> terrainRequests=new java.util.TreeMap<>();
+    private volatile TerrainSettings terrainSettings=NO_TERRAIN_EFFECTS;
+    /** Reads the selected geometry settings.
+     * @return selected geometry settings */
+    public static DirectTerrainEffects terrainEffects(){return INSTANCE.terrainSettings.geometry();}
+    /** Reads both settings together.
+     * @return atomic geometry/material snapshot for one frame */
+    public static TerrainSettings terrainSettings(){return INSTANCE.terrainSettings;}
     @Override public synchronized void requestTerrainEffects(String owner,DirectTerrainEffects settings){
+        requestTerrainEffects(owner,settings,DirectMaterialEffects.NONE);
+    }
+    @Override public synchronized void requestTerrainEffects(String owner,DirectTerrainEffects settings,DirectMaterialEffects materials){
         if(owner==null||!PASS_ID.matcher(owner).matches())throw new IllegalArgumentException("Invalid effect owner");
         if(!terrainRequests.containsKey(owner)&&terrainRequests.size()>=64)throw new IllegalStateException("Too many geometry effect owners");
-        terrainRequests.put(owner,Objects.requireNonNull(settings));terrainSettings=terrainRequests.firstEntry().getValue();
+        var request=new TerrainSettings(Objects.requireNonNull(settings),Objects.requireNonNull(materials));
+        terrainRequests.put(owner,request);terrainSettings=terrainRequests.firstEntry().getValue();
     }
-    @Override public synchronized void releaseTerrainEffects(String owner){terrainRequests.remove(owner);terrainSettings=terrainRequests.isEmpty()?DirectTerrainEffects.NONE:terrainRequests.firstEntry().getValue();}
-    @Override public java.util.Set<String> terrainFeatures(){return capabilities.nativeTerrain()?java.util.Set.of("materials-v2","normals","shadows","wind","translucency","water","reflections"):java.util.Set.of();}
+    @Override public synchronized void releaseTerrainEffects(String owner){terrainRequests.remove(owner);terrainSettings=terrainRequests.isEmpty()?NO_TERRAIN_EFFECTS:terrainRequests.firstEntry().getValue();}
+    @Override public java.util.Set<String> terrainFeatures(){return capabilities.nativeTerrain()?java.util.Set.of("materials-v2","normals","shadows","wind","translucency","water","reflections","material-lighting"):java.util.Set.of();}
     @Override public synchronized String terrainEffectOwner(){return terrainRequests.isEmpty()?"":terrainRequests.firstKey();}
 
     private DirectRenderApi() {

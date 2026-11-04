@@ -28,6 +28,8 @@ abstract class SectionCompilerMixin {
             VertexSorting sorting, SectionBufferBuilderPack bufferPack,
             List<AddSectionGeometryEvent.AdditionalSectionRenderer> additionalRenderers,
             Operation<SectionCompiler.Results> original) {
+        if(!TerrainMeshStore.isCaptureEnabled())
+            return original.call(sectionPos,region,sorting,bufferPack,additionalRenderers);
         TerrainMeshStore.beginCapture(sectionPos);
         try {
             SectionCompiler.Results results = original.call(sectionPos, region, sorting, bufferPack,

@@ -13,9 +13,11 @@ import java.nio.file.Path;
 abstract class NativeMaterialsInteropTestBase {
     boolean aliased(){return false;}
     private void registerTargets(long color,long depth){
-        colorObject=register(aliased()?NativeDx12.acquireColorInteropTarget():color,sharedColor);
+        GL11.glDeleteTextures(sharedColor);
+        var target=InteropColorTarget.create(device,color,64,64,aliased());
+        assertEquals(aliased(),target.direct,target.fallbackReason);
+        sharedColor=target.texture;colorObject=target.object;
         depthObject=register(depth,sharedDepth);
-        NativeDx12.configureColorAlias(aliased());
     }
     private long window,device,colorObject,depthObject;private int sharedColor,sharedDepth;
     @BeforeEach void open(){
@@ -35,6 +37,24 @@ abstract class NativeMaterialsInteropTestBase {
     private void finish(long frame){assertTrue(NativeDx12.waitInteropFrame(frame+1));NativeDx12.signalInteropFence(frame+1);}
     private ByteBuffer readShared(){try(MemoryStack stack=MemoryStack.stackPush()){var objects=stack.pointers(colorObject,depthObject);assertTrue(WGLNVDXInterop.wglDXLockObjectsNV(device,objects));try{GL11.glBindTexture(GL11.GL_TEXTURE_2D,sharedColor);ByteBuffer image=ByteBuffer.allocateDirect(64*64*4);GL11.glGetTexImage(GL11.GL_TEXTURE_2D,0,GL11.GL_RGBA,GL11.GL_UNSIGNED_BYTE,image);return image;}finally{assertTrue(WGLNVDXInterop.wglDXUnlockObjectsNV(device,objects));GL11.glFinish();}}}
     private FloatBuffer readDepth(){try(MemoryStack stack=MemoryStack.stackPush()){var objects=stack.pointers(colorObject,depthObject);assertTrue(WGLNVDXInterop.wglDXLockObjectsNV(device,objects));try{GL11.glBindTexture(GL11.GL_TEXTURE_2D,sharedDepth);var data=ByteBuffer.allocateDirect(64*64*4).order(ByteOrder.nativeOrder()).asFloatBuffer();GL11.glGetTexImage(GL11.GL_TEXTURE_2D,0,GL11.GL_RED,GL11.GL_FLOAT,data);return data;}finally{assertTrue(WGLNVDXInterop.wglDXUnlockObjectsNV(device,objects));GL11.glFinish();}}}
+    @Test void rejectedNativeStorageRetainsCopiedBridgeAfterResize(){
+        float[] frame=matrix(new Matrix4f());
+        NativeDx12.configureRenderPasses(new String[]{"float4 main(float4 p:SV_Position):SV_Target0{return float4(1,0,0,1);}"});
+        assertEquals(0,NativeDx12.renderInterop(frame,0,0,0,256,0,0,new float[60],false,true));finish(0);
+        var before=readShared();assertEquals(255,Byte.toUnsignedInt(before.get(0)));
+        assertTrue(WGLNVDXInterop.wglDXUnregisterObjectNV(device,colorObject));colorObject=0;
+        assertTrue(WGLNVDXInterop.wglDXUnregisterObjectNV(device,depthObject));depthObject=0;
+        GL11.glDeleteTextures(sharedColor);GL11.glDeleteTextures(sharedDepth);
+        var resized=NativeDx12.resizeInterop(64,64);
+        // Mismatching storage must be rejected even when WGL registration itself succeeds.
+        var target=InteropColorTarget.create(device,resized[0],32,64,true);
+        sharedColor=target.texture;colorObject=target.object;
+        assertFalse(target.direct);assertTrue(target.fallbackReason.contains("64x64; expected 32x64"));
+        sharedDepth=GL11.glGenTextures();depthObject=register(resized[1],sharedDepth);
+        assertEquals(0,NativeDx12.renderInterop(frame,0,0,0,256,1,0,new float[60],false,true));finish(1);
+        assertEquals(before,readShared(),"Rejected alias must preserve the copied output after resize");
+        assertEquals(GL11.GL_NO_ERROR,GL11.glGetError());
+    }
     @Test void sceneRoundTripPreservesRowsDepthAndGlState(){
         float[] frame=matrix(new Matrix4f());
         NativeDx12.setTerrainEffects(new float[]{1,1,.5f,0,1,.7f,.7f,0,1,0});
@@ -103,16 +123,18 @@ abstract class NativeMaterialsInteropTestBase {
             // The same native water mesh responds to water/reflection settings without recompilation.
             var water=ByteBuffer.allocateDirect(80).order(ByteOrder.nativeOrder());for(float[] p:new float[][]{{-.9f,-.9f},{.9f,-.9f},{.9f,.9f},{-.9f,.9f}})vertex(water,p[0],p[1],.4f,0x80ff0000,5);water.flip();
             NativeDx12.updateTerrainSection(1,0,0,0,water,4,indices(1),new int[]{0,0,0,6});
-            int[] green=new int[3];
-            for(int scenario=0;scenario<3;scenario++){
+            int[] green=new int[5];
+            for(int scenario=0;scenario<5;scenario++){
                 if(scenario==2){
                     var reflector=ByteBuffer.allocateDirect(80).order(ByteOrder.nativeOrder());
                     for(float[] p:new float[][]{{-.8f,-.09f,.2f},{.8f,-.09f,.2f},{.8f,.09f,.6f},{-.8f,.09f,.6f}})vertex(reflector,p[0],p[1],p[2],0x80ffffff,5);
                     reflector.flip();NativeDx12.updateTerrainSection(1,0,0,0,reflector,4,indices(1),new int[]{0,0,0,6});
                 }
+                if(scenario>=3)NativeDx12.updateTerrainSection(1,0,0,0,water,4,indices(1),new int[]{0,0,0,6});
+                NativeDx12.setMaterialEffects(new float[]{0,0,0,scenario>=3?1:0});
                 NativeDx12.setTerrainEffects(new float[]{0,scenario==0?1:0,scenario==0?.7f:scenario==2?1:0,0,0,.7f,.7f,0,1,0});
                 long opaque=2+scenario*2;NativeDx12.renderInterop(frame,0,0,0,256,opaque,0,new float[0],false,true);finish(opaque);
-                GL30.glBindFramebuffer(GL30.GL_FRAMEBUFFER,fbo);GL11.glDepthMask(true);GL11.glColorMask(true,true,true,true);GL11.glClearColor(0,1,0,1);GL11.glClearDepth(.8);GL11.glClear(GL11.GL_COLOR_BUFFER_BIT|GL11.GL_DEPTH_BUFFER_BIT);
+                GL30.glBindFramebuffer(GL30.GL_FRAMEBUFFER,fbo);GL11.glDepthMask(true);GL11.glColorMask(true,true,true,true);GL11.glClearColor(0,1,0,1);GL11.glClearDepth(scenario==3?.5:scenario==4?.95:.8);GL11.glClear(GL11.GL_COLOR_BUFFER_BIT|GL11.GL_DEPTH_BUFFER_BIT);
                 GL11.glEnable(GL11.GL_SCISSOR_TEST);GL11.glScissor(0,0,32,64);GL11.glClearColor(1,0,0,1);GL11.glClearDepth(.2);GL11.glClear(GL11.GL_COLOR_BUFFER_BIT|GL11.GL_DEPTH_BUFFER_BIT);GL11.glDisable(GL11.GL_SCISSOR_TEST);
                 assertTrue(WGLNVDXInterop.wglDXLockObjectsNV(device,objects));capture.capture(fbo,depth,sharedColor,sharedDepth,64,64);assertTrue(WGLNVDXInterop.wglDXUnlockObjectsNV(device,objects));GL11.glFinish();
                 assertEquals(0,NativeDx12.renderTranslucentInterop(frame,0,0,0,opaque+1));assertTrue(NativeDx12.waitInteropFrame(opaque+2));
@@ -121,8 +143,95 @@ abstract class NativeMaterialsInteropTestBase {
                 if(scenario==2){int center=(32*64+32)*4;assertTrue(Byte.toUnsignedInt(pixels.get(center))<120,"Water must reflect the scene rather than remain white");assertEquals(255,Byte.toUnsignedInt(pixels.get(center+1)),1,"SSR must find the green scene; the black sky fallback would darken green");}
             }
             assertTrue(green[0]>green[1]+10,"Refraction must change native water output");
+            assertTrue(green[3]>green[4]+1,"Deeper water must absorb more light even with waves and SSR disabled: "+green[3]+" vs "+green[4]);
             assertEquals(GL11.GL_NO_ERROR,GL11.glGetError());
         }finally{GL30.glBindFramebuffer(GL30.GL_FRAMEBUFFER,0);GL30.glDeleteFramebuffers(fbo);GL11.glDeleteTextures(color);GL11.glDeleteTextures(depth);}
+    }
+    @Test void materialControlsChangeOnlyTheirSurfacesAndZeroRestoresOutput(){
+        var vertices=ByteBuffer.allocateDirect(240).order(ByteOrder.nativeOrder());
+        for(int q=0;q<3;q++)for(float[] p:new float[][]{{-.28f,-.6f},{.28f,-.6f},{.28f,.6f},{-.28f,.6f}}){
+            vertex(vertices,p[0]+(q-1)*.62f,p[1],.4f,0xff808080,q==0?1:q==1?7:6);
+            vertices.put(vertices.position()-3,(byte)90);vertices.put(vertices.position()-2,(byte)-90);
+        }
+        vertices.flip();NativeDx12.updateTerrainSection(1,0,0,0,vertices,12,indices(3),new int[]{18,0,0,0});NativeDx12.setVisibleSections(new long[]{1},1,true);
+        var light=ByteBuffer.allocateDirect(1024).order(ByteOrder.nativeOrder());for(int i=0;i<256;i++)light.putInt(0xff404040);light.flip();NativeDx12.updateLightmap(light);
+        float[] frame=matrix(new Matrix4f());ByteBuffer[] result=new ByteBuffer[7];FloatBuffer depth=null;
+        for(int step=0;step<7;step++){
+            if(step>=5){
+                for(int v=0;v<12;v++)vertices.putShort(v*20+6,(short)(step==5?0x00f0:0xf0f0));
+                NativeDx12.updateTerrainSection(1,0,0,0,vertices,12,indices(3),new int[]{18,0,0,0});
+            }
+            NativeDx12.setTerrainEffects(new float[]{0,0,0,0,0,0,step==6?-1:1,0,0,step==2||step==5?1:0});
+            NativeDx12.setMaterialEffects(new float[]{step==1||step==6?1:0,step==2||step==5?1:0,step==3?1:0,0});
+            assertEquals(0,NativeDx12.renderInterop(frame,0,0,0,256,step,0,new float[0],false,true));finish(step);
+            result[step]=readShared();if(step==0)depth=readDepth();else assertEquals(depth,readDepth(),"Material shading cannot alter geometry depth");
+        }
+        int stone=(32*64+12)*4,metal=(32*64+32)*4,emissive=(32*64+51)*4;
+        assertTrue(Byte.toUnsignedInt(result[1].get(metal))>Byte.toUnsignedInt(result[0].get(metal))+10,"Metal must receive a solar highlight");
+        assertTrue(Byte.toUnsignedInt(result[2].get(stone))<Byte.toUnsignedInt(result[0].get(stone)),"Rain must darken exposed stone");
+        assertEquals(result[0].get(emissive),result[2].get(emissive),"Wetness must not darken emissive material");
+        assertTrue(Byte.toUnsignedInt(result[3].get(emissive))>Byte.toUnsignedInt(result[0].get(emissive))+50,"Emissive control must restore unlit surface color");
+        assertEquals(result[0].get(stone),result[3].get(stone),"Emissive control cannot brighten ordinary stone");
+        assertEquals(result[0],result[4],"Zero must restore every original pixel");
+        assertEquals(result[0],result[5],"No skylight must prevent rain wetting interior faces");
+        assertEquals(result[0],result[6],"Sun highlights must be disabled at night");
+        assertEquals(GL11.GL_NO_ERROR,GL11.glGetError());
+    }
+    @Test void indexWidthsPreserveBoundaryVerticesAndDrawFallback(){
+        float[] frame=matrix(new Matrix4f());long next=0;
+        for(int count:new int[]{65536,65540}){
+            int base=count-4;var vertices=ByteBuffer.allocateDirect(count*20).order(ByteOrder.nativeOrder());vertices.position(base*20);
+            for(float[] p:new float[][]{{-.7f,-.7f},{.7f,-.7f},{.7f,.7f},{-.7f,.7f}})vertex(vertices,p[0],p[1],.4f,0xff0000ff,1);
+            vertices.flip();var indices=ByteBuffer.allocateDirect(24).order(ByteOrder.nativeOrder());for(int i:new int[]{0,1,2,2,3,0})indices.putInt(base+i);indices.flip();
+            NativeDx12.updateTerrainSection(1,0,0,0,vertices,count,indices,new int[]{6,0,0,0});NativeDx12.setVisibleSections(new long[]{1},1,true);
+            ByteBuffer expected=null;
+            for(boolean indirect:new boolean[]{true,false}){
+                assertEquals(0,NativeDx12.renderInterop(frame,0,0,0,256,next,0,new float[0],false,indirect));finish(next++);
+                var image=readShared();int center=(32*64+32)*4;assertEquals(255,Byte.toUnsignedInt(image.get(center)));assertEquals(0,Byte.toUnsignedInt(image.get(center+1)));
+                if(expected==null)expected=image;else assertEquals(expected,image,"Indirect and direct draw must agree at the index-width boundary");
+            }
+        }
+        assertEquals(GL11.GL_NO_ERROR,GL11.glGetError());
+    }
+    @Test void frontOrderingPreservesColorDepthAndCoplanarTies(){
+        for(int key=1;key<=3;key++){
+            var vertices=ByteBuffer.allocateDirect(80).order(ByteOrder.nativeOrder());
+            for(float[] p:new float[][]{{-.8f,-.8f},{.8f,-.8f},{.8f,.8f},{-.8f,.8f}})vertex(vertices,p[0],p[1],key==1?.6f:.2f,key==1?0xff0000ff:key==2?0xff00ff00:0xffff0000,1);
+            vertices.flip();NativeDx12.updateTerrainSection(key,0,0,key==1?16:0,vertices,4,indices(1),new int[]{6,0,0,0});
+        }
+        float[] frame=matrix(new Matrix4f().m22(.03f));ByteBuffer expected=null;FloatBuffer expectedDepth=null;
+        long[][] orders={{1,2},{2,1},{1,2,3},{1,3,2}};
+        for(int i=0;i<orders.length;i++){
+            NativeDx12.setVisibleSections(orders[i],orders[i].length,true);NativeDx12.renderInterop(frame,0,0,0,256,i,0,new float[0],false,i%2==0);finish(i);
+            var image=readShared();var depth=readDepth();int center=(32*64+32)*4;
+            if(i==0){expected=image;expectedDepth=depth;assertEquals(255,Byte.toUnsignedInt(image.get(center+1)));}
+            if(i==1){assertEquals(expected,image);assertEquals(expectedDepth,depth);}
+            if(i==2)assertEquals(255,Byte.toUnsignedInt(image.get(center+2)),"Stable ties must preserve last coplanar draw");
+            if(i==3)assertEquals(255,Byte.toUnsignedInt(image.get(center+1)));
+        }
+        assertEquals(GL11.GL_NO_ERROR,GL11.glGetError());
+    }
+    @Test void translucentOrderCacheTracksCameraAndReplacement(){
+        var vertices=ByteBuffer.allocateDirect(160).order(ByteOrder.nativeOrder());
+        for(int q=0;q<2;q++)for(float[] p:new float[][]{{-.8f,-.8f},{.8f,-.8f},{.8f,.8f},{-.8f,.8f}})vertex(vertices,p[0],p[1],q==0?.4f:.6f,q==0?0x800000ff:0x80ff0000,4);
+        vertices.flip();NativeDx12.updateTerrainSection(1,0,0,0,vertices,8,indices(2),new int[]{0,0,0,12});NativeDx12.setVisibleSections(new long[]{1},1,true);
+        ByteBuffer previous=null;
+        for(int step=0;step<4;step++){
+            double camera=step<2?0:1;
+            if(step==3){
+                for(int i=0;i<8;i++)vertices.putInt(i*20+8,i<4?0x80ff0000:0x800000ff);
+                NativeDx12.updateTerrainSection(1,0,0,0,vertices,8,indices(2),new int[]{0,0,0,12});
+            }
+            float[] frame=matrix(step<2?new Matrix4f():new Matrix4f().m22(-1));long opaque=step*2;
+            assertEquals(0,NativeDx12.renderInterop(frame,0,0,camera,256,opaque,0,new float[0],false,true));finish(opaque);
+            assertEquals(0,NativeDx12.renderTranslucentInterop(frame,0,0,camera,opaque+1));finish(opaque+1);
+            var image=readShared();int center=(32*64+32)*4;
+            if(step==1)assertEquals(previous,image,"Stationary camera must reuse the same sorted result");
+            if(step==0||step==1||step==3)assertTrue(Byte.toUnsignedInt(image.get(center))>Byte.toUnsignedInt(image.get(center+2)),"Expected red in front, step="+step);
+            else assertTrue(Byte.toUnsignedInt(image.get(center+2))>Byte.toUnsignedInt(image.get(center)),"Moving behind the quads must reverse the blend order");
+            previous=image;
+        }
+        assertEquals(GL11.GL_NO_ERROR,GL11.glGetError());
     }
     @Test void nativeWindChangesFoliageGeometry(){
         var vertices=ByteBuffer.allocateDirect(80).order(ByteOrder.nativeOrder());for(float[] p:new float[][]{{-.7f,-.7f},{.7f,-.7f},{.7f,.7f},{-.7f,.7f}})vertex(vertices,p[0],p[1],.4f,-1,3);vertices.flip();

@@ -1,4 +1,8 @@
-> Atualização Direct 1.4.1: [propriedade por seção e correção de chunks](correcao-chunks-1.4.1.md). API pública continua 1.3.0; o fluxo global de cobertura foi substituído por composição mista segura.
+> Direct 1.5.0 / API 1.4.0: [materiais, controles e compatibilidade](materiais-1.5.0.md). As notas abaixo de versões anteriores são históricas.
+
+> Atualização Direct 1.4.2: [cor compartilhada, fallback e medições](interop-cor-1.4.2.md). A API pública continua 1.3.0. A ponte D3D11On12/WGL permanece, com cópia de profundidade e cópia de cor apenas no fallback.
+>
+> Direct 1.4.1: [propriedade por seção e correção de chunks](correcao-chunks-1.4.1.md); o fluxo global de cobertura foi substituído por composição mista segura.
 
 # Direct 1.4.0 / API 1.3.0 — contrato e integração nativa
 

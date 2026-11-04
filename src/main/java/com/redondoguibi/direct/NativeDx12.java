@@ -68,6 +68,7 @@ final class NativeDx12 {
     }
     private static native void updateTerrainSectionV2(long key,int sectionX,int sectionY,int sectionZ,ByteBuffer vertices,int vertexCount,ByteBuffer indices,int[] counts);
     static native void setTerrainEffects(float[] effects);
+    static native void setMaterialEffects(float[] effects);
     static native int renderTranslucentInterop(float[] matrix,double x,double y,double z,long frameIndex);
     static native int translucentFrameStatus();
 

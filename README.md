@@ -16,9 +16,19 @@ On a machine with an OpenGL driver, also run `.\gradlew.bat graphicsTest`. This 
 
 `build` compiles the Java mod and native DLL on Windows. The native smoke test creates a D3D12 WARP device, direct queue/list, and fence. `compileJava`, `test`, and `javadoc` can also run on Linux without building the Windows renderer. The Linux CI job runs only those Java checks and does not publish a JAR. The Windows CI job creates the distributable JAR and verifies that it contains `META-INF/native/windows-x86_64/direct_renderer.dll`; a JAR built manually on Linux does not include the Windows backend and must not be used as the DX12 release artifact.
 
-The native DLL links Windows SDK libraries (`d3d11`, `d3d12`, `dxgi`, and `d3dcompiler`). D3D11On12 is used only to expose/copy D3D12 color and depth to OpenGL-compatible textures for WGL interop; terrain geometry and extension passes are recorded and rendered by native D3D12.
+The native DLL links Windows SDK libraries (`d3d11`, `d3d12`, `dxgi`, and `d3dcompiler`). D3D11On12 exposes the native color target to WGL when compatible, retaining a copied-color fallback; depth still uses a copied bridge. Terrain geometry and extension passes are recorded and rendered by native D3D12.
 
 ## Renderer and capabilities
+
+Direct 1.5.3 reuses bounded capture workspaces, removes obsolete uploads before budget checks and consolidates the pending queue. See [research sources, implementation and allocation measurements](docs/referencias-otimizacao-1.5.3.md).
+
+Direct 1.5.2 bypasses inactive chunk-capture work, speeds up sequential index generation and caches native translucent quad order for an unchanged camera position. See [scope, CPU measurement and validation](docs/chunks-1.5.2.md).
+
+Direct 1.5.1 reduces terrain overdraw, compacts eligible GPU indices and removes duplicated section selection. See [measured results and validation limits](docs/terrain-1.5.1.md).
+
+Direct 1.5.0 / API 1.4.0 adds optional material highlights, rain wetness, emissive surfaces and depth-based water absorption in the native terrain passes. [Controls, cost measurements and limits](docs/materiais-1.5.0.md). Existing API calls remain supported.
+
+Direct 1.4.2 removes the intermediate color copy on compatible WGL drivers, retaining explicit synchronization and the copied bridge as fallback. It saves one RGBA8 image allocation and export copy, plus the color import copy when native translucency runs. See [measurements, fallback coverage and remaining game validation](docs/interop-cor-1.4.2.md). No in-game FPS gain is certified.
 
 Direct 1.2.4 uses a single terrain color target and copies the actual D32 depth buffer through 11On12, eliminating the former shader-written depth export target. Invalidated frames are rejected before the CPU waits for their completion. See [measured workload and validation limits](docs/dx12-terrain-performance.md).
 
@@ -28,7 +38,7 @@ Direct 1.2.4 uses a single terrain color target and copies the actual D32 depth 
 - Terrain capture retains vanilla vertex colors/AO and both light coordinates inside the original 16-byte prefix. The native vertex shader samples the CPU-captured vanilla lightmap. The pixel shader applies vanilla fog distance/shape, smoothstep fog, color modulation and the layer-specific alpha cutoff. Counter-clockwise front faces and back-face culling are verified by the WGL integration test.
 - Replacement uses the actual vanilla visible-section selection, including occlusion, with no additional spherical-distance rejection that could create holes. Missing, pending or incompatible visible meshes retain vanilla rendering. The selection and capture readiness are rechecked after compilation before composition.
 - The full block atlas is uploaded on load/reload. Actual sprite uploads mark changed rectangles; subsequent animation updates read only those rectangles and their mipmaps. BC7 encoding of private pixel snapshots runs on a daemon worker, with block-aligned patches, reused buffers, reload generation checks and upload-ring backpressure. BC7 remains optional and lossy. The lightmap is captured from its CPU image only when vanilla updates it, avoiding a per-frame GL readback.
-- Native D3D12 renders one color target and the actual depth buffer, without a shader-written depth export. D3D11On12 copies both to WGL textures on the same command queue, using acquire/release and Flush rather than an additional CPU wait before the copy. Replacement waits for the current output fence at composition, then writes `gl_FragDepth`; it does not use a previous camera frame during movement. GPU semaphores or a real GLsync protect subsequent reuse. A watchdog rejects stalled/device-removed work; The optional translucent stage additionally completes the current GL scene capture before native import; this synchronization cost is measured separately.
+- Native D3D12 renders one color target and the actual depth buffer, without a shader-written depth export. D3D11On12 shares the acquired color target with WGL when registration exposes valid storage; otherwise it copies color. Depth is always copied. Acquire/release and Flush preserve queue order. Replacement waits for the current output fence at composition, then writes `gl_FragDepth`; it does not use a previous camera frame during movement. GPU semaphores or a real GLsync protect subsequent reuse. A watchdog rejects stalled/device-removed work; the optional translucent stage additionally completes the current GL scene capture before native import; this synchronization cost is measured separately.
 - On initialization, the public API reports the adapter name, hardware/software adapter status, descriptor tier, pipeline-library availability, semaphore status, and WGL support. `renderPasses` is reported as `false` because Direct binds targets explicitly. The in-game status overlay shows whether Direct, CPU fallback, or vanilla rendering is active.
 
 Direct 1.4.0 / API 1.3.0 supports native near sun shadows, foliage wind, translucent blending, water waves/refraction and bounded screen-space reflections. Raydiance requests these independently through `DirectTerrainEffects`; Direct owns their shaders and memory. Translucency retains vanilla on Fabulous/custom targets or when its index budget is exceeded. Without water/reflection requests, the second interop round trip is skipped unless `dx12Translucency=true`. Entities, GUI, sky and features not migrated remain OpenGL. Direct does not load Iris packs.
@@ -42,6 +52,7 @@ See [renderer validation](docs/renderer-validation.md) for test coverage and the
 Open Minecraft's mod configuration screen and select **Direct DX12**. The client options are:
 
 - `enableDx12Preview` — enable Direct's D3D12 renderer (off by default; experimental).
+- `preferDirectColorInterop` — share native color when validated, falling back to copied color if incompatible (on by default; applied on backend initialization/resize).
 - `replaceVanillaTerrain` — true selects experimental color/depth replacement; false selects the diagnostic overlay.
 - `profileRenderer` — log FPS, bounded frame-time percentiles, CPU/GPU costs, atlas traffic and draw counts.
 - `compressBlockAtlas` — compress the D3D12 block atlas with BC7 (on by default).

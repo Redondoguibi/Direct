@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuite name="com.redondoguibi.direct.NativeMaterialsInteropTest" tests="1" skipped="0" failures="1" errors="0" timestamp="2026-11-04T01:32:16.700Z" hostname="DESKTOP-1EOIJJB" time="0.854">
+  <properties/>
+  <testcase name="typedDepthProbe()" classname="com.redondoguibi.direct.NativeMaterialsInteropTest" time="0.854">
+    <failure message="org.opentest4j.AssertionFailedError: expected: &lt;64&gt; but was: &lt;0&gt;" type="org.opentest4j.AssertionFailedError">org.opentest4j.AssertionFailedError: expected: &lt;64&gt; but was: &lt;0&gt;
+	at app//com.redondoguibi.direct.NativeMaterialsInteropTestBase.typedDepthProbe(NativeMaterialsInteropTest.java:185)
+	at java.base@21.0.12.1/java.lang.reflect.Method.invoke(Method.java:580)
+	at java.base@21.0.12.1/java.util.ArrayList.forEach(ArrayList.java:1596)
+	at java.base@21.0.12.1/java.util.ArrayList.forEach(ArrayList.java:1596)
+</failure>
+  </testcase>
+  <system-out><![CDATA[TYPED_DEPTH width=0 format=6408 error=0
+]]></system-out>
+  <system-err><![CDATA[]]></system-err>
+</testsuite>
