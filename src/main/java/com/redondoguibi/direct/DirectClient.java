@@ -17,6 +17,8 @@ public class DirectClient {
         container.registerConfig(ModConfig.Type.CLIENT, ClientConfig.SPEC);
         container.getEventBus().addListener(this::onClientSetup);
         container.getEventBus().addListener(DirectStatusOverlay::register);
+        net.neoforged.neoforge.common.NeoForge.EVENT_BUS.addListener(
+                (net.neoforged.neoforge.client.event.ClientTickEvent.Post event) -> Dx12GlInterop.idle());
         Direct.LOGGER.info("Direct DX12 client initialized.");
     }
 

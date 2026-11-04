@@ -26,7 +26,7 @@ abstract class LevelRendererMixin {
     @WrapMethod(method = "renderSectionLayer")
     private void direct$replaceTerrain(RenderType renderType, double x, double y, double z,
             Matrix4f frustumMatrix, Matrix4f projectionMatrix, Operation<Void> original) {
-        boolean skip = Dx12GlInterop.shouldSkipVanillaLayer(renderType);
+        boolean skip = renderType==RenderType.translucent()?Dx12GlInterop.renderTranslucentLayer():Dx12GlInterop.shouldSkipVanillaLayer(renderType);
         if (renderType == RenderType.solid() || renderType == RenderType.cutout() || renderType == RenderType.cutoutMipped())
             com.redondoguibi.direct.RendererMetrics.layer(skip);
         if (skip) {
@@ -48,13 +48,15 @@ abstract class LevelRendererMixin {
     @com.llamalad7.mixinextras.injector.wrapoperation.WrapOperation(method = "renderSectionLayer",
             at = @At(value = "INVOKE", target = "Lcom/mojang/blaze3d/vertex/VertexBuffer;draw()V"))
     private void direct$countVanillaDraw(com.mojang.blaze3d.vertex.VertexBuffer buffer, Operation<Void> original) {
-        com.redondoguibi.direct.RendererMetrics.vanillaDraw();
-        original.call(buffer);
+        if(!Dx12GlInterop.shouldSkipVanillaBuffer(buffer)){
+            com.redondoguibi.direct.RendererMetrics.vanillaDraw();
+            original.call(buffer);
+        }
     }
 
     @Inject(method = "renderLevel", at = @At(value = "INVOKE",
             target = "Lnet/minecraft/client/renderer/LevelRenderer;compileSections(Lnet/minecraft/client/Camera;)V",
-            shift = At.Shift.BEFORE))
+            shift = At.Shift.AFTER))
     private void direct$submitTerrain(DeltaTracker deltaTracker, boolean renderBlockOutline, Camera camera,
             GameRenderer gameRenderer, LightTexture lightTexture, Matrix4f frustumMatrix,
             Matrix4f projectionMatrix, CallbackInfo callback) {
@@ -81,7 +83,6 @@ abstract class LevelRendererMixin {
             Camera camera, GameRenderer gameRenderer, LightTexture lightTexture, Matrix4f frustumMatrix,
             Matrix4f projectionMatrix, CallbackInfo callback) {
         if (Dx12GlInterop.shouldCompositeBeforeVanilla()) {
-            Dx12GlInterop.captureVisibleSections(visibleSections);
             Dx12GlInterop.compositeTerrainFrame();
         }
     }

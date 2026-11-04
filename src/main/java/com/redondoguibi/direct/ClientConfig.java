@@ -19,6 +19,11 @@ public final class ClientConfig {
             .comment("Show Direct's renderer state in the in-game HUD.")
             .define("showRendererStatus", true);
 
+    public static final ModConfigSpec.BooleanValue PREFER_DIRECT_COLOR_INTEROP = BUILDER
+            .comment("Share the native DX12 color target through D3D11On12/WGL instead of copying it.",
+                    "Falls back to the original bridge when registration is incompatible. Applied on backend initialization/resize.")
+            .define("preferDirectColorInterop", true);
+
     // Spread chunk uploads over multiple frames to avoid large GPU submission spikes.
     public static final ModConfigSpec.IntValue MAX_MESH_UPLOADS_PER_FRAME = BUILDER
             .comment("Maximum number of compiled terrain sections uploaded to D3D12 per frame.")
@@ -61,6 +66,11 @@ public final class ClientConfig {
                     "Experimental until in-game visual and performance validation; false enables the diagnostic overlay.")
             .define("replaceVanillaTerrain", true);
 
+    public static final ModConfigSpec.BooleanValue DX12_TRANSLUCENCY = BUILDER
+            .comment("Render translucent blocks in DX12 even without a requested water/reflection effect.",
+                    "Water/reflection requests enable this stage automatically. Off avoids a second interop round trip when unused.")
+            .define("dx12Translucency", false);
+
     public static final ModConfigSpec.IntValue UPLOAD_RING_BUFFER_MIB = BUILDER
             .comment("Persistent per-frame D3D12 upload-ring capacity shared by terrain section updates.")
             .defineInRange("uploadRingBufferMiB", 32, 16, 512);
@@ -74,7 +84,8 @@ public final class ClientConfig {
             .defineInRange("maxTerrainArenaMiB", 256, 64, 4096);
 
     public static final ModConfigSpec.IntValue MAX_PENDING_MESH_MIB = BUILDER
-            .comment("Soft backpressure limit for compiled terrain meshes waiting for GPU upload.")
+            .comment("Soft warning threshold for coalesced, committed meshes waiting for GPU upload.",
+                    "The render thread never blocks waiting for this queue; per-frame uploads remain budgeted.")
             .defineInRange("maxPendingMeshMiB", 128, 64, 2048);
 
     public static final ModConfigSpec.BooleanValue PROFILE_RENDERER = BUILDER

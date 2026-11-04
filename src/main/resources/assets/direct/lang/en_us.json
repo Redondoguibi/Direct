@@ -4,8 +4,10 @@
   "direct.configuration.section.direct.client.toml.title": "Direct DX12",
   "direct.configuration.enableDx12Preview": "Enable DX12 terrain (experimental)",
   "direct.configuration.replaceVanillaTerrain": "Replace vanilla terrain (experimental)",
+  "direct.configuration.dx12Translucency": "DX12 translucent blocks (automatic with water effects)",
   "direct.configuration.compressBlockAtlas": "Compress block atlas (lossy BC7)",
   "direct.configuration.showRendererStatus": "Show renderer status",
+  "direct.configuration.preferDirectColorInterop": "Share native terrain color when supported",
   "direct.configuration.maxMeshUploadsPerFrame": "Mesh uploads per frame",
   "direct.configuration.maxMeshUploadMiBPerFrame": "Mesh upload budget (MiB/frame)",
   "direct.configuration.terrainRenderDistancePercent": "DX12 render distance (%)",
@@ -18,5 +20,5 @@
   "direct.configuration.terrainArenaPageMiB": "Terrain arena page size (MiB)",
   "direct.configuration.maxTerrainArenaMiB": "Terrain GPU memory budget (MiB)",
   "direct.configuration.maxPendingMeshMiB": "Pending mesh memory budget (MiB)",
-  "direct.configuration.profileRenderer": "Log renderer costs (no FPS recording)"
+  "direct.configuration.profileRenderer": "Log FPS, frame times and renderer costs"
 }

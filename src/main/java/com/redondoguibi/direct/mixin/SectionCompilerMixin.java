@@ -32,7 +32,7 @@ abstract class SectionCompilerMixin {
         try {
             SectionCompiler.Results results = original.call(sectionPos, region, sorting, bufferPack,
                     additionalRenderers);
-            TerrainMeshStore.capture(sectionPos, results);
+            TerrainMeshStore.capture(sectionPos, results, region);
             return results;
         } finally {
             // Also runs when vanilla compilation throws before returning Results.

@@ -17,6 +17,11 @@ abstract class RenderSectionMixin {
     @Shadow
     public abstract BlockPos getOrigin();
 
+    @Inject(method="setCompiled",at=@At("RETURN"))
+    private void direct$committed(SectionRenderDispatcher.CompiledSection compiled,CallbackInfo ci){
+        TerrainMeshStore.vanillaCommitted((SectionRenderDispatcher.RenderSection)(Object)this);
+    }
+
     @Inject(method = "reset", at = @At("HEAD"))
     private void direct$removeTerrain(CallbackInfo callback) {
         TerrainMeshStore.remove(SectionPos.of(getOrigin()));

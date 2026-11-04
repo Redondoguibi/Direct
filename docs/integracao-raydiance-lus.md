@@ -1,3 +1,5 @@
+> Relatório histórico de 2026-11-02. Estado atual: [Direct 1.4.0 / API 1.3.0](native-shader-contract.md). As pendências de geometria descritas abaixo foram implementadas; validação no jogo continua separada.
+
 # Integração Direct / Raydiance / Lus — 2026-11-02
 
 ## Estado: correções de estabilidade entregues; migração de materiais incompleta

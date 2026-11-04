@@ -13,6 +13,34 @@ class TerrainBufferPackerTest {
     private static final int SOURCE_PREFIX = 8;
 
     @Test
+    void v2PreservesNormalsAndAnchorsPlantBases() {
+        var source=ByteBuffer.allocateDirect(4*32).order(ByteOrder.nativeOrder());
+        for(int i=0;i<4;i++)source.putFloat(i%2).putFloat(i<2?0:1).putFloat(0).putInt(-1)
+                .putFloat(.2f).putFloat(.3f).putInt(0x00f000f0).put((byte)-127).put((byte)0).put((byte)127).put((byte)0);
+        source.flip();var packed=ByteBuffer.allocateDirect(80).order(ByteOrder.nativeOrder());
+        TerrainBufferPacker.packVertices20(packed,source,4,32,0,12,16,24,28,new byte[]{8});
+        assertEquals(0,source.position());assertEquals(80,packed.position());
+        for(int i=0;i<4;i++){
+            assertEquals(-127,packed.get(i*20+16));assertEquals(127,packed.get(i*20+18));
+            assertEquals(i<2?8:136,Byte.toUnsignedInt(packed.get(i*20+19)));
+        }
+        packed.clear();
+        assertThrows(IllegalArgumentException.class,()->TerrainBufferPacker.packVertices20(packed,source,4,32,0,12,16,24,30,new byte[]{8}));
+        assertEquals(0,packed.position());
+        assertThrows(IllegalArgumentException.class,()->TerrainBufferPacker.packVertices20(packed,source,4,32,0,12,16,24,28,new byte[0]));
+    }
+
+    @Test
+    void v2MarksWaterSurfacesWithoutMovingTheBottom() {
+        var source=ByteBuffer.allocateDirect(8*32).order(ByteOrder.nativeOrder());
+        for(float[] p:new float[][]{{0,1,0},{0,1,1},{1,1,1},{1,1,0},{0,0,0},{1,0,0},{1,0,1},{0,0,1}})
+            source.putFloat(p[0]).putFloat(p[1]).putFloat(p[2]).putInt(-1).putFloat(.2f).putFloat(.3f).putInt(0).putInt(0x00007f00);
+        source.flip();var packed=ByteBuffer.allocateDirect(160).order(ByteOrder.nativeOrder());
+        TerrainBufferPacker.packVertices20(packed,source,8,32,0,12,16,24,28,new byte[]{5,5});
+        for(int i=0;i<8;i++)assertEquals(i<4?133:5,Byte.toUnsignedInt(packed.get(i*20+19)));
+    }
+
+    @Test
     void packsMultipleDirectVertexLayersAtTheirCurrentPositions() {
         ByteBuffer destination = ByteBuffer.allocateDirect(2 * 16).order(ByteOrder.nativeOrder());
         ByteBuffer firstLayer = vertex(1.0f, 2.0f, 3.0f, 0x11223344, 0.5f, 0.25f);

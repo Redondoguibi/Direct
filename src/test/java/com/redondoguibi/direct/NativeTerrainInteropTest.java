@@ -15,7 +15,8 @@ import org.lwjgl.system.MemoryStack;
 
 @Tag("graphics")
 @EnabledOnOs(OS.WINDOWS)
-class NativeTerrainInteropTest {
+abstract class NativeTerrainInteropTestBase {
+    boolean aliased(){return false;}
     @Test
     void transfersCurrentColorDepthLightAndAnimatedPatchesThroughRealWgl() {
         System.load(Path.of("build/generated/nativeResources/META-INF/native/windows-x86_64/direct_renderer.dll").toAbsolutePath().toString());
@@ -39,8 +40,9 @@ class NativeTerrainInteropTest {
             assertNotEquals(0, device);
             int color = GL11.glGenTextures();
             int depth = GL11.glGenTextures();
-            colorObject = register(device, handles[1], color);
+            colorObject = register(device, aliased()?NativeDx12.acquireColorInteropTarget():handles[1], color);
             depthObject = register(device, handles[4], depth);
+            NativeDx12.configureColorAlias(aliased());
             ByteBuffer atlas = ByteBuffer.allocateDirect(4 * 4 * 4);
             for (int i = 0; i < 16; i++) atlas.putInt(-1);
             atlas.flip();
@@ -190,17 +192,26 @@ class NativeTerrainInteropTest {
             GL11.glFinish(); NativeDx12.signalInteropFence(7);
             NativeDx12.configureRenderPasses(new String[0]);
 
+            // Every pass must see the ORIGINAL terrain depth at t1, including ping-pong input.
+            String depthShader="Texture2D<float> DirectDepth:register(t1); float4 main(float4 p:SV_Position):SV_Target0 {float d=DirectDepth.Load(int3(int2(p.xy),0));return float4(d,d,d,1);}";
+            NativeDx12.configureRenderPasses(new String[]{depthShader,depthShader});
+            NativeDx12.renderInterop(constants,0,0,0,256,7,0,new float[120],false,true);assertTrue(NativeDx12.waitInteropFrame(8));
+            assertTrue(WGLNVDXInterop.wglDXLockObjectsNV(device,objects));GL11.glBindTexture(GL11.GL_TEXTURE_2D,color);GL11.glGetTexImage(GL11.GL_TEXTURE_2D,0,GL11.GL_RGBA,GL11.GL_UNSIGNED_BYTE,colors);
+            assertEquals(64,Byte.toUnsignedInt(colors.get(center)),1,"depth .25 must be sampled by second HLSL pass");assertEquals(255,Byte.toUnsignedInt(colors.get(0)),"clear depth must remain 1");
+            assertTrue(WGLNVDXInterop.wglDXUnlockObjectsNV(device,objects));GL11.glFinish();NativeDx12.signalInteropFence(8);NativeDx12.configureRenderPasses(new String[0]);
+
             // Resize requires unregistering BOTH resources; an empty world exports clear depth.
             assertTrue(WGLNVDXInterop.wglDXUnregisterObjectNV(device, colorObject)); colorObject = 0;
             assertTrue(WGLNVDXInterop.wglDXUnregisterObjectNV(device, depthObject)); depthObject = 0;
             long[] resized = NativeDx12.resizeInterop(16, 16);
             int resizedColor=GL11.glGenTextures();
-            colorObject = register(device, resized[0], resizedColor);
+            colorObject = register(device, aliased()?NativeDx12.acquireColorInteropTarget():resized[0], resizedColor);
             int resizedDepth = GL11.glGenTextures();
             depthObject = register(device, resized[1], resizedDepth);
+            NativeDx12.configureColorAlias(aliased());
             NativeDx12.clearTerrain();
-            NativeDx12.renderInterop(constants, 0, 0, 0, 256, 7, 0, new float[0], false, true);
-            NativeDx12.waitInteropFrame(8);
+            NativeDx12.renderInterop(constants, 0, 0, 0, 256, 8, 0, new float[0], false, true);
+            NativeDx12.waitInteropFrame(9);
             var resizedObjects = stack.pointers(colorObject, depthObject);
             assertTrue(WGLNVDXInterop.wglDXLockObjectsNV(device, resizedObjects));
             GL11.glBindTexture(GL11.GL_TEXTURE_2D, resizedDepth);
@@ -208,7 +219,7 @@ class NativeTerrainInteropTest {
             GL11.glGetTexImage(GL11.GL_TEXTURE_2D, 0, GL11.GL_RED, GL11.GL_FLOAT, cleared);
             assertEquals(1f, cleared.get(8 * 16 + 8), 1e-5);
             assertTrue(WGLNVDXInterop.wglDXUnlockObjectsNV(device, resizedObjects));
-            GL11.glFinish(); NativeDx12.signalInteropFence(8);
+            GL11.glFinish(); NativeDx12.signalInteropFence(9);
             // Real asynchronous GL PBO -> CPU -> D3D12 atlas -> WGL color round trip.
             int glAtlas=GL11.glGenTextures();
             AtlasRegionUpdates updates=new AtlasRegionUpdates();
@@ -223,26 +234,26 @@ class NativeTerrainInteropTest {
                 light.rewind();NativeDx12.updateLightmap(light);
                 NativeDx12.updateTerrainSection(1,0,0,0,vertices,4,indices,new int[]{6,0,0});
                 NativeDx12.setVisibleSections(new long[]{1},1,true);
-                NativeDx12.renderInterop(constants,0,0,0,256,8,0,new float[0],false,true);
-                assertTrue(NativeDx12.waitInteropFrame(9));
+                NativeDx12.renderInterop(constants,0,0,0,256,9,0,new float[0],false,true);
+                assertTrue(NativeDx12.waitInteropFrame(10));
                 assertTrue(WGLNVDXInterop.wglDXLockObjectsNV(device,resizedObjects));
                 GL11.glBindTexture(GL11.GL_TEXTURE_2D,resizedColor);ByteBuffer result=stack.malloc(16*16*4);
                 GL11.glGetTexImage(GL11.GL_TEXTURE_2D,0,GL11.GL_RGBA,GL11.GL_UNSIGNED_BYTE,result);
                 int pixel=(8*16+8)*4;assertTrue(Byte.toUnsignedInt(result.get(pixel))>240,"async patch must reach terrain");
                 assertTrue(Byte.toUnsignedInt(result.get(pixel+1))<10);assertTrue(Byte.toUnsignedInt(result.get(pixel+2))<10);
-                assertTrue(WGLNVDXInterop.wglDXUnlockObjectsNV(device,resizedObjects));GL11.glFinish();NativeDx12.signalInteropFence(9);
+                assertTrue(WGLNVDXInterop.wglDXUnlockObjectsNV(device,resizedObjects));GL11.glFinish();NativeDx12.signalInteropFence(10);
                 // Discard a submitted image without sampling or waiting. Completion of
                 // the following frame must still be ordered, and retain correct depth/color.
-                NativeDx12.renderInterop(constants,0,0,0,256,9,0,new float[0],false,true);
-                NativeDx12.signalInteropFence(10);
                 NativeDx12.renderInterop(constants,0,0,0,256,10,0,new float[0],false,true);
-                assertTrue(NativeDx12.waitInteropFrame(11));
+                NativeDx12.signalInteropFence(11);
+                NativeDx12.renderInterop(constants,0,0,0,256,11,0,new float[0],false,true);
+                assertTrue(NativeDx12.waitInteropFrame(12));
                 assertTrue(WGLNVDXInterop.wglDXLockObjectsNV(device,resizedObjects));
                 GL11.glBindTexture(GL11.GL_TEXTURE_2D,resizedColor);GL11.glGetTexImage(GL11.GL_TEXTURE_2D,0,GL11.GL_RGBA,GL11.GL_UNSIGNED_BYTE,result);
                 assertTrue(Byte.toUnsignedInt(result.get(pixel))>240);
                 GL11.glBindTexture(GL11.GL_TEXTURE_2D,resizedDepth);GL11.glGetTexImage(GL11.GL_TEXTURE_2D,0,GL11.GL_RED,GL11.GL_FLOAT,cleared);
                 assertEquals(.25f,cleared.get(8*16+8),1e-5);
-                assertTrue(WGLNVDXInterop.wglDXUnlockObjectsNV(device,resizedObjects));GL11.glFinish();NativeDx12.signalInteropFence(11);
+                assertTrue(WGLNVDXInterop.wglDXUnlockObjectsNV(device,resizedObjects));GL11.glFinish();NativeDx12.signalInteropFence(12);
             }finally{updates.close();GL11.glDeleteTextures(glAtlas);}
             assertFalse(NativeDx12.hasInteropGpuSyncFault());
             assertEquals(GL11.GL_NO_ERROR, GL11.glGetError());
@@ -329,4 +340,9 @@ class NativeTerrainInteropTest {
         GL30.glBindFramebuffer(GL30.GL_FRAMEBUFFER, 0);
         GL11.glDisable(GL11.GL_DEPTH_TEST);
     }
+}
+
+class NativeTerrainInteropTest extends NativeTerrainInteropTestBase {}
+class NativeAliasedTerrainInteropTest extends NativeTerrainInteropTestBase {
+    @Override boolean aliased(){return true;}
 }

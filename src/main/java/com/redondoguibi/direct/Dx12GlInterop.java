@@ -42,6 +42,7 @@ public final class Dx12GlInterop {
     private static final int[] NO_OBJECTS = new int[0];
     private static final int MAX_ATLAS_LEVELS = 16;
     private static final AtlasRegionUpdates ATLAS_REGIONS = new AtlasRegionUpdates();
+    private static final InteropSceneCapture SCENE_CAPTURE=new InteropSceneCapture();
     private static final long RETRY_DELAY_NANOS = 5_000_000_000L;
     static final String VERTEX_SHADER = """
             #version 150
@@ -87,8 +88,13 @@ public final class Dx12GlInterop {
     private static boolean lightmapUploaded;
     private static long[] visibleKeys = new long[256];
     private static int visibleCount;
-    private static long[] submittedVisibleKeys = new long[256];
-    private static int submittedVisibleCount;
+    private static int visibleTranslucentCount;
+    private static List<SectionRenderDispatcher.RenderSection> currentVisibleSections=List.of();
+    private static int fallbackSections;
+    private static int fallbackBaseSections;
+    private static boolean translucentCovered;
+    private static final java.util.Set<com.mojang.blaze3d.vertex.VertexBuffer> ownedBuffers=java.util.Collections.newSetFromMap(new java.util.IdentityHashMap<>());
+    private static boolean reportedTranslucentBudget;
     private static boolean replacementFrame;
     private static int depthTexture;
     private static long depthInteropObject;
@@ -157,19 +163,80 @@ public final class Dx12GlInterop {
     public static boolean shouldCompositeBeforeVanilla() {
         return ClientConfig.REPLACE_VANILLA_TERRAIN.get();
     }
+    /** Replaces just the translucent layer after entities, importing their current color/depth first. */
+    public static boolean renderTranslucentLayer(){
+        if(!ClientConfig.ENABLE_DX12.get()||!shouldCompositeBeforeVanilla()||!initialized||!lastFrameSucceeded||!replacementFrame)return false;
+        var mc=Minecraft.getInstance();var target=mc.getMainRenderTarget();
+        var effects=DirectRenderApi.terrainEffects();
+        if(!ClientConfig.DX12_TRANSLUCENCY.get()&&effects.water()==0&&effects.reflections()==0)return false;
+        if(Minecraft.useShaderTransparency()||GL11.glGetInteger(GL30.GL_DRAW_FRAMEBUFFER_BINDING)!=target.frameBufferId)return false;
+        if(!PENDING_VIEW.matches(CAPTURED_VIEW,CAPTURED_PROJECTION,cameraX,cameraY,cameraZ)||!translucentCovered)return false;
+        if(visibleTranslucentCount==0)return true;
+        try(MemoryStack stack=MemoryStack.stackPush()){
+            if(frameIndex>=Long.MAX_VALUE-1)throw new IllegalStateException("Interop frame timeline exhausted");
+            int readiness=NativeDx12.translucentFrameStatus();
+            if(readiness==NativeDx12.FRAME_SKIPPED_BUSY)return false;
+            if(readiness==NativeDx12.FRAME_SKIPPED_BUDGET){
+                if(!reportedTranslucentBudget){Direct.LOGGER.warn("DX12 translucent index budget exceeded; keeping vanilla transparency and DX12 opaque terrain. Increase uploadRingBufferMiB if needed.");reportedTranslucentBudget=true;}
+                DirectStatusOverlay.setStatus("DX12 terrain / vanilla translucency (index budget)");return false;
+            }
+            if(readiness!=NativeDx12.FRAME_RENDERED_CPU_SYNC)throw new IllegalStateException("Translucent preflight failed");
+            long captureStart=System.nanoTime();
+            finishPendingGlSync();
+            var objects=stack.pointers(interopObject,depthInteropObject);
+            if(!WGLNVDXInterop.wglDXLockObjectsNV(interopDevice,objects))throw new IllegalStateException("Cannot lock scene capture");
+            try{SCENE_CAPTURE.capture(target.frameBufferId,target.getDepthTextureId(),texture,depthTexture,width,height);}
+            finally{if(!WGLNVDXInterop.wglDXUnlockObjectsNV(interopDevice,objects))throw new IllegalStateException("Cannot unlock scene capture");}
+            // Imported scene writes must complete before D3D12 can sample them. The shared
+            // consumption fence cannot be reused here: it already signaled for the base layer.
+            GL11.glFinish();
+            if(RendererMetrics.recording)RendererMetrics.translucentCaptureNanos+=System.nanoTime()-captureStart;
+            long submitStart=System.nanoTime();
+            int result=NativeDx12.renderTranslucentInterop(MATRIX,cameraX,cameraY,cameraZ,frameIndex);
+            if(RendererMetrics.recording)RendererMetrics.translucentSubmitNanos+=System.nanoTime()-submitStart;
+            if(result==NativeDx12.FRAME_SKIPPED_BUSY||result==NativeDx12.FRAME_SKIPPED_BUDGET)return false;
+            if(result!=NativeDx12.FRAME_RENDERED_CPU_SYNC)throw new IllegalStateException("Translucent submission failed");
+            long value=++frameIndex;
+            long waitStart=System.nanoTime();
+            if(!NativeDx12.waitInteropFrame(value))throw new IllegalStateException("Translucent frame incomplete");
+            if(RendererMetrics.recording)RendererMetrics.translucentWaitNanos+=System.nanoTime()-waitStart;
+            if(RendererMetrics.recording){var metrics=NativeDx12.frameMetrics();if(metrics!=null&&metrics[0]>=0){RendererMetrics.translucentGpuNanos+=(long)(metrics[0]*1e6);RendererMetrics.translucentDraws+=(long)metrics[2];}}
+            long presentStart=System.nanoTime();
+            if(!WGLNVDXInterop.wglDXLockObjectsNV(interopDevice,objects))throw new IllegalStateException("Cannot lock transparent output");
+            try{SCENE_CAPTURE.present(target.frameBufferId,texture,depthTexture,width,height);}
+            finally{if(!WGLNVDXInterop.wglDXUnlockObjectsNV(interopDevice,objects))throw new IllegalStateException("Cannot unlock transparent output");}
+            queueCpuGlSync(value);
+            if(RendererMetrics.recording){RendererMetrics.translucentPresentNanos+=System.nanoTime()-presentStart;RendererMetrics.translucentFrames++;}
+            return true;
+        }catch(RuntimeException|UnsatisfiedLinkError ex){
+            Direct.LOGGER.error("DX12 translucent layer failed; preserving vanilla translucent rendering",ex);
+            lastFrameSucceeded=false;shutdown();disableTerrainCapture();retryAfterNanos=System.nanoTime()+RETRY_DELAY_NANOS;return false;
+        }
+    }
 
     public static void captureVisibleSections(List<SectionRenderDispatcher.RenderSection> sections) {
-        visibleCount = 0;
-        if (!ClientConfig.ENABLE_DX12.get()) return;
-        if (visibleKeys.length < sections.size()) visibleKeys = new long[sections.size()];
-        for (var section : sections) {
-            var compiled = section.getCompiled();
-            if (!compiled.isEmpty(RenderType.solid()) || !compiled.isEmpty(RenderType.cutoutMipped())
-                    || !compiled.isEmpty(RenderType.cutout())) {
-                long key = SectionPos.of(section.getOrigin()).asLong();
-                visibleKeys[visibleCount++] = key;
-            }
+        currentVisibleSections=sections;
+        visibleCount=0;visibleTranslucentCount=0;fallbackSections=fallbackBaseSections=0;translucentCovered=true;ownedBuffers.clear();
+        if(!ClientConfig.ENABLE_DX12.get())return;
+        if(visibleKeys.length<sections.size())visibleKeys=new long[sections.size()];
+        for(var section:sections){
+            var compiled=section.getCompiled();
+            boolean translucent=!compiled.isEmpty(RenderType.translucent());
+            boolean base=!compiled.isEmpty(RenderType.solid())||!compiled.isEmpty(RenderType.cutoutMipped())||!compiled.isEmpty(RenderType.cutout());
+            if(!base&&!translucent)continue;
+            long key=SectionPos.of(section.getOrigin()).asLong();
+            boolean owned=TerrainMeshStore.owns(key);
+            if(translucent){visibleTranslucentCount++;if(!owned)translucentCovered=false;}
+            if(!owned){fallbackSections++;if(base)fallbackBaseSections++;continue;}
+            visibleKeys[visibleCount++]=key;
+            for(var layer:java.util.List.of(RenderType.solid(),RenderType.cutoutMipped(),RenderType.cutout()))
+                if(!compiled.isEmpty(layer))ownedBuffers.add(section.getBuffer(layer));
         }
+    }
+
+    /** Frozen ownership for this frame; never suppress a buffer before successful composition. */
+    public static boolean shouldSkipVanillaBuffer(com.mojang.blaze3d.vertex.VertexBuffer buffer){
+        return lastFrameSucceeded&&replacementFrame&&ownedBuffers.contains(buffer);
     }
 
     /** Current-frame composition: never cancels vanilla until BOTH color and depth were imported. */
@@ -179,9 +246,8 @@ public final class Dx12GlInterop {
         try {
             // Compilation may have changed the visible meshes after submission. An image
             // that cannot be displayed must not stall vanilla waiting for its completion.
-            if (!java.util.Arrays.equals(visibleKeys, 0, visibleCount, submittedVisibleKeys, 0, submittedVisibleCount)
-                    || !TerrainMeshStore.canReplaceVisible(visibleKeys, visibleCount)
-                    || !PENDING_VIEW.matches(CAPTURED_VIEW, CAPTURED_PROJECTION, cameraX, cameraY, cameraZ)) {
+            if (TerrainMeshStore.hasCaptureFault()
+                    || !PENDING_VIEW.matches(CAPTURED_VIEW,CAPTURED_PROJECTION,cameraX,cameraY,cameraZ)) {
                 discardPendingFrame();replacementFrame=false;
                 if(RendererMetrics.recording)RendererMetrics.discardedBeforeWait++;
                 return;
@@ -200,7 +266,7 @@ public final class Dx12GlInterop {
                     if(metrics.length>=5){RendererMetrics.gpuArenaBytes=(long)metrics[3];RendererMetrics.uploadRingBytes=(long)metrics[4];}
                 }
             }
-            if (!TerrainMeshStore.canReplaceVisible(visibleKeys, visibleCount)) {
+            if (TerrainMeshStore.hasCaptureFault()) {
                 discardPendingFrame();
                 replacementFrame = false;
                 return;
@@ -327,18 +393,17 @@ public final class Dx12GlInterop {
             }
             if (!lastSubmittedFrameReady("terrain resource updates")) return;
             TerrainMeshStore.uploadPending();
-            replacementFrame = shouldCompositeBeforeVanilla() && ClientConfig.TERRAIN_RENDER_DISTANCE_PERCENT.get() == 100
-                    && TerrainMeshStore.canReplaceVisible(visibleKeys, visibleCount);
-            if (shouldCompositeBeforeVanilla() && !replacementFrame) {
-                DirectStatusOverlay.setStatus("Vanilla (waiting for compatible visible meshes)");
+            captureVisibleSections(currentVisibleSections);
+            if(RendererMetrics.recording){RendererMetrics.ownershipFrames++;RendererMetrics.ownedSectionSamples+=visibleCount;RendererMetrics.fallbackSectionSamples+=fallbackSections;if(visibleCount>0&&fallbackBaseSections>0)RendererMetrics.mixedFrames++;}
+            replacementFrame = shouldCompositeBeforeVanilla() && ClientConfig.TERRAIN_RENDER_DISTANCE_PERCENT.get() == 100;
+            if (shouldCompositeBeforeVanilla() && (!replacementFrame||visibleCount==0)) {
+                DirectStatusOverlay.setStatus("Vanilla (initial terrain uploads)");
                 return;
             }
             uploadBlockAtlasIfNeeded(minecraft);
             uploadLightmap();
             NativeDx12.setVisibleSections(visibleKeys, visibleCount, replacementFrame);
-            if (submittedVisibleKeys.length < visibleCount) submittedVisibleKeys = new long[visibleCount];
-            System.arraycopy(visibleKeys, 0, submittedVisibleKeys, 0, visibleCount);
-            submittedVisibleCount = visibleCount;
+            if(DirectRenderApi.terrainEffects().shadows()>0){var keys=TerrainMeshStore.shadowKeys();NativeDx12.setShadowSections(keys);}
 
             CLIP_CORRECTION.mul(CAPTURED_PROJECTION, VIEW_PROJECTION).mul(CAPTURED_VIEW);
             VIEW_PROJECTION.get(MATRIX);
@@ -397,6 +462,9 @@ public final class Dx12GlInterop {
                         index * DirectRenderApi.MAX_UNIFORM_FLOATS);
             }
             NativeDx12.setProfilingEnabled(ClientConfig.PROFILE_RENDERER.get());
+            var effects=DirectRenderApi.terrainEffects();
+            float angle=minecraft.level.getSunAngle(0);
+            NativeDx12.setTerrainEffects(new float[]{minecraft.level.dimensionType().hasSkyLight()?effects.shadows():0,effects.water(),effects.reflections(),effects.wind(),effects.quality(),-(float)Math.sin(angle),(float)Math.cos(angle),0,(minecraft.level.getGameTime()%240000)/20f,minecraft.level.getRainLevel(0)});
             boolean useGpuSync = gpuSemaphoreInterop && ClientConfig.USE_GPU_SEMAPHORE_SYNC.get();
             long submittedAt = System.nanoTime();
             int renderResult = NativeDx12.renderInterop(MATRIX, cameraX, cameraY, cameraZ,
@@ -426,7 +494,8 @@ public final class Dx12GlInterop {
             frameIndex++;
             retryAfterNanos = 0;
             DirectStatusOverlay.setStatus((replacementFrame ? "DX12 terrain (experimental)" : "DX12 overlay (debug)")
-                    + (frameUsesGpuSemaphore ? " / GPU sync" : " / CPU sync"));
+                    + (frameUsesGpuSemaphore ? " / GPU sync" : " / CPU sync")
+                    + (replacementFrame&&fallbackSections>0?" / "+fallbackSections+" vanilla sections":""));
         } catch (IOException | RuntimeException | UnsatisfiedLinkError exception) {
             Direct.LOGGER.error("DX12/OpenGL interop failed; retaining vanilla rendering.", exception);
             shutdown();
@@ -438,10 +507,21 @@ public final class Dx12GlInterop {
         }
     }
 
+    /** Release world-owned meshes/targets even when no renderLevel hook runs in the menu. */
+    public static void idle() {
+        if(Minecraft.getInstance().level!=null||(!initialized&&!terrainCaptureEnabled))return;
+        if(!RenderSystem.isOnRenderThread()){RenderSystem.recordRenderCall(Dx12GlInterop::idle);return;}
+        disableTerrainCapture();
+        shutdown();
+        renderedLevel=null;matricesCaptured=false;replacementFrame=false;
+    }
+
     public static void shutdown() {
         configuredPassRevision = -1L;
         configuredPasses = List.of();
         lastFrameSucceeded = false;
+        ownedBuffers.clear();
+        currentVisibleSections=List.of();
         if (pendingGlSync != 0) {
             finishPendingGlSync();
         } else if (glDoneSemaphore != 0 || interopObject != 0) {
@@ -454,6 +534,7 @@ public final class Dx12GlInterop {
         gpuSemaphoreInterop = false;
         wglInteropAvailable = false;
         ATLAS_REGIONS.close();
+        SCENE_CAPTURE.close();
         unregisterTexture();
         if (interopDevice != 0) {
             WGLNVDXInterop.wglDXCloseDeviceNV(interopDevice);
@@ -481,9 +562,11 @@ public final class Dx12GlInterop {
         pendingFrameUsesGpuSemaphore = false;
         startedAtNanos = 0;
         blockAtlasId = -1;
+        reportedTranslucentBudget=false;
     }
 
-    public static void blockAtlasUpdated() {
+    public static void blockAtlasUpdated(net.minecraft.client.renderer.texture.TextureAtlas atlas) {
+        TerrainMaterials.refresh(atlas);
         blockAtlasDirty = true;
         ATLAS_REGIONS.reset();
     }
@@ -537,7 +620,7 @@ public final class Dx12GlInterop {
     public static boolean shouldSkipVanillaLayer(net.minecraft.client.renderer.RenderType layer) {
         if (!ClientConfig.REPLACE_VANILLA_TERRAIN.get() || !initialized || disabled
                 || ClientConfig.TERRAIN_RENDER_DISTANCE_PERCENT.get() < 100
-                || !lastFrameSucceeded || !replacementFrame) {
+                || !lastFrameSucceeded || !replacementFrame || fallbackBaseSections!=0) {
             return false;
         }
         return layer == net.minecraft.client.renderer.RenderType.solid()
@@ -575,7 +658,7 @@ public final class Dx12GlInterop {
         DirectRenderApi.updateCapabilities(new DirectRenderCapabilities("Direct3D 12",
                 adapterName == null || adapterName.isBlank() ? "unknown" : adapterName,
                 (featureFlags & 1) != 0, true, true, (featureFlags & 2) != 0, (featureFlags & 4) != 0,
-                (featureFlags & 8) != 0, gpuSemaphoreInterop, true, false));
+                (featureFlags & 8) != 0, gpuSemaphoreInterop, true, true));
         DirectStatusOverlay.setStatus("D3D12 / initializing");
         program = createProgram();
         sourceTextureUniform = GL20.glGetUniformLocation(program, "sourceTexture");
@@ -643,7 +726,7 @@ public final class Dx12GlInterop {
         GL11.glTexParameteri(GL11.GL_TEXTURE_2D, GL11.GL_TEXTURE_WRAP_S, GL12.GL_CLAMP_TO_EDGE);
         GL11.glTexParameteri(GL11.GL_TEXTURE_2D, GL11.GL_TEXTURE_WRAP_T, GL12.GL_CLAMP_TO_EDGE);
         long object = WGLNVDXInterop.wglDXRegisterObjectNV(interopDevice, resource, name,
-                GL11.GL_TEXTURE_2D, WGLNVDXInterop.WGL_ACCESS_READ_ONLY_NV);
+                GL11.GL_TEXTURE_2D, WGLNVDXInterop.WGL_ACCESS_READ_WRITE_NV);
         if (object == 0) throw new IllegalStateException("Could not register DX12 color/depth for OpenGL.");
         return object;
     }

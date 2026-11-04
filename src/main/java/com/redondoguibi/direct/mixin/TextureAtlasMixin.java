@@ -18,7 +18,7 @@ abstract class TextureAtlasMixin {
             at = @At("RETURN"))
     private void direct$markAtlasDirty(SpriteLoader.Preparations preparations, CallbackInfo callback) {
         if (((TextureAtlas) (Object) this).location().equals(InventoryMenu.BLOCK_ATLAS)) {
-            Dx12GlInterop.blockAtlasUpdated();
+            Dx12GlInterop.blockAtlasUpdated((TextureAtlas)(Object)this);
         }
     }
 

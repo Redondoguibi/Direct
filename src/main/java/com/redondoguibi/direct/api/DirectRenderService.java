@@ -10,7 +10,7 @@ import java.util.List;
  */
 public interface DirectRenderService {
     /** Current public API semantic version. */
-    String API_VERSION = "1.1.0";
+    String API_VERSION = "1.3.0";
 
     /**
      * Returns the active service. The service is available on the client after client setup.
@@ -68,4 +68,28 @@ public interface DirectRenderService {
     default String passFailure(String id) {
         return "";
     }
+    /**
+     * Registers geometry effects. The lexically first owner wins; requests do not stack.
+     * @param owner stable id matching the pass-id syntax; at most 64 owners
+     * @param settings validated effect strengths
+     */
+    default void requestTerrainEffects(String owner, DirectTerrainEffects settings) {
+        throw new UnsupportedOperationException("Geometry effects unavailable");
+    }
+    /**
+     * Releases the client's request without disabling terrain. Release on unload/disable.
+     * @param owner previously registered owner
+     */
+    default void releaseTerrainEffects(String owner) {}
+    /**
+     * Reports implementation features, independently gated from fullscreen passes.
+     * A supported feature can still fall back for an incompatible target or an exhausted budget.
+     * @return immutable feature names, empty when the native backend is unavailable
+     */
+    default java.util.Set<String> terrainFeatures() { return java.util.Set.of(); }
+    /**
+     * Returns the selected geometry effect owner.
+     * @return selected owner, or empty if no request exists
+     */
+    default String terrainEffectOwner() { return ""; }
 }

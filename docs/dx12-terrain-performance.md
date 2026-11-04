@@ -66,3 +66,61 @@ usado foi extraído do JAR 1.2.3 realmente instalado, não recompilado com códi
 Contrato de wrapping e cópia consultado:
 https://learn.microsoft.com/en-us/windows/win32/api/d3d11on12/nf-d3d11on12-id3d11on12device-createwrappedresource
 https://microsoft.github.io/DirectX-Specs/d3d/archive/D3D11_3_FunctionalSpec.htm
+
+## Direct 1.4.0 — custos da migração de geometria
+
+Preserva as reduções de trabalho medidas na 1.2.4. Esta ampliação não estabelece
+um novo ganho de FPS. V2 acrescenta 4 bytes por vértice (+25% de vértices), normais
+e materiais; transparência usa centros/índices CPU e o ring existente para ordenação.
+Sombras são um passe opt-in; vento é trabalho de vértice, sem pós-passagem.
+Cor/profundidade de refração são snapshots separados, alocados sob demanda.
+
+A travessia adicional GL para DX12 e de volta só é solicitada por água/reflexos ou
+pela opção dx12Translucency. Camada vazia e orçamento excedido são detectados antes
+da captura. Orçamento insuficiente preserva a transparência vanilla sem reiniciar
+opaco DX12. Effects/integração desligados liberam pedidos; recursos são liberados
+quando os valores zeram e ao sair do mundo, inclusive sem outro hook renderLevel.
+
+Além de direct-performance.csv, profileRenderer escreve por minuto
+logs/direct-translucency-performance.csv. captureMs/sortSubmitMs/waitMs/presentMs
+são por frame do mundo; GPU/draws são por frame translúcido nativo. GPU translúcida
+abrange snapshots, geometria e exportação, excluindo a importação 11On12 anterior
+ao marcador. A captura inclui sua conclusão GL. Espera CPU não deve ser somada ao
+tempo GPU como se representassem trabalhos independentes. O tempo GPU de terreno
+agora inclui o mapa de sombras quando ativo, e seus draw calls também são contados.
+
+Teste de importação direta em Intel UHD 630: recurso D3D12 compartilhado real,
+size=0, enum correto, rejeitado com GL_INVALID_ENUM. Fence também rejeitada.
+A alternativa não passou na validação funcional; não foi adotada nem foi inventada
+uma medição comparativa. A causa interna do driver permanece sem determinação.
+
+Comparação pendente no modpack: mesmo cenário/câmera/resolução/distância e configurações,
+60s estáveis por modo; registrar água/reflexos/sombras individualmente e p95/p99,
+sem incluir menus/carregamento como se fossem uma sessão estável. Referência do usuário:
+60 FPS desligado / 50 ligado. O cliente deve ser aberto pelo usuário.
+
+### Verificação adicional sem efeitos (2026-11-03)
+
+Uma primeira rodada sinalizou possível regressão: 1.3.0 p50 9.7857/8.9846 ms,
+1.4.0 inicial 10.4090/10.0071 ms, na ordem antigo/novo/novo/antigo.
+Foi adicionado um pipeline especializado para opaco/recortes sem sombras/vento.
+Ele é criado uma vez, selecionado por frame e não recompila ao mover controles.
+Mantém o layout V2, mas não busca os atributos novos nem executa essas rotinas.
+Água/reflexos continuam no pipeline translúcido próprio, sem encarecer o shader opaco.
+
+Comparação do compilador FXC /O3, shader original extraído da DLL 1.3.0 realmente
+instalada: VS rápido e PS rápido têm bytecode idêntico ao anterior, por SHA-256.
+VS: 25 slots de instrução contra 66 da variante de efeitos; PS: 30 contra 68.
+Isso verifica remoção de trabalho estático, não uma proporção de tempo de GPU:
+branches e o driver determinam o trabalho efetivamente executado. Resultados em
+build/shader-comparison/results.json; fontes/bytecode/assembly no mesmo diretório.
+
+Repetição na ordem rápido/antigo/antigo/rápido, mesmo teste 1080p/16 quads:
+- 1.4 rápido: p50 9.9837, p95 10.3221 ms.
+- 1.3: p50 8.5677, p95 10.0160 ms.
+- 1.3: p50 8.9165, p95 9.9560 ms.
+- 1.4 rápido: p50 7.7772, p95 10.1601 ms.
+A variação é grande: a suspeita inicial não ficou confirmada como uma regressão
+estável; estes dados também não provam ganho. Não converter em estimativa de FPS
+no Minecraft. Logs originais em archive/benchmark-1.4.0*.txt. Reproduzir passando
+benchmarkJar e benchmarkLibrary correspondentes à mesma versão para manter a ABI.

@@ -34,6 +34,20 @@ public final class DirectRenderApi implements DirectRenderService {
     private final AtomicBoolean dirty = new AtomicBoolean(true);
     private volatile PassSnapshot passSnapshot = new PassSnapshot(0L, List.of());
     private volatile DirectRenderCapabilities capabilities = DirectRenderCapabilities.unavailable();
+    private final java.util.TreeMap<String,DirectTerrainEffects> terrainRequests=new java.util.TreeMap<>();
+    private volatile DirectTerrainEffects terrainSettings=DirectTerrainEffects.NONE;
+    /** Returns the immutable geometry settings for this render frame.
+     * @return selected owner's settings, or no effects
+     */
+    public static DirectTerrainEffects terrainEffects(){return INSTANCE.terrainSettings;}
+    @Override public synchronized void requestTerrainEffects(String owner,DirectTerrainEffects settings){
+        if(owner==null||!PASS_ID.matcher(owner).matches())throw new IllegalArgumentException("Invalid effect owner");
+        if(!terrainRequests.containsKey(owner)&&terrainRequests.size()>=64)throw new IllegalStateException("Too many geometry effect owners");
+        terrainRequests.put(owner,Objects.requireNonNull(settings));terrainSettings=terrainRequests.firstEntry().getValue();
+    }
+    @Override public synchronized void releaseTerrainEffects(String owner){terrainRequests.remove(owner);terrainSettings=terrainRequests.isEmpty()?DirectTerrainEffects.NONE:terrainRequests.firstEntry().getValue();}
+    @Override public java.util.Set<String> terrainFeatures(){return capabilities.nativeTerrain()?java.util.Set.of("materials-v2","normals","shadows","wind","translucency","water","reflections"):java.util.Set.of();}
+    @Override public synchronized String terrainEffectOwner(){return terrainRequests.isEmpty()?"":terrainRequests.firstKey();}
 
     private DirectRenderApi() {
     }

@@ -7,7 +7,10 @@ package com.redondoguibi.direct.api;
  * {@code DirectSampler} at {@code s0}, and {@code DirectFrameData} plus
  * {@code DirectUniforms[15]} in a {@code b0} constant buffer. The entry point is
  * {@code float4 main(float4 position : SV_Position) : SV_Target0}. Passes sample the previous
- * pass output and write a distinct color target.</p>
+ * pass output and write a distinct color target. API 1.2 additionally binds a read-only
+ * {@code Texture2D<float>} at {@code t1}: original terrain device depth, 0..1,
+ * top-left texel origin, clear value 1. Use {@code Load} for exact depth texels.
+ * Check {@code capabilities().depthInput()} before registering a depth-dependent pass.</p>
  */
 public interface DirectRenderPass {
     /**

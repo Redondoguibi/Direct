@@ -19,6 +19,28 @@ import org.junit.jupiter.api.Test;
 class DirectRenderServiceTest {
     private final DirectRenderService service = DirectRenderService.getInstance();
 
+    @Test
+    void geometryEffectsAreBoundedAndReleaseRestoresThePreviousOwner() {
+        var first = new DirectTerrainEffects(.4f,.3f,.2f,.1f,1);
+        var second = new DirectTerrainEffects(0,1,0,0,0);
+        try {
+            assertEquals(DirectTerrainEffects.NONE,DirectRenderApi.terrainEffects());
+            service.requestTerrainEffects("z.test",second);
+            service.requestTerrainEffects("a.test",first);
+            assertEquals(first,DirectRenderApi.terrainEffects());
+            service.releaseTerrainEffects("a.test");
+            assertEquals(second,DirectRenderApi.terrainEffects());
+            assertThrows(IllegalArgumentException.class,()->new DirectTerrainEffects(Float.NaN,0,0,0,0));
+            assertThrows(IllegalArgumentException.class,()->new DirectTerrainEffects(0,0,0,1.01f,0));
+            assertThrows(IllegalArgumentException.class,()->new DirectTerrainEffects(0,0,0,0,3));
+            assertThrows(IllegalArgumentException.class,()->service.requestTerrainEffects("../bad",first));
+            assertEquals(second,DirectRenderApi.terrainEffects());
+        } finally {
+            service.releaseTerrainEffects("a.test");service.releaseTerrainEffects("z.test");
+        }
+        assertEquals(DirectTerrainEffects.NONE,DirectRenderApi.terrainEffects());
+    }
+
     @AfterEach
     void clearPasses() {
         for (DirectRenderPass pass : service.passes()) {

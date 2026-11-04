@@ -1,0 +1,27 @@
+{
+  "version": "1.4.1",
+  "suites": {
+    "test": {
+      "tests": 35,
+      "failures": 0,
+      "errors": 0,
+      "skipped": 0
+    },
+    "graphicsTest": {
+      "tests": 9,
+      "failures": 0,
+      "errors": 0,
+      "skipped": 0
+    },
+    "validateLus": {
+      "tests": 1,
+      "failures": 0,
+      "errors": 0,
+      "skipped": 0
+    }
+  },
+  "nativeSmoke": "1/1 passed",
+  "minecraftStartedByAgent": false,
+  "inGameValidated": false,
+  "jarSha256": "90da416b091c74295a4da60f1763ca1248953b71a16edcbbdbedabb7fed59303"
+}

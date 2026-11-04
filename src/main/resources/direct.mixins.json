@@ -6,6 +6,7 @@
     "LevelRendererMixin",
     "RenderSectionMixin",
     "SectionCompilerMixin",
+    "VertexBufferMixin",
     "TextureAtlasMixin",
     "SpriteContentsMixin",
     "LightTextureMixin",
