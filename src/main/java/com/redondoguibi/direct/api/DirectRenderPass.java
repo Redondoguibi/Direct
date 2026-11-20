@@ -5,7 +5,7 @@ package com.redondoguibi.direct.api;
  *
  * <p>The pixel shader source must declare {@code DirectInput} at {@code t0}, a
  * {@code DirectSampler} at {@code s0}, and {@code DirectFrameData} plus
- * {@code DirectUniforms[15]} in a {@code b0} constant buffer. The entry point is
+ * {@code DirectUniforms[63]} in a {@code b0} constant buffer. The entry point is
  * {@code float4 main(float4 position : SV_Position) : SV_Target0}. Passes sample the previous
  * pass output and write a distinct color target. API 1.2 additionally binds a read-only
  * {@code Texture2D<float>} at {@code t1}: original terrain device depth, 0..1,
@@ -37,7 +37,7 @@ public interface DirectRenderPass {
     }
 
     /**
-     * Returns packed float4 uniform values, up to 15 vectors (60 floats).
+     * Returns packed float4 uniform values, up to 63 vectors (252 floats, API 1.5; the original 60-float prefix is preserved).
      * Unspecified values are zero-filled for each frame.
      *
      * @param frame frame- and pass-specific metadata; valid only during this callback

@@ -44,6 +44,13 @@ public final class Dx12GlInterop {
     private static final AtlasRegionUpdates ATLAS_REGIONS = new AtlasRegionUpdates();
     private static final InteropSceneCapture SCENE_CAPTURE=new InteropSceneCapture();
     private static final long RETRY_DELAY_NANOS = 5_000_000_000L;
+    private static final int MAX_FAILURES = 3;
+    private static final int RECOVERY_FRAMES = 120;
+    private static int consecutiveFailures;
+    private static int successfulFrames;
+    private static String lastFailure = "";
+    private static volatile boolean restartRequested;
+    private static boolean cleanupNeedsRestart;
     static final String VERTEX_SHADER = """
             #version 150
             out vec2 texCoord;
@@ -87,6 +94,9 @@ public final class Dx12GlInterop {
     private static boolean lightmapDirty = true;
     private static boolean lightmapUploaded;
     private static long[] visibleKeys = new long[256];
+    private static int[] visibleSectionIndices = new int[256];
+    private static byte[] visibleLayerMasks = new byte[256];
+    private static boolean[] visibleOwnership = new boolean[256];
     private static int visibleCount;
     private static int visibleTranslucentCount;
     private static List<SectionRenderDispatcher.RenderSection> currentVisibleSections=List.of();
@@ -136,11 +146,53 @@ public final class Dx12GlInterop {
     private static int sourceTextureUniform = -1;
     private static int glDoneSemaphore;
     private static long pendingGlSync;
+    private static long pendingGlSince;
     private static long pendingGlFenceValue;
     private static long pendingReadyValue;
     private static long pendingFrameIndex;
     private static boolean pendingFrameUsesGpuSemaphore;
     private static int blockAtlasId = -1;
+    private static long[] submittedShadowKeys;
+    private static final float[] materialScratch = new float[4];
+    private static final float[] geometryScratch = new float[10];
+    private static String[] worldSources = NO_PASS_SOURCES;
+    private static String[] rejectedWorldSources;
+    private static String worldFailure="";
+    public static String worldFailure(){return worldFailure;}
+
+    /** Complete-world post processing; all effect calculations run in native HLSL. */
+    public static boolean renderWorld(String[] sources,float[] uniforms){
+        RenderSystem.assertOnRenderThread();
+        if(sources==null||sources.length<1||sources.length>8||uniforms==null||uniforms.length!=sources.length*DirectRenderApi.MAX_UNIFORM_FLOATS)
+            throw new IllegalArgumentException("Invalid world pass layout");
+        for(String source:sources)if(source==null||source.isBlank()||source.length()>1048576)throw new IllegalArgumentException("Invalid world shader source");
+        for(float value:uniforms)if(!Float.isFinite(value))throw new IllegalArgumentException("Non-finite world uniform");
+        if(java.util.Arrays.equals(rejectedWorldSources,sources))return false;
+        if(!initialized||disabled||!ClientConfig.ENABLE_DX12.get()||!ClientConfig.REPLACE_VANILLA_TERRAIN.get())return false;
+        var mc=Minecraft.getInstance();var target=mc.getMainRenderTarget();
+        if(Minecraft.useShaderTransparency()||target.width!=width||target.height!=height||GL11.glGetInteger(GL30.GL_DRAW_FRAMEBUFFER_BINDING)!=target.frameBufferId)return false;
+        try(MemoryStack stack=MemoryStack.stackPush()){
+            if(!lastSubmittedFrameReady("world post")||!NativeDx12.isWorldFrameReady())return false;
+            if(!java.util.Arrays.equals(worldSources,sources)){NativeDx12.configureWorldPasses(sources);worldSources=sources.clone();}
+            finishPendingGlSync();
+            var objects=stack.pointers(interopObject,depthInteropObject);
+            if(!WGLNVDXInterop.wglDXLockObjectsNV(interopDevice,objects))throw new IllegalStateException("Cannot lock world input");
+            try{SCENE_CAPTURE.capture(target.frameBufferId,target.getDepthTextureId(),texture,depthTexture,width,height);}
+            finally{if(!WGLNVDXInterop.wglDXUnlockObjectsNV(interopDevice,objects))throw new IllegalStateException("Cannot unlock world input");}
+            GL11.glFinish();
+            if(frameIndex>=Long.MAX_VALUE-1)throw new IllegalStateException("World timeline exhausted");
+            int result=NativeDx12.renderWorldInterop(uniforms,frameIndex);
+            if(result==NativeDx12.FRAME_SKIPPED_BUSY)return false;
+            if(result!=0)throw new IllegalStateException("World render failed: "+result);
+            long value=++frameIndex;
+            if(!NativeDx12.waitInteropFrame(value))throw new IllegalStateException("World output incomplete");
+            if(!WGLNVDXInterop.wglDXLockObjectsNV(interopDevice,objects))throw new IllegalStateException("Cannot lock world output");
+            try{SCENE_CAPTURE.presentColor(target.frameBufferId,texture,width,height);}
+            finally{if(!WGLNVDXInterop.wglDXUnlockObjectsNV(interopDevice,objects))throw new IllegalStateException("Cannot unlock world output");}
+            queueCpuGlSync(value);worldFailure="";return true;
+        }catch(IllegalArgumentException exception){worldFailure=exception.getMessage();rejectedWorldSources=sources.clone();Direct.LOGGER.error("Rejected world shader",exception);return false;}
+        catch(RuntimeException|UnsatisfiedLinkError exception){worldFailure=exception.getMessage();rendererFailed("world post",exception);return false;}
+    }
 
     private Dx12GlInterop() {
     }
@@ -179,7 +231,7 @@ public final class Dx12GlInterop {
             if(readiness==NativeDx12.FRAME_SKIPPED_BUSY)return false;
             if(readiness==NativeDx12.FRAME_SKIPPED_BUDGET){
                 if(!reportedTranslucentBudget){Direct.LOGGER.warn("DX12 translucent index budget exceeded; keeping vanilla transparency and DX12 opaque terrain. Increase uploadRingBufferMiB if needed.");reportedTranslucentBudget=true;}
-                DirectStatusOverlay.setStatus("DX12 terrain / vanilla translucency (index budget)");return false;
+                DirectStatusOverlay.setStatus("translucency_budget");return false;
             }
             if(readiness!=NativeDx12.FRAME_RENDERED_CPU_SYNC)throw new IllegalStateException("Translucent preflight failed");
             long captureStart=System.nanoTime();
@@ -210,8 +262,8 @@ public final class Dx12GlInterop {
             if(RendererMetrics.recording){RendererMetrics.translucentPresentNanos+=System.nanoTime()-presentStart;RendererMetrics.translucentFrames++;}
             return true;
         }catch(RuntimeException|UnsatisfiedLinkError ex){
-            Direct.LOGGER.error("DX12 translucent layer failed; preserving vanilla translucent rendering",ex);
-            lastFrameSucceeded=false;shutdown();disableTerrainCapture();retryAfterNanos=System.nanoTime()+RETRY_DELAY_NANOS;return false;
+            rendererFailed("translucency", ex);
+            return false;
         }
     }
 
@@ -226,19 +278,38 @@ public final class Dx12GlInterop {
         var sections=currentVisibleSections;
         visibleCount=0;visibleTranslucentCount=0;fallbackSections=fallbackBaseSections=0;translucentCovered=true;ownedBuffers.clear();
         if(!ClientConfig.ENABLE_DX12.get())return;
-        if(visibleKeys.length<sections.size())visibleKeys=new long[sections.size()];
-        for(var section:sections){
+        if(visibleKeys.length<sections.size()){
+            visibleKeys=new long[sections.size()];
+            visibleSectionIndices=new int[sections.size()];
+            visibleLayerMasks=new byte[sections.size()];
+            visibleOwnership=new boolean[sections.size()];
+        }
+        int candidates=0;
+        for(int i=0;i<sections.size();i++){
+            var section=sections.get(i);
             var compiled=section.getCompiled();
-            boolean translucent=!compiled.isEmpty(RenderType.translucent());
-            boolean base=!compiled.isEmpty(RenderType.solid())||!compiled.isEmpty(RenderType.cutoutMipped())||!compiled.isEmpty(RenderType.cutout());
-            if(!base&&!translucent)continue;
-            long key=SectionPos.of(section.getOrigin()).asLong();
-            boolean owned=TerrainMeshStore.owns(key);
+            int mask=(!compiled.isEmpty(RenderType.solid())?1:0)
+                    |(!compiled.isEmpty(RenderType.cutoutMipped())?2:0)
+                    |(!compiled.isEmpty(RenderType.cutout())?4:0)
+                    |(!compiled.isEmpty(RenderType.translucent())?8:0);
+            if(mask==0)continue;
+            visibleKeys[candidates]=SectionPos.of(section.getOrigin()).asLong();
+            visibleSectionIndices[candidates]=i;
+            visibleLayerMasks[candidates++]=(byte)mask;
+        }
+        TerrainMeshStore.copyOwnership(visibleKeys,candidates,visibleOwnership);
+        for(int i=0;i<candidates;i++){
+            int mask=visibleLayerMasks[i];
+            boolean translucent=(mask&8)!=0,base=(mask&7)!=0;
+            boolean owned=visibleOwnership[i];
             if(translucent){visibleTranslucentCount++;if(!owned)translucentCovered=false;}
             if(!owned){fallbackSections++;if(base)fallbackBaseSections++;continue;}
-            visibleKeys[visibleCount++]=key;
-            for(var layer:java.util.List.of(RenderType.solid(),RenderType.cutoutMipped(),RenderType.cutout()))
-                if(!compiled.isEmpty(layer))ownedBuffers.add(section.getBuffer(layer));
+            // Compact in place, preserving vanilla order (including coplanar tie order).
+            visibleKeys[visibleCount++]=visibleKeys[i];
+            var section=sections.get(visibleSectionIndices[i]);
+            if((mask&1)!=0)ownedBuffers.add(section.getBuffer(RenderType.solid()));
+            if((mask&2)!=0)ownedBuffers.add(section.getBuffer(RenderType.cutoutMipped()));
+            if((mask&4)!=0)ownedBuffers.add(section.getBuffer(RenderType.cutout()));
         }
     }
 
@@ -280,12 +351,8 @@ public final class Dx12GlInterop {
                 return;
             }
             resolvePendingFrame(true);
-        } catch (RuntimeException exception) {
-            Direct.LOGGER.error("Current DX12 frame failed; using vanilla terrain.", exception);
-            lastFrameSucceeded = false;
-            shutdown();
-            disableTerrainCapture();
-            retryAfterNanos = System.nanoTime() + RETRY_DELAY_NANOS;
+        } catch (RuntimeException | UnsatisfiedLinkError exception) {
+            rendererFailed("composition", exception);
         } finally {
             RendererMetrics.compositeNanos += System.nanoTime() - started;
         }
@@ -299,6 +366,8 @@ public final class Dx12GlInterop {
         }
         boolean captured = matricesCaptured;
         matricesCaptured = false;
+        // A failed teardown must not become another per-frame or per-tick retry loop.
+        if (cleanupNeedsRestart) return;
         if (!ClientConfig.ENABLE_DX12.get()) {
             TerrainMeshStore.clearCaptureFault();
             if (initialized || terrainCaptureEnabled) {
@@ -307,32 +376,39 @@ public final class Dx12GlInterop {
             }
             disabled = false;
             retryAfterNanos = 0;
-            DirectStatusOverlay.setStatus("Vanilla (disabled in config)");
+            consecutiveFailures = successfulFrames = 0;
+            DirectStatusOverlay.setStatus("disabled");
             return;
         }
+        if (disabled) return;
         if (TerrainMeshStore.hasCaptureFault()) {
-            disableTerrainCapture();
-            shutdown();
-            disabled = true;
-            DirectStatusOverlay.setStatus("Vanilla (terrain capture failed)");
-            return;
-        }
-        if (disabled) {
+            rendererFailed("terrain capture", new IllegalStateException("Terrain capture failed; see the preceding capture error in latest.log."));
+            TerrainMeshStore.clearCaptureFault();
             return;
         }
         if (!initialized && retryAfterNanos != 0 && System.nanoTime() - retryAfterNanos < 0) {
+            long seconds = Math.max(1, (retryAfterNanos - System.nanoTime() + 999_999_999L) / 1_000_000_000L);
+            DirectStatusOverlay.setStatus("retrying", seconds, consecutiveFailures, MAX_FAILURES);
             return;
         }
 
         try {
+            if (!initialized) {
+                var reason = DirectEnvironment.unavailableReason();
+                if (reason != null) {
+                    disabled = true;
+                    lastFailure = reason.getString();
+                    DirectStatusOverlay.setStatus("unavailable", reason);
+                    return;
+                }
+            }
             if (!pollCpuGlSync()) {
-                if (!shouldCompositeBeforeVanilla()) return;
-                long waitStart=System.nanoTime();
-                int result = GL32.glClientWaitSync(pendingGlSync, GL32.GL_SYNC_FLUSH_COMMANDS_BIT, 5_000_000_000L);
-                if(RendererMetrics.recording)RendererMetrics.glWaitNanos+=System.nanoTime()-waitStart;
-                if (result == GL32.GL_TIMEOUT_EXPIRED || result == GL32.GL_WAIT_FAILED)
+                if (System.nanoTime()-pendingGlSince>=5_000_000_000L)
                     throw new IllegalStateException("OpenGL did not release the shared terrain image.");
-                if (!pollCpuGlSync()) return;
+                // The previous GL consumer still owns the shared image. Render vanilla this
+                // frame instead of serializing the render thread behind a multi-second wait.
+                DirectStatusOverlay.setStatus("waiting_gl");
+                return;
             }
             if (!wglInteropAvailable) {
                 WGLCapabilities capabilities = GL.getCapabilitiesWGL();
@@ -343,7 +419,8 @@ public final class Dx12GlInterop {
                         reportedUnsupported = true;
                     }
                     DirectRenderApi.updateCapabilities(DirectRenderCapabilities.unavailable());
-                    DirectStatusOverlay.setStatus("Vanilla (WGL interop unavailable)");
+                    DirectStatusOverlay.setStatus("wgl");
+                    lastFailure = "WGL_NV_DX_interop2 is unavailable on the active OpenGL driver.";
                     disabled = true;
                     disableTerrainCapture();
                     return;
@@ -388,7 +465,7 @@ public final class Dx12GlInterop {
             else if (pendingReadyValue != 0) discardPendingFrame(); // mode switch: never strand the GL-consumption fence
             // Do not overwrite shared targets while a prior GL composite still samples them.
             if (!pollCpuGlSync()) {
-                DirectStatusOverlay.setStatus("D3D12 / waiting for OpenGL");
+                DirectStatusOverlay.setStatus("waiting_gl");
                 return;
             }
             if (!captured) {
@@ -396,7 +473,7 @@ public final class Dx12GlInterop {
             }
 
             if (!NativeDx12.isCurrentFrameSlotReady()) {
-                DirectStatusOverlay.setStatus("D3D12 / waiting for GPU");
+                DirectStatusOverlay.setStatus("waiting_gpu");
                 return;
             }
             if (!lastSubmittedFrameReady("terrain resource updates")) return;
@@ -405,20 +482,24 @@ public final class Dx12GlInterop {
             if(RendererMetrics.recording){RendererMetrics.ownershipFrames++;RendererMetrics.ownedSectionSamples+=visibleCount;RendererMetrics.fallbackSectionSamples+=fallbackSections;if(visibleCount>0&&fallbackBaseSections>0)RendererMetrics.mixedFrames++;}
             replacementFrame = shouldCompositeBeforeVanilla() && ClientConfig.TERRAIN_RENDER_DISTANCE_PERCENT.get() == 100;
             if (shouldCompositeBeforeVanilla() && (!replacementFrame||visibleCount==0)) {
-                DirectStatusOverlay.setStatus("Vanilla (initial terrain uploads)");
+                DirectStatusOverlay.setStatus(replacementFrame ? "uploads" : "distance");
                 return;
             }
             uploadBlockAtlasIfNeeded(minecraft);
             uploadLightmap();
             NativeDx12.setVisibleSections(visibleKeys, visibleCount, replacementFrame);
-            if(DirectRenderApi.terrainEffects().shadows()>0){var keys=TerrainMeshStore.shadowKeys();NativeDx12.setShadowSections(keys);}
+            if(DirectRenderApi.terrainEffects().shadows()>0){
+                var keys=TerrainMeshStore.shadowKeys();
+                if(keys!=submittedShadowKeys){NativeDx12.setShadowSections(keys);submittedShadowKeys=keys;}
+            }
 
             CLIP_CORRECTION.mul(CAPTURED_PROJECTION, VIEW_PROJECTION).mul(CAPTURED_VIEW);
             VIEW_PROJECTION.get(MATRIX);
             float[] fog = RenderSystem.getShaderFogColor();
             System.arraycopy(fog, 0, MATRIX, 16, 4);
-            MATRIX[20] = RenderSystem.getShaderFogStart();
-            MATRIX[21] = RenderSystem.getShaderFogEnd();
+            float fogMultiplier=minecraft.gameRenderer.getMainCamera().getFluidInCamera()==net.minecraft.world.level.material.FogType.NONE?DirectRenderApi.shaderFogDistance():1;
+            MATRIX[20] = RenderSystem.getShaderFogStart()*fogMultiplier;
+            MATRIX[21] = RenderSystem.getShaderFogEnd()*fogMultiplier;
             MATRIX[22] = RenderSystem.getShaderFogShape().getIndex();
             MATRIX[23] = 0;
             System.arraycopy(RenderSystem.getShaderColor(), 0, MATRIX, 24, 4);
@@ -473,9 +554,14 @@ public final class Dx12GlInterop {
             var terrainSettings=DirectRenderApi.terrainSettings();
             var effects=terrainSettings.geometry();
             var materials=terrainSettings.materials();
-            NativeDx12.setMaterialEffects(new float[]{materials.specular(),materials.wetness(),materials.emissive(),materials.waterAbsorption()});
+            materialScratch[0]=materials.specular();materialScratch[1]=materials.wetness();materialScratch[2]=materials.emissive();materialScratch[3]=materials.waterAbsorption();
+            NativeDx12.setMaterialEffects(materialScratch);
             float angle=minecraft.level.getSunAngle(0);
-            NativeDx12.setTerrainEffects(new float[]{minecraft.level.dimensionType().hasSkyLight()?effects.shadows():0,effects.water(),effects.reflections(),effects.wind(),effects.quality(),-(float)Math.sin(angle),minecraft.level.dimensionType().hasSkyLight()?(float)Math.cos(angle):0,0,(minecraft.level.getGameTime()%240000)/20f,minecraft.level.getRainLevel(0)});
+            geometryScratch[0]=minecraft.level.dimensionType().hasSkyLight()?effects.shadows():0;
+            geometryScratch[1]=effects.water();geometryScratch[2]=effects.reflections();geometryScratch[3]=effects.wind();geometryScratch[4]=effects.quality();
+            geometryScratch[5]=-(float)Math.sin(angle);geometryScratch[6]=minecraft.level.dimensionType().hasSkyLight()?(float)Math.cos(angle):0;
+            geometryScratch[7]=0;geometryScratch[8]=(minecraft.level.getGameTime()%240000)/20f;geometryScratch[9]=minecraft.level.getRainLevel(0);
+            NativeDx12.setTerrainEffects(geometryScratch);
             boolean useGpuSync = gpuSemaphoreInterop && ClientConfig.USE_GPU_SEMAPHORE_SYNC.get();
             long submittedAt = System.nanoTime();
             int renderResult = NativeDx12.renderInterop(MATRIX, cameraX, cameraY, cameraZ,
@@ -483,7 +569,7 @@ public final class Dx12GlInterop {
                     elapsedSeconds, passUniformScratch, useGpuSync, ClientConfig.USE_EXECUTE_INDIRECT.get());
             RendererMetrics.submitNanos += System.nanoTime() - submittedAt;
             if (renderResult == NativeDx12.FRAME_SKIPPED_BUSY) {
-                DirectStatusOverlay.setStatus("D3D12 / waiting for GPU");
+                DirectStatusOverlay.setStatus("waiting_gpu");
                 return;
             }
             if (renderResult != NativeDx12.FRAME_RENDERED_CPU_SYNC
@@ -504,30 +590,80 @@ public final class Dx12GlInterop {
             PENDING_VIEW.set(CAPTURED_VIEW, CAPTURED_PROJECTION, cameraX, cameraY, cameraZ);
             frameIndex++;
             retryAfterNanos = 0;
-            DirectStatusOverlay.setStatus((replacementFrame ? "DX12 terrain (experimental)" : "DX12 overlay (debug)")
-                    + (frameUsesGpuSemaphore ? " / GPU sync" : " / CPU sync")
-                    + (replacementFrame&&fallbackSections>0?" / "+fallbackSections+" vanilla sections":""));
+            if (replacementFrame) DirectStatusOverlay.setStatus("submitted");
         } catch (IOException | RuntimeException | UnsatisfiedLinkError exception) {
-            Direct.LOGGER.error("DX12/OpenGL interop failed; retaining vanilla rendering.", exception);
-            shutdown();
-            disableTerrainCapture();
-            DirectRenderApi.updateCapabilities(DirectRenderCapabilities.unavailable());
-            disabled = false;
-            retryAfterNanos = System.nanoTime() + RETRY_DELAY_NANOS;
-            DirectStatusOverlay.setStatus("Vanilla (retrying after renderer error)");
+            rendererFailed("terrain rendering", exception);
         }
+    }
+
+    /** Schedule teardown at a client tick boundary, never halfway through a terrain frame. */
+    public static void requestRestart() {
+        restartRequested = true;
+    }
+
+    static String lastFailure() {
+        return lastFailure;
+    }
+
+    private static void rendererFailed(String stage, Throwable exception) {
+        lastFailure = stage + ": " + exception.getClass().getSimpleName() + ": " + exception.getMessage();
+        Direct.LOGGER.error("Direct failed during {}; retaining vanilla terrain.", stage, exception);
+        lastFrameSucceeded = false;
+        successfulFrames = 0;
+        consecutiveFailures++;
+        boolean cleanupFailed = false;
+        try {
+            disableTerrainCapture();
+        } catch (RuntimeException | LinkageError cleanup) {
+            cleanupFailed = true;
+            Direct.LOGGER.error("Could not release Direct terrain captures.", cleanup);
+        }
+        try {
+            shutdown();
+        } catch (RuntimeException | LinkageError cleanup) {
+            cleanupFailed = true;
+            Direct.LOGGER.error("Could not shut down the Direct backend.", cleanup);
+        }
+        DirectRenderApi.updateCapabilities(DirectRenderCapabilities.unavailable());
+        cleanupNeedsRestart = cleanupFailed;
+        disabled = cleanupFailed || consecutiveFailures >= MAX_FAILURES;
+        retryAfterNanos = disabled ? 0 : System.nanoTime() + RETRY_DELAY_NANOS * consecutiveFailures;
+        DirectStatusOverlay.setStatus(disabled ? "suspended" : "retrying", 5 * consecutiveFailures,
+                consecutiveFailures, MAX_FAILURES);
     }
 
     /** Release world-owned meshes/targets even when no renderLevel hook runs in the menu. */
     public static void idle() {
-        if(Minecraft.getInstance().level!=null||(!initialized&&!terrainCaptureEnabled))return;
         if(!RenderSystem.isOnRenderThread()){RenderSystem.recordRenderCall(Dx12GlInterop::idle);return;}
-        disableTerrainCapture();
-        shutdown();
+        boolean restart = restartRequested;
+        restartRequested = false;
+        if (cleanupNeedsRestart && !restart) return;
+        boolean noWorld = Minecraft.getInstance().level == null;
+        if (!restart && !noWorld && ClientConfig.ENABLE_DX12.get()) return;
+        if (initialized || terrainCaptureEnabled || restart) {
+            try {
+                disableTerrainCapture();
+                shutdown();
+            } catch (RuntimeException | LinkageError exception) {
+                rendererFailed("restart / world exit", exception);
+                return;
+            }
+        }
         renderedLevel=null;matricesCaptured=false;replacementFrame=false;
+        if (restart || !ClientConfig.ENABLE_DX12.get()) {
+            cleanupNeedsRestart = false;
+            disabled = false;
+            consecutiveFailures = successfulFrames = 0;
+            retryAfterNanos = 0;
+            TerrainMeshStore.clearCaptureFault();
+            DirectStatusOverlay.setStatus(ClientConfig.ENABLE_DX12.get() ? "initializing" : "disabled");
+        }
     }
 
     public static void shutdown() {
+        worldSources=NO_PASS_SOURCES;
+        rejectedWorldSources=null;
+        submittedShadowKeys = null;
         configuredPassRevision = -1L;
         configuredPasses = List.of();
         lastFrameSucceeded = false;
@@ -613,6 +749,10 @@ public final class Dx12GlInterop {
         }
         drawImportedTexture(useGpuSemaphore, frame);
         lastFrameSucceeded = true;
+        // A successful submit is not proof of recovery: count only imported frames.
+        if (successfulFrames < RECOVERY_FRAMES && ++successfulFrames == RECOVERY_FRAMES) consecutiveFailures = 0;
+        DirectStatusOverlay.setStatus(replacementFrame ? (fallbackSections > 0 ? "mixed" : "active") : "overlay",
+                net.minecraft.network.chat.Component.translatable("direct.sync." + (useGpuSemaphore ? "gpu" : "cpu")), fallbackSections);
     }
 
     private static void discardPendingFrame() {
@@ -670,7 +810,7 @@ public final class Dx12GlInterop {
                 adapterName == null || adapterName.isBlank() ? "unknown" : adapterName,
                 (featureFlags & 1) != 0, true, true, (featureFlags & 2) != 0, (featureFlags & 4) != 0,
                 (featureFlags & 8) != 0, gpuSemaphoreInterop, true, true));
-        DirectStatusOverlay.setStatus("D3D12 / initializing");
+        DirectStatusOverlay.setStatus("initializing");
         program = createProgram();
         sourceTextureUniform = GL20.glGetUniformLocation(program, "sourceTexture");
         sourceDepthUniform = GL20.glGetUniformLocation(program, "sourceDepth");
@@ -697,7 +837,7 @@ public final class Dx12GlInterop {
             throw new IllegalStateException("D3D12 fence failed before " + operation + ".");
         }
         if (state == 0) {
-            DirectStatusOverlay.setStatus("D3D12 / waiting before " + operation);
+            DirectStatusOverlay.setStatus("waiting_gpu");
             return false;
         }
         return true;
@@ -939,6 +1079,7 @@ public final class Dx12GlInterop {
     }
 
     private static void queueCpuGlSync(long value) {
+        pendingGlSince = System.nanoTime();
         pendingGlSync = GL32.glFenceSync(GL32.GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
         if (pendingGlSync == 0) {
             // A failed sync allocation still needs a real completion before CPU-signaling.

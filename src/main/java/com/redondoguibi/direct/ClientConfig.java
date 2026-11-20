@@ -33,6 +33,11 @@ public final class ClientConfig {
             .comment("Soft terrain upload budget per frame in MiB. One oversized section is still allowed.")
             .defineInRange("maxMeshUploadMiBPerFrame", 16, 1, 512);
 
+    public static final ModConfigSpec.IntValue MAX_MESH_UPLOAD_MICROS = BUILDER
+            .comment("Soft CPU time budget for section uploads per frame in microseconds; zero disables it.",
+                    "At least one queued section may progress. Complements the byte/count budgets.")
+            .defineInRange("maxMeshUploadMicros", 2000, 0, 20000);
+
     public static final ModConfigSpec.IntValue TERRAIN_RENDER_DISTANCE_PERCENT = BUILDER
             .comment("Direct terrain visibility distance as a percentage of Minecraft's configured render distance.")
             .defineInRange("terrainRenderDistancePercent", 100, 25, 100);

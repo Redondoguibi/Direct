@@ -17,6 +17,9 @@ final class NativeDx12 {
     static native long[] resizeInterop(int width, int height);
 
     static native void configureRenderPasses(String[] pixelShaderSources);
+    static native void configureWorldPasses(String[] sources);
+    static native int renderWorldInterop(float[] uniforms,long frameIndex);
+    static native boolean isWorldFrameReady();
 
     static native int renderInterop(float[] viewProjection, double cameraX, double cameraY, double cameraZ,
             float renderDistance, long frameIndex, float elapsedSeconds, float[] passUniforms,

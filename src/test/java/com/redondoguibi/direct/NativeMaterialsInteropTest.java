@@ -71,12 +71,38 @@ abstract class NativeMaterialsInteropTestBase {
             var objects=stack.pointers(colorObject,depthObject);assertTrue(WGLNVDXInterop.wglDXLockObjectsNV(device,objects));capture.capture(fbo,depth,sharedColor,sharedDepth,64,64);assertTrue(WGLNVDXInterop.wglDXUnlockObjectsNV(device,objects));GL11.glFinish();
             assertEquals(GL13.GL_TEXTURE3,GL11.glGetInteger(GL13.GL_ACTIVE_TEXTURE));assertTrue(GL11.glIsEnabled(GL11.GL_BLEND));assertFalse(GL11.glGetBoolean(GL11.GL_DEPTH_WRITEMASK));
             assertEquals(0,NativeDx12.renderTranslucentInterop(frame,0,0,0,1));assertTrue(NativeDx12.waitInteropFrame(2));assertTrue(NativeDx12.frameMetrics()[0]>=0);
+            // Give the scene different color and depth so each presentation mode is observable.
+            GL11.glDisable(GL11.GL_SCISSOR_TEST);
+            GL30.glColorMaski(0,true,true,true,true);
+            GL11.glDepthMask(true);
+            GL11.glClearColor(0,0,0,0);
+            GL11.glClearDepth(.875);
+            GL11.glClear(GL11.GL_COLOR_BUFFER_BIT | GL11.GL_DEPTH_BUFFER_BIT);
+            GL11.glEnable(GL11.GL_SCISSOR_TEST);
+            GL11.glDepthMask(false);
+            GL30.glColorMaski(0,true,false,true,false);
+
+            assertTrue(WGLNVDXInterop.wglDXLockObjectsNV(device,objects));
+            try {
+                capture.presentColor(fbo,sharedColor,64,64);
+            } finally {
+                assertTrue(WGLNVDXInterop.wglDXUnlockObjectsNV(device,objects));
+            }
+            assertEquals(fbo,GL11.glGetInteger(GL30.GL_READ_FRAMEBUFFER_BINDING));
+            assertEquals(fbo,GL11.glGetInteger(GL30.GL_DRAW_FRAMEBUFFER_BINDING));
+            assertTrue(GL11.glIsEnabled(GL11.GL_SCISSOR_TEST));
+            var pixels=stack.malloc(64*64*4);
+            var depths=stack.mallocFloat(64*64);
+            GL11.glReadPixels(0,0,64,64,GL11.GL_RGBA,GL11.GL_UNSIGNED_BYTE,pixels);
+            GL11.glReadPixels(0,0,64,64,GL11.GL_DEPTH_COMPONENT,GL11.GL_FLOAT,depths);
+            assertEquals(seed,pixels,"Color-only presentation must restore every color row");
+            for(int i=0;i<depths.capacity();i++)assertEquals(.875f,depths.get(i));
             assertTrue(WGLNVDXInterop.wglDXLockObjectsNV(device,objects));capture.present(fbo,sharedColor,sharedDepth,64,64);assertTrue(WGLNVDXInterop.wglDXUnlockObjectsNV(device,objects));GL11.glFinish();NativeDx12.signalInteropFence(2);
             assertEquals(fbo,GL11.glGetInteger(GL30.GL_DRAW_FRAMEBUFFER_BINDING));assertEquals(GL13.GL_TEXTURE3,GL11.glGetInteger(GL13.GL_ACTIVE_TEXTURE));assertTrue(GL11.glIsEnabled(GL11.GL_SCISSOR_TEST));assertTrue(GL11.glIsEnabled(GL11.GL_CULL_FACE));assertTrue(GL11.glIsEnabled(GL11.GL_BLEND));assertFalse(GL11.glGetBoolean(GL11.GL_DEPTH_WRITEMASK));
             int[] viewport=new int[4];GL11.glGetIntegerv(GL11.GL_VIEWPORT,viewport);assertArrayEquals(new int[]{2,3,37,41},viewport);
             var mask=stack.malloc(4);GL11.glGetBooleanv(GL11.GL_COLOR_WRITEMASK,mask);assertEquals(0,mask.get(1));assertNotEquals(0,mask.get(2));
             assertFalse(GL30.glIsEnabledi(GL11.GL_BLEND,1));GL30.glGetBooleani_v(GL11.GL_COLOR_WRITEMASK,1,mask);assertEquals(0,mask.get(0));assertNotEquals(0,mask.get(1));
-            var pixels=stack.malloc(64*64*4);var depths=stack.mallocFloat(64*64);GL11.glReadPixels(0,0,64,64,GL11.GL_RGBA,GL11.GL_UNSIGNED_BYTE,pixels);GL11.glReadPixels(0,0,64,64,GL11.GL_DEPTH_COMPONENT,GL11.GL_FLOAT,depths);
+            GL11.glReadPixels(0,0,64,64,GL11.GL_RGBA,GL11.GL_UNSIGNED_BYTE,pixels);GL11.glReadPixels(0,0,64,64,GL11.GL_DEPTH_COMPONENT,GL11.GL_FLOAT,depths);
             assertEquals(seed,pixels,"Both vertical flips must preserve every color row");assertEquals(depthSeed,depths,"Depth must follow the same row orientation");
             assertEquals(GL11.GL_NO_ERROR,GL11.glGetError());
             // Resize while water snapshots and the native shadow target are still allocated.

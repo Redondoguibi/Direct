@@ -1,6 +1,30 @@
-# Direct
+# Direct 1.7.3
 
 Direct is a Windows x86-64 native Direct3D 12 terrain renderer and render-pass extension platform for Minecraft Java 1.21.1 / NeoForge 21.1. It is not a shader-pack loader and does not provide Iris compatibility. HLSL shaders and shader-pack UX belong in separate mods that depend on Direct's public Java API.
+
+## Terrain CPU work in 1.7.3
+
+Unchanged terrain views reuse their native visibility selection before section lookups and transforms. Mesh and selection changes invalidate that snapshot explicitly. Java collects ownership for visible sections under one mesh-store lock and reuses selection buffers. Resolution, render distance, shaders and GPU synchronization remain unchanged. See [implementation notes](docs/terrain-1.7.3.md); these CPU changes do not establish an in-game FPS gain.
+
+## Native shaderpack world stage
+
+API 1.5 adds completed-world HLSL processing through renderWorld, used by Raydiance 1.6.0 and the Lus native port. Pack effects run in DX12 with exclusive priority over standalone OpenGL controls. See [contract and limitations](docs/shaderpacks-dx12-1.7.md). This adds a scene transfer and has not been validated in game.
+
+## Rendering changes in 1.6.1
+
+Time-budgeted section uploads, primitive ownership maps, cached shadow selection, reusable opaque ordering and batched terrain/HLSL submission reduce repeated work. Raydiance 1.5.3 adds uniform change tracking, neutral-pass bypass and eligible final-pass output without a blit. See [implementation and validation limits](docs/otimizacoes-1.6.1.md). These changes have not been benchmarked.
+
+## Start playing
+
+Open **Mods > Direct > Config**, press **F7** in a world, or use **`/direct menu`**. Choose **Renderer: Direct DX12**, then **Save and apply**. The dashboard is translated into English and Brazilian Portuguese. The key binding can be changed in Minecraft Controls. Existing configuration keys and values are preserved; fresh installations still start in vanilla mode.
+
+The dashboard provides Balanced, Lower memory and Compatibility profiles, resource budgets, advanced controls, a scrollable guide and copyable diagnostics. Edits stay in a local draft until saved; Cancel/Escape discards them. Renderer changes restart Direct at a client tick boundary, including settings previously requiring a resource reload. HUD/profiling changes do not rebuild the backend. The optional Raydiance button opens its own settings, which save separately.
+
+Runtime failures retry after 5 and 10 seconds, then suspend Direct after the third failure. Successful submissions alone do not reset this limit: 120 imported frames are required. **Restart renderer** or **`/direct retry`** starts a new attempt with saved settings. Diagnostics retains the last failure, adapter, API version, extension errors and current configuration. `/direct` and `/direct status` report the backend state. The HUD reports DX12 only after composition and respects F1/F3.
+
+Known alternate terrain renderers (Sodium, Embeddium, Iris, Oculus and OptiFine, when exposed as loader mod IDs) disable Direct's mixins and activation. Unsupported platforms and missing native libraries receive an explicit diagnostic. These guards do not establish general modpack compatibility.
+
+**Validation status:** this update was compiled and packaged without running tests, as requested. It is an implementation of the player-facing experience, not a claim of validated release stability or increased FPS. See [1.6.0 delivery notes](docs/experiencia-1.6.0.md) for scope and deferred validation.
 
 The renderer is opt-in and remains experimental: no validated in-game FPS improvement is available for this version. With `enableDx12Preview=true` and `replaceVanillaTerrain=true`, Direct prepares terrain after vanilla section uploads, then imports its color and depth before the solid layer. Only buffers belonging to the successfully composed native subset are skipped; pending sections retain their vanilla draw without switching the whole terrain backend. Entities and later OpenGL passes use the imported depth. Optional native translucency runs after entities, importing the current scene first. Setting `replaceVanillaTerrain=false` selects the diagnostic overlay, which renders the terrain twice and is not the optimization mode. Renderer failures retain vanilla rendering.
 
@@ -49,7 +73,7 @@ See [renderer validation](docs/renderer-validation.md) for test coverage and the
 
 ## Configuration
 
-Open Minecraft's mod configuration screen and select **Direct DX12**. The client options are:
+Open the Direct dashboard using F7, `/direct menu`, or the mod configuration button. **Resources** and **Advanced** expose the technical controls with explanations. The underlying client options remain compatible:
 
 - `enableDx12Preview` — enable Direct's D3D12 renderer (off by default; experimental).
 - `preferDirectColorInterop` — share native color when validated, falling back to copied color if incompatible (on by default; applied on backend initialization/resize).

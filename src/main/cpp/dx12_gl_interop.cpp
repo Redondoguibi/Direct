@@ -38,8 +38,8 @@ constexpr UINT kFramesInFlight = 3;
 constexpr UINT kAtlasSlots = 64;
 constexpr UINT kDrawConstantCount = 5;
 constexpr UINT kMaxExtensionPasses = 8;
-constexpr UINT kPassUniformFloatCount = 60;
-constexpr UINT kPassConstantCount = 64;
+constexpr UINT kPassUniformFloatCount = 252;
+constexpr UINT kPassConstantCount = 256;
 constexpr UINT kGeometryConstantCount = 68;
 constexpr UINT kGeometryConstantBytes = 512; // CBV allocation remains 256-byte aligned.
 constexpr jsize kMaxAtlasLevels = 16;
@@ -249,6 +249,7 @@ struct VisibleSection {
     const TerrainSection* section;
     float offset[3];
     float sortDepth;
+    size_t ordinal;
 };
 
 struct TerrainIndirectCommand {
@@ -355,6 +356,14 @@ struct InteropRenderer {
     ID3D11Resource* wrappedDepth;
     ID3D12Resource* lightmap;
     std::vector<jlong> visibleKeys;
+    std::vector<jlong> incomingVisibleKeys;
+    double sortedCamera[3];
+    float sortedMatrix[16];
+    float sortedDistance;
+    bool sortedExact;
+    bool visibleOrderValid;
+    UINT visibleOpaqueDraws;
+    UINT visibleCutoutDraws;
     std::unordered_set<jlong> shadowKeys;
     bool useShadowKeys;
     bool useVisibleKeys;
@@ -375,6 +384,7 @@ struct InteropRenderer {
     ID3D12PipelineState* fastCutoutPipeline;
     bool terrainEffectsActive;
     std::vector<ExtensionPass> extensionPasses;
+    std::vector<ExtensionPass> worldPasses;
     ID3D12DescriptorHeap* extensionRtvHeap;
     ID3D12DescriptorHeap* extensionSrvHeap;
     UINT extensionSrvIncrement;
@@ -843,11 +853,9 @@ bool ensureUploadOpen(InteropRenderer* renderer) {
     return true;
 }
 
-bool reserveUploadRange(InteropRenderer* renderer, UINT64 bytes, UINT64 alignment, UINT64* offsetOut) {
-    if (!ensureUploadOpen(renderer)) {
-        return false;
-    }
-    FrameSlot& slot = renderer->slots[renderer->slotIndex];
+// Reserve mapped memory without opening a COPY command list. Translucent indices
+// are read directly from this ring by the draw, not copied to a default heap.
+bool reserveMappedRange(FrameSlot& slot, UINT64 bytes, UINT64 alignment, UINT64* offsetOut) {
     const UINT64 offset = alignUp(slot.uploadOffset, alignment);
     if (offset > slot.uploadCapacity || bytes > slot.uploadCapacity - offset) {
         return false;
@@ -855,6 +863,11 @@ bool reserveUploadRange(InteropRenderer* renderer, UINT64 bytes, UINT64 alignmen
     slot.uploadOffset = offset + bytes;
     *offsetOut = offset;
     return true;
+}
+
+bool reserveUploadRange(InteropRenderer* renderer, UINT64 bytes, UINT64 alignment, UINT64* offsetOut) {
+    if (!ensureUploadOpen(renderer)) return false;
+    return reserveMappedRange(renderer->slots[renderer->slotIndex],bytes,alignment,offsetOut);
 }
 
 void deleteSection(TerrainSection* section) {
@@ -872,14 +885,22 @@ void retireSection(InteropRenderer* renderer, TerrainSection* section) {
     delete section;
 }
 
+void clearVisibleSections(InteropRenderer* renderer) {
+    renderer->visibleOrderValid = false;
+    renderer->visible.clear();
+    renderer->visibleOpaqueDraws = 0;
+    renderer->visibleCutoutDraws = 0;
+    renderer->translucentIndexBytes = 0;
+}
+
 void retireTerrainSections(InteropRenderer* renderer) {
+    clearVisibleSections(renderer);
     for (auto& entry : renderer->sections) {
         retireSection(renderer, entry.second);
     }
     renderer->sections.clear();
     renderer->sectionIndices.clear();
     renderer->sectionList.clear();
-    renderer->visible.clear();renderer->translucentIndexBytes=0;
 }
 
 void releaseExtensionResources(InteropRenderer* renderer) {
@@ -891,7 +912,7 @@ void releaseExtensionResources(InteropRenderer* renderer) {
     renderer->extensionSrvIncrement = 0;
 }
 
-bool createExtensionResources(InteropRenderer* renderer, JNIEnv* env);
+bool createExtensionResources(InteropRenderer* renderer, JNIEnv* env, bool force = false);
 
 void releaseSizeResources(InteropRenderer* renderer) {
     releaseColorInterop(renderer);
@@ -1075,6 +1096,8 @@ void destroyInteropRenderer(InteropRenderer* renderer) {
         release(pass.pipeline);
     }
     renderer->extensionPasses.clear();
+    for(auto& pass:renderer->worldPasses)release(pass.pipeline);
+    renderer->worldPasses.clear();
     release(renderer->extensionRootSignature);
     release(renderer->terrainCommandSignature);
     release(renderer->cutoutPipeline);
@@ -1361,9 +1384,9 @@ bool createExtensionRootSignature(InteropRenderer* renderer) {
     return SUCCEEDED(result);
 }
 
-bool createExtensionResources(InteropRenderer* renderer, JNIEnv* env) {
-    const UINT passCount = static_cast<UINT>(renderer->extensionPasses.size());
-    if (passCount == 0) {
+bool createExtensionResources(InteropRenderer* renderer, JNIEnv* env, bool force) {
+    const UINT passCount = static_cast<UINT>(renderer->extensionPasses.size()+renderer->worldPasses.size());
+    if (passCount == 0 && !force) {
         return true;
     }
 
@@ -1440,9 +1463,11 @@ bool configureExtensionPasses(InteropRenderer* renderer, const std::vector<std::
         return false;
     }
     if (sources.empty()) {
-        releaseExtensionResources(renderer);
         for (ExtensionPass& pass : renderer->extensionPasses) release(pass.pipeline);
         renderer->extensionPasses.clear();
+        // The world chain shares these targets. Removing a terrain chain must not
+        // destroy/recreate targets still owned by the other stage.
+        if(renderer->worldPasses.empty())releaseExtensionResources(renderer);
         return true;
     }
     if (renderer->extensionRootSignature == nullptr && !createExtensionRootSignature(renderer)) {
@@ -1527,10 +1552,20 @@ bool configureExtensionPasses(InteropRenderer* renderer, const std::vector<std::
         candidates.push_back({source, pipeline});
     }
     release(vertex);
-    releaseExtensionResources(renderer);
+    // Targets depend on window size, not shader source. Keep the working chain
+    // intact until both compilation and the first resource allocation succeed.
+    if(!renderer->extensionTargets[0]||!renderer->extensionTargets[1]
+            ||!renderer->extensionRtvHeap||!renderer->extensionSrvHeap){
+        releaseExtensionResources(renderer);
+        if(!createExtensionResources(renderer,env,true)){
+            releaseExtensionResources(renderer);
+            for(auto& pass:candidates)release(pass.pipeline);
+            return false;
+        }
+    }
     for (ExtensionPass& pass : renderer->extensionPasses) release(pass.pipeline);
     renderer->extensionPasses = std::move(candidates);
-    return createExtensionResources(renderer, env);
+    return true;
 }
 
 bool createDescriptorHeaps(InteropRenderer* renderer) {
@@ -1616,7 +1651,7 @@ bool createUploadRingBuffers(InteropRenderer* renderer, UINT64 capacity, JNIEnv*
         slot.uploadMapped = static_cast<uint8_t*>(mapped);
         slot.uploadCapacity = capacity;
         slot.uploadOffset = 0;
-        if (!createBuffer(renderer, D3D12_HEAP_TYPE_UPLOAD, kMaxExtensionPasses * 256 + kGeometryConstantBytes,
+        if (!createBuffer(renderer, D3D12_HEAP_TYPE_UPLOAD, kMaxExtensionPasses * 1024 + kGeometryConstantBytes,
                 D3D12_RESOURCE_STATE_GENERIC_READ, &slot.passConstants)) {
             throwJava(env, "Direct could not allocate extension constant buffers.");
             return false;
@@ -1763,11 +1798,20 @@ bool sphereVisible(const Plane* planes, float x, float y, float z, float radius)
 
 void collectVisibleSections(InteropRenderer* renderer, double cameraX, double cameraY, double cameraZ,
         float renderDistance) {
-    renderer->visible.clear();
-    renderer->translucentIndexBytes=0;
+    // Geometry and visible-key mutations invalidate this snapshot explicitly. Check
+    // before rebuilding it so an unchanged frame needs no section lookups or copies.
+    if (renderer->visibleOrderValid
+            && renderer->sortedCamera[0] == cameraX && renderer->sortedCamera[1] == cameraY
+            && renderer->sortedCamera[2] == cameraZ && renderer->sortedDistance == renderDistance
+            && renderer->sortedExact == renderer->exactVisibleCoverage
+            && std::memcmp(renderer->sortedMatrix, renderer->viewProjection,
+                    sizeof(renderer->sortedMatrix)) == 0) {
+        return;
+    }
+    clearVisibleSections(renderer);
     renderer->visible.reserve(renderer->useVisibleKeys?renderer->visibleKeys.size():renderer->sectionList.size());
     Plane frustum[6];
-    extractFrustum(renderer->viewProjection, frustum);
+    if (!renderer->exactVisibleCoverage) extractFrustum(renderer->viewProjection, frustum);
     const double maxDistanceSquared = static_cast<double>(renderDistance) * renderDistance;
     auto append = [&](const TerrainSection* section) {
         const double ox=section->x-cameraX,oy=section->y-cameraY,oz=section->z-cameraZ;
@@ -1778,7 +1822,10 @@ void collectVisibleSections(InteropRenderer* renderer, double cameraX, double ca
         double clipZ=m[2]*cx+m[6]*cy+m[10]*cz+m[14];
         double clipW=m[3]*cx+m[7]*cy+m[11]*cz+m[15];
         float depth=clipW>0?static_cast<float>(clipZ/clipW):-std::numeric_limits<float>::max();
-        renderer->visible.push_back({section,{static_cast<float>(ox),static_cast<float>(oy),static_cast<float>(oz)},depth});
+        renderer->visible.push_back({section,{static_cast<float>(ox),static_cast<float>(oy),static_cast<float>(oz)},depth,renderer->visible.size()});
+        renderer->visibleOpaqueDraws += section->layerIndexCounts[0] != 0;
+        renderer->visibleCutoutDraws += section->layerIndexCounts[1] != 0;
+        renderer->visibleCutoutDraws += section->layerIndexCounts[2] != 0;
         if(!section->transparent.empty())renderer->translucentIndexBytes=((renderer->translucentIndexBytes+255)&~UINT64(255))+section->transparent.size()*24;
     };
     if(renderer->useVisibleKeys){
@@ -1786,9 +1833,12 @@ void collectVisibleSections(InteropRenderer* renderer, double cameraX, double ca
     }else for(const auto* section:renderer->sectionList)append(section);
     // Opaque/cutout only: early depth rejection avoids shading hidden distant surfaces.
     // Translucency retains its independent back-to-front ordering later in the frame.
-    auto nearer=[](const VisibleSection& a,const VisibleSection& b){return a.sortDepth<b.sortDepth;};
+    auto nearer=[](const VisibleSection& a,const VisibleSection& b){return a.sortDepth<b.sortDepth||(a.sortDepth==b.sortDepth&&a.ordinal<b.ordinal);};
     if(!std::is_sorted(renderer->visible.begin(),renderer->visible.end(),nearer))
-        std::stable_sort(renderer->visible.begin(),renderer->visible.end(),nearer);
+        std::sort(renderer->visible.begin(),renderer->visible.end(),nearer);
+    renderer->sortedCamera[0]=cameraX;renderer->sortedCamera[1]=cameraY;renderer->sortedCamera[2]=cameraZ;
+    std::memcpy(renderer->sortedMatrix,renderer->viewProjection,sizeof(renderer->sortedMatrix));
+    renderer->sortedDistance=renderDistance;renderer->sortedExact=renderer->exactVisibleCoverage;renderer->visibleOrderValid=true;
 }
 
 // Opaco limpa o alvo; cutout preserva cor e depth.
@@ -1819,7 +1869,7 @@ void beginTerrainPass(InteropRenderer* renderer, ID3D12GraphicsCommandList* list
     list->RSSetViewports(1, &viewport);
     list->RSSetScissorRects(1, &scissor);
     list->SetGraphicsRoot32BitConstants(0, 28, renderer->viewProjection, 0);
-    list->SetGraphicsRootConstantBufferView(3,renderer->slots[renderer->slotIndex].passConstants->GetGPUVirtualAddress()+kMaxExtensionPasses*256);
+    list->SetGraphicsRootConstantBufferView(3,renderer->slots[renderer->slotIndex].passConstants->GetGPUVirtualAddress()+kMaxExtensionPasses*1024);
     list->SetGraphicsRootDescriptorTable(2, renderer->srvHeap->GetGPUDescriptorHandleForHeapStart());
 }
 
@@ -1840,14 +1890,8 @@ bool prepareTerrainIndirectCommands(InteropRenderer* renderer, FrameSlot& slot, 
         return true;
     }
 
-    UINT opaqueCount = 0;
-    UINT cutoutCount = 0;
-    for (const VisibleSection& entry : renderer->visible) {
-        const TerrainSection* section = entry.section;
-        opaqueCount += section->layerIndexCounts[0] != 0 ? 1u : 0u;
-        cutoutCount += section->layerIndexCounts[1] != 0 ? 1u : 0u;
-        cutoutCount += section->layerIndexCounts[2] != 0 ? 1u : 0u;
-    }
+    const UINT opaqueCount = renderer->visibleOpaqueDraws;
+    const UINT cutoutCount = renderer->visibleCutoutDraws;
 
     const UINT64 commandCount = static_cast<UINT64>(opaqueCount) + cutoutCount;
     if (commandCount == 0) {
@@ -1954,13 +1998,14 @@ bool recordTerrainList(InteropRenderer* renderer, ID3D12CommandAllocator* alloca
 }
 
 // Grava opaco na thread de render e cutout em paralelo na thread de gravação.
-bool recordTerrain(InteropRenderer* renderer, FrameSlot& slot, bool drawTerrain) {
-    if (!drawTerrain) {
-        return recordTerrainList(renderer, slot.opaque, renderer->opaqueList, PassRole::ClearOnly);
+bool recordTerrain(InteropRenderer* renderer, FrameSlot& slot) {
+    const PassRole baseRole = renderer->visibleOpaqueDraws ? PassRole::Opaque : PassRole::ClearOnly;
+    if (!renderer->visibleCutoutDraws) {
+        return recordTerrainList(renderer, slot.opaque, renderer->opaqueList, baseRole);
     }
-    if (!renderer->workerRunning || slot.indirectReady) {
+    if (!renderer->workerRunning || slot.indirectReady || baseRole == PassRole::ClearOnly) {
         // Two ExecuteIndirect calls do not justify waking and joining a recording worker.
-        return recordTerrainList(renderer, slot.opaque, renderer->opaqueList, PassRole::Opaque)
+        return recordTerrainList(renderer, slot.opaque, renderer->opaqueList, baseRole)
                 && recordTerrainList(renderer, slot.cutout, renderer->cutoutList, PassRole::Cutout);
     }
     RecordWorker& worker = renderer->worker;
@@ -2003,15 +2048,20 @@ bool submitUploads(InteropRenderer* renderer) {
     return true;
 }
 
-bool copyToInteropTexture(InteropRenderer* renderer) {
+bool copyToInteropTexture(InteropRenderer* renderer, bool exportDepth = true) {
     // Both APIs submit to the same queue. Acquire/release plus Flush preserve GPU order;
     // a CPU wait before this copy serializes the renderer unnecessarily.
     ID3D11Resource* wrapped[] = {renderer->wrappedColor, renderer->wrappedDepth};
-    renderer->d3d11On12->AcquireWrappedResources(wrapped, 2);
+    const UINT count = exportDepth ? 2 : 1;
+    renderer->d3d11On12->AcquireWrappedResources(wrapped, count);
     if(!renderer->colorAlias)renderer->d3d11Context->CopyResource(renderer->interopTexture, renderer->wrappedColor);
-    renderer->d3d11Context->CopyResource(renderer->interopDepth, renderer->wrappedDepth);
-    if(renderer->colorAlias){renderer->d3d11On12->ReleaseWrappedResources(wrapped+1,1);renderer->colorAcquired=true;}
-    else renderer->d3d11On12->ReleaseWrappedResources(wrapped,2);
+    if (exportDepth) renderer->d3d11Context->CopyResource(renderer->interopDepth, renderer->wrappedDepth);
+    if (renderer->colorAlias) {
+        if (exportDepth) renderer->d3d11On12->ReleaseWrappedResources(wrapped + 1, 1);
+        renderer->colorAcquired = true;
+    } else {
+        renderer->d3d11On12->ReleaseWrappedResources(wrapped, count);
+    }
     renderer->d3d11Context->Flush();
     return SUCCEEDED(renderer->d3d11Device->GetDeviceRemovedReason());
 }
@@ -2066,7 +2116,7 @@ bool recordExtensionPasses(InteropRenderer* renderer, FrameSlot& slot, UINT64 fr
         constants[3] = static_cast<float>(frameIndex);
         std::memcpy(constants + 4, uniforms + index * kPassUniformFloatCount,
                 kPassUniformFloatCount * sizeof(float));
-        const UINT64 constantOffset = static_cast<UINT64>(index) * 256;
+        const UINT64 constantOffset = static_cast<UINT64>(index) * 1024;
         std::memcpy(slot.passConstantsMapped + constantOffset, constants, sizeof(constants));
         list->SetGraphicsRootConstantBufferView(0, slot.passConstants->GetGPUVirtualAddress() + constantOffset);
         list->DrawInstanced(3, 1, 0, 0);
@@ -2132,14 +2182,14 @@ bool prepareGeometry(InteropRenderer* r,FrameSlot& slot,double x,double y,double
         auto eye=XMVectorSet(c[20]*128,c[21]*128,c[22]*128,1);auto view=XMMatrixLookAtLH(eye,XMVectorZero(),XMVectorSet(0,0,1,0));auto projection=XMMatrixOrthographicLH(96,96,.1f,256);
         XMFLOAT4X4 shadow;XMStoreFloat4x4(&shadow,XMMatrixMultiply(view,projection));std::memcpy(c,&shadow,64);c[24]=1;
     }else if(r->shadowMap){release(r->shadowMap);release(r->shadowDsv);r->shadowSize=0;setDepthSrv(r,nullptr,66);}
-    std::memcpy(slot.passConstantsMapped+kMaxExtensionPasses*256,c,sizeof(r->geometryConstants));
+    std::memcpy(slot.passConstantsMapped+kMaxExtensionPasses*1024,c,sizeof(r->geometryConstants));
     if(c[24]>.5f){
         auto* list=r->shadowList;if(FAILED(slot.shadow->Reset())||FAILED(list->Reset(slot.shadow,r->shadowPipeline))){throwJava(env,"Shadow command list reset failed");return false;}
         if(r->profiling)list->EndQuery(r->timestampHeap,D3D12_QUERY_TYPE_TIMESTAMP,r->slotIndex*2);
         auto toDepth=transition(r->shadowMap,D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,D3D12_RESOURCE_STATE_DEPTH_WRITE);list->ResourceBarrier(1,&toDepth);
         auto dsv=r->shadowDsv->GetCPUDescriptorHandleForHeapStart();list->OMSetRenderTargets(0,nullptr,FALSE,&dsv);list->ClearDepthStencilView(dsv,D3D12_CLEAR_FLAG_DEPTH,1,0,0,nullptr);
         D3D12_VIEWPORT viewport={0,0,static_cast<float>(r->shadowSize),static_cast<float>(r->shadowSize),0,1};D3D12_RECT rect={0,0,static_cast<LONG>(r->shadowSize),static_cast<LONG>(r->shadowSize)};list->RSSetViewports(1,&viewport);list->RSSetScissorRects(1,&rect);
-        ID3D12DescriptorHeap* heaps[]={r->srvHeap};list->SetDescriptorHeaps(1,heaps);list->SetGraphicsRootSignature(r->rootSignature);list->SetGraphicsRootDescriptorTable(2,r->srvHeap->GetGPUDescriptorHandleForHeapStart());list->SetGraphicsRootConstantBufferView(3,slot.passConstants->GetGPUVirtualAddress()+kMaxExtensionPasses*256);list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        ID3D12DescriptorHeap* heaps[]={r->srvHeap};list->SetDescriptorHeaps(1,heaps);list->SetGraphicsRootSignature(r->rootSignature);list->SetGraphicsRootDescriptorTable(2,r->srvHeap->GetGPUDescriptorHandleForHeapStart());list->SetGraphicsRootConstantBufferView(3,slot.passConstants->GetGPUVirtualAddress()+kMaxExtensionPasses*1024);list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         float frame[28]={};std::memcpy(frame,c,64);list->SetGraphicsRoot32BitConstants(0,28,frame,0);
         for(const auto* section:r->sectionList){
             if(r->useShadowKeys&&r->shadowKeys.find(section->key)==r->shadowKeys.end())continue;
@@ -2194,28 +2244,29 @@ bool renderInteropFrame(InteropRenderer* renderer, const float* viewProjection,
     const bool drawTerrain = renderer->atlas != nullptr && !renderer->sections.empty();
     if (drawTerrain) {
         collectVisibleSections(renderer, cameraX, cameraY, cameraZ, renderDistance);
-    } else {renderer->visible.clear();renderer->translucentIndexBytes=0;}
+    } else {
+        clearVisibleSections(renderer);
+    }
     if (!submitUploads(renderer)) {
         throwJava(env, "DX12 terrain upload command list could not be closed.");
         return false;
     }
     if(!prepareGeometry(renderer,slot,cameraX,cameraY,cameraZ,env))return false;
     prepareTerrainIndirectCommands(renderer, slot, drawTerrain, useExecuteIndirect);
-    if (!recordTerrain(renderer, slot, drawTerrain)) {
+    if (!recordTerrain(renderer, slot)) {
         throwJava(env, "DX12 terrain command lists could not be recorded.");
         return false;
     }
     // Ambas as listas na mesma submissão e na mesma fila: o cutout preserva a cor/depth do opaco.
-    ID3D12CommandList* lists[] = {renderer->opaqueList, renderer->cutoutList};
-    renderer->queue->ExecuteCommandLists(drawTerrain ? 2 : 1, lists);
     if (!recordExtensionPasses(renderer, slot, frameIndex, elapsedSeconds, passUniforms)) {
         throwJava(env, "Direct extension pass command list could not be recorded.");
         return false;
     }
-    if (!renderer->extensionPasses.empty()) {
-        ID3D12CommandList* extensionLists[] = {renderer->extensionList};
-        renderer->queue->ExecuteCommandLists(1, extensionLists);
-    }
+    ID3D12CommandList* lists[3] = {renderer->opaqueList};
+    UINT listCount = 1;
+    if (renderer->visibleCutoutDraws) lists[listCount++] = renderer->cutoutList;
+    if (!renderer->extensionPasses.empty()) lists[listCount++] = renderer->extensionList;
+    renderer->queue->ExecuteCommandLists(listCount, lists);
     if (!copyToInteropTexture(renderer)) {
         throwJava(env, "D3D11On12 reported device removal while copying the completed terrain image.");
         return false;
@@ -2247,8 +2298,7 @@ bool renderInteropFrame(InteropRenderer* renderer, const float* viewProjection,
         return false;
     }
     slot.fenceValue = dxReadyValue;
-    slot.drawCount=renderer->shadowDrawCount;
-    for(const auto& entry:renderer->visible)for(UINT layer=0;layer<3;layer++)slot.drawCount+=entry.section->layerIndexCounts[layer]!=0;
+    slot.drawCount = renderer->shadowDrawCount + renderer->visibleOpaqueDraws + renderer->visibleCutoutDraws;
     slot.timestampValid = renderer->profiling;
     renderer->slotIndex = (renderer->slotIndex + 1) % kFramesInFlight;
     for (ID3D12Resource* resource : renderer->pendingRetire) {
@@ -2580,6 +2630,9 @@ Java_com_redondoguibi_direct_NativeDx12_updateTerrainSectionV2(JNIEnv* env, jcla
     if (renderer == nullptr) {
         return;
     }
+    // Invalidate before replacing/deleting any section, including allocator address
+    // reuse. Pointer equality cannot establish that cached mesh metadata is current.
+    renderer->visibleOrderValid = false;
     if (vertexData == nullptr || indexData == nullptr || vertexCount <= 0 || layerIndexCounts == nullptr
             || env->GetArrayLength(layerIndexCounts) != static_cast<jsize>(kLayerCount)) {
         throwJava(env, "DX12 terrain section data is incomplete.");
@@ -2779,6 +2832,7 @@ Java_com_redondoguibi_direct_NativeDx12_removeTerrainSection(JNIEnv*, jclass, jl
     if (existing != g_interopRenderer->sections.end()) {
         TerrainSection* section = existing->second;
         auto& renderer = *g_interopRenderer;
+        renderer.visibleOrderValid = false;
         const auto index = renderer.sectionIndices.find(key);
         size_t removeIndex = renderer.sectionList.size();
         if (index != renderer.sectionIndices.end() && index->second < renderer.sectionList.size()
@@ -2832,8 +2886,16 @@ Java_com_redondoguibi_direct_NativeDx12_setVisibleSections(JNIEnv* env, jclass, 
         throwJava(env, "Invalid visible terrain selection."); return;
     }
     auto* renderer = g_interopRenderer;
-    renderer->visibleKeys.resize(count);
-    env->GetLongArrayRegion(keys, 0, count, renderer->visibleKeys.data());
+    // Reuse scratch storage: the Java caller submits this selection each frame.
+    // Keep the live selection intact if JNI rejects the copy.
+    renderer->incomingVisibleKeys.resize(count);
+    env->GetLongArrayRegion(keys, 0, count, renderer->incomingVisibleKeys.data());
+    if (env->ExceptionCheck()) return;
+    if (!renderer->useVisibleKeys || renderer->exactVisibleCoverage != (exactCoverage == JNI_TRUE)
+            || renderer->visibleKeys != renderer->incomingVisibleKeys) {
+        renderer->visibleOrderValid = false;
+        renderer->visibleKeys.swap(renderer->incomingVisibleKeys);
+    }
     renderer->useVisibleKeys = true;
     renderer->exactVisibleCoverage = exactCoverage == JNI_TRUE;
 }
@@ -3059,7 +3121,7 @@ extern "C" JNIEXPORT jint JNICALL Java_com_redondoguibi_direct_NativeDx12_render
     r->d3d11On12->ReleaseWrappedResources(wrapped,2);r->d3d11Context->Flush();
     if(FAILED(r->d3d11Device->GetDeviceRemovedReason())){throwJava(env,"Scene import failed");return -1;}
     env->GetFloatArrayRegion(matrix,0,28,r->viewProjection);
-    std::memcpy(slot.passConstantsMapped+kMaxExtensionPasses*256,r->geometryConstants,sizeof(r->geometryConstants));
+    std::memcpy(slot.passConstantsMapped+kMaxExtensionPasses*1024,r->geometryConstants,sizeof(r->geometryConstants));
     auto* list=r->translucentList;if(FAILED(slot.translucent->Reset())||FAILED(list->Reset(slot.translucent,r->translucentPipeline))){throwJava(env,"Translucent list reset failed");return -1;}
     if(r->profiling)list->EndQuery(r->timestampHeap,D3D12_QUERY_TYPE_TIMESTAMP,r->slotIndex*2);
     if(r->geometrySettings[1]>0||r->geometrySettings[2]>0||r->materialSettings[3]>0){
@@ -3082,7 +3144,7 @@ extern "C" JNIEXPORT jint JNICALL Java_com_redondoguibi_direct_NativeDx12_render
         D3D12_RESOURCE_BARRIER restoreDepth[]={transition(r->sceneDepth,D3D12_RESOURCE_STATE_COPY_DEST,D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE),transition(r->depthTarget,D3D12_RESOURCE_STATE_COPY_SOURCE,D3D12_RESOURCE_STATE_DEPTH_WRITE)};list->ResourceBarrier(2,restoreDepth);
     }else if(r->sceneColor||r->sceneDepth){releaseSceneSnapshots(r);}
     auto rtv=r->rtvHeap->GetCPUDescriptorHandleForHeapStart();auto dsv=r->dsvHeap->GetCPUDescriptorHandleForHeapStart();
-    list->OMSetRenderTargets(1,&rtv,FALSE,&dsv);ID3D12DescriptorHeap* heaps[]={r->srvHeap};list->SetDescriptorHeaps(1,heaps);list->SetGraphicsRootSignature(r->rootSignature);list->SetGraphicsRootDescriptorTable(2,r->srvHeap->GetGPUDescriptorHandleForHeapStart());list->SetGraphicsRootConstantBufferView(3,slot.passConstants->GetGPUVirtualAddress()+kMaxExtensionPasses*256);list->SetGraphicsRoot32BitConstants(0,28,r->viewProjection,0);list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    list->OMSetRenderTargets(1,&rtv,FALSE,&dsv);ID3D12DescriptorHeap* heaps[]={r->srvHeap};list->SetDescriptorHeaps(1,heaps);list->SetGraphicsRootSignature(r->rootSignature);list->SetGraphicsRootDescriptorTable(2,r->srvHeap->GetGPUDescriptorHandleForHeapStart());list->SetGraphicsRootConstantBufferView(3,slot.passConstants->GetGPUVirtualAddress()+kMaxExtensionPasses*1024);list->SetGraphicsRoot32BitConstants(0,28,r->viewProjection,0);list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     D3D12_VIEWPORT viewport={0,0,static_cast<float>(r->width),static_cast<float>(r->height),0,1};D3D12_RECT rect={0,0,static_cast<LONG>(r->width),static_cast<LONG>(r->height)};list->RSSetViewports(1,&viewport);list->RSSetScissorRects(1,&rect);
     auto& sections=r->transparentSections;sections.clear();for(auto& entry:r->visible)if(!entry.section->transparent.empty())sections.push_back(entry.section);
     auto distance=[&](const TerrainSection* s){double x=s->x+8-cameraX,y=s->y+8-cameraY,z=s->z+8-cameraZ;return x*x+y*y+z*z;};
@@ -3101,7 +3163,7 @@ extern "C" JNIEXPORT jint JNICALL Java_com_redondoguibi_direct_NativeDx12_render
             std::sort(order.begin(),order.end(),[&](UINT a,UINT b){return distances[a]!=distances[b]?distances[a]>distances[b]:a<b;});
             section->sortCamera[0]=cameraX;section->sortCamera[1]=cameraY;section->sortCamera[2]=cameraZ;section->transparentOrderValid=true;
         }
-        UINT64 bytes=static_cast<UINT64>(order.size())*24,offset=0;if(!reserveUploadRange(r,bytes,256,&offset)){throwJava(env,"Translucent index budget exceeded; retain vanilla layer");return -1;}
+        UINT64 bytes=static_cast<UINT64>(order.size())*24,offset=0;if(!reserveMappedRange(slot,bytes,256,&offset)){throwJava(env,"Translucent index budget exceeded; retain vanilla layer");return -1;}
         auto* dst=reinterpret_cast<UINT*>(slot.uploadMapped+offset);for(UINT i:order){std::memcpy(dst,section->transparent[i].indices.data(),24);dst+=6;}
         D3D12_INDEX_BUFFER_VIEW indices={slot.uploadBuffer->GetGPUVirtualAddress()+offset,static_cast<UINT>(bytes),DXGI_FORMAT_R32_UINT};list->IASetIndexBuffer(&indices);list->IASetVertexBuffers(0,1,&section->vertexView);
         float positions[]={static_cast<float>(section->x-cameraX),static_cast<float>(section->y-cameraY),static_cast<float>(section->z-cameraZ),-1};UINT constants[5];std::memcpy(constants,positions,16);constants[4]=r->atlasIndex;list->SetGraphicsRoot32BitConstants(1,5,constants,0);list->DrawIndexedInstanced(static_cast<UINT>(order.size())*6,1,0,0,0);
@@ -3119,4 +3181,44 @@ extern "C" JNIEXPORT jint JNICALL Java_com_redondoguibi_direct_NativeDx12_render
     if(FAILED(r->queue->Signal(r->fence,value))){throwJava(env,"Translucent fence failed");return -1;}
     r->lastSignaledValue=value;slot.fenceValue=value;slot.timestampValid=r->profiling;slot.drawCount=static_cast<UINT>(sections.size());r->slotIndex=(r->slotIndex+1)%kFramesInFlight;guard.submitted=true;
     return 0;
+}
+
+extern "C" JNIEXPORT void JNICALL Java_com_redondoguibi_direct_NativeDx12_configureWorldPasses(JNIEnv* env,jclass type,jobjectArray sources){
+    auto* r=g_interopRenderer;if(!r){throwJava(env,"World backend unavailable");return;}
+    r->extensionPasses.swap(r->worldPasses);
+    Java_com_redondoguibi_direct_NativeDx12_configureRenderPasses(env,type,sources);
+    r->extensionPasses.swap(r->worldPasses);
+}
+extern "C" JNIEXPORT jint JNICALL Java_com_redondoguibi_direct_NativeDx12_renderWorldInterop(JNIEnv* env,jclass,jfloatArray uniforms,jlong frameIndex){
+    auto* r=g_interopRenderer;
+    if(!r||r->worldPasses.empty()||!uniforms||env->GetArrayLength(uniforms)!=r->worldPasses.size()*kPassUniformFloatCount||frameIndex<0||frameIndex>=INT64_MAX-1){throwJava(env,"Invalid world pass frame");return -1;}
+    bool ready=false;if(!currentFrameSlotReady(r,env,&ready))return -1;if(!ready)return 2;
+    auto& slot=r->slots[r->slotIndex];
+    if(r->uploadOpen)return 2; // Defer; pending terrain uploads are not a backend failure.
+    struct WorldFenceGuard{InteropRenderer* r;FrameSlot& slot;UINT64 value;bool submitted=false;~WorldFenceGuard(){if(!submitted&&SUCCEEDED(r->queue->Signal(r->fence,value))){r->lastSignaledValue=value;slot.fenceValue=value;}}} guard{r,slot,static_cast<UINT64>(frameIndex)+1};
+    float values[kMaxExtensionPasses*kPassUniformFloatCount]={};env->GetFloatArrayRegion(uniforms,0,env->GetArrayLength(uniforms),values);if(env->ExceptionCheck())return -1;
+    releaseColorInterop(r);
+    ID3D11Resource* wrapped[]={r->wrappedColor,r->wrappedDepth};r->d3d11On12->AcquireWrappedResources(wrapped,2);
+    if(!r->colorAlias)r->d3d11Context->CopyResource(r->wrappedColor,r->interopTexture);
+    r->d3d11Context->CopyResource(r->wrappedDepth,r->interopDepth);
+    r->d3d11On12->ReleaseWrappedResources(wrapped,2);r->d3d11Context->Flush();
+    r->extensionPasses.swap(r->worldPasses);
+    bool recorded=recordExtensionPasses(r,slot,frameIndex,0,values);
+    r->extensionPasses.swap(r->worldPasses);
+    if(!recorded){throwJava(env,"World pass recording failed");return -1;}
+    ID3D12CommandList* lists[]={r->extensionList};r->queue->ExecuteCommandLists(1,lists);
+    // World passes only sample depth. interopDepth still contains the scene depth imported above.
+    if(!copyToInteropTexture(r, false)){throwJava(env,"World output transfer failed");return -1;}
+    UINT64 value=static_cast<UINT64>(frameIndex)+1;
+    if(FAILED(r->queue->Signal(r->fence,value))){throwJava(env,"World fence failed");return -1;}
+    r->lastSignaledValue=value;slot.fenceValue=value;slot.timestampValid=false;r->slotIndex=(r->slotIndex+1)%kFramesInFlight;guard.submitted=true;
+    return 0;
+}
+
+extern "C" JNIEXPORT jboolean JNICALL Java_com_redondoguibi_direct_NativeDx12_isWorldFrameReady(JNIEnv* env,jclass){
+    auto* r=g_interopRenderer;
+    if(!r||r->uploadOpen)return JNI_FALSE;
+    bool ready=false;
+    if(!currentFrameSlotReady(r,env,&ready))return JNI_FALSE;
+    return ready?JNI_TRUE:JNI_FALSE;
 }

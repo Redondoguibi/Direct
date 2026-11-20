@@ -17,7 +17,13 @@ public final class DirectRenderApi implements DirectRenderService {
     /** Maximum number of extension passes accepted by the current native backend. */
     public static final int MAX_PASSES = 8;
     /** Number of packed float components reserved for each pass's HLSL uniform buffer. */
-    public static final int MAX_UNIFORM_FLOATS = 60;
+    public static final int MAX_UNIFORM_FLOATS = 252;
+    private static volatile float shaderFog=1;
+    @Override public void shaderFogDistance(float distance){if(!Float.isFinite(distance)||distance<.25f||distance>3)throw new IllegalArgumentException("Invalid shader fog");shaderFog=distance;}
+    /** @return active native terrain fog multiplier */
+    public static float shaderFogDistance(){return shaderFog;}
+    @Override public boolean renderWorld(String[] sources,float[] uniforms){return com.redondoguibi.direct.Dx12GlInterop.renderWorld(sources,uniforms);}
+    @Override public String worldFailure(){return com.redondoguibi.direct.Dx12GlInterop.worldFailure();}
 
     /**
      * Immutable, versioned snapshot used to keep Java and native pass configuration in sync.
@@ -58,7 +64,7 @@ public final class DirectRenderApi implements DirectRenderService {
         terrainRequests.put(owner,request);terrainSettings=terrainRequests.firstEntry().getValue();
     }
     @Override public synchronized void releaseTerrainEffects(String owner){terrainRequests.remove(owner);terrainSettings=terrainRequests.isEmpty()?NO_TERRAIN_EFFECTS:terrainRequests.firstEntry().getValue();}
-    @Override public java.util.Set<String> terrainFeatures(){return capabilities.nativeTerrain()?java.util.Set.of("materials-v2","normals","shadows","wind","translucency","water","reflections","material-lighting"):java.util.Set.of();}
+    @Override public java.util.Set<String> terrainFeatures(){return capabilities.nativeTerrain()?java.util.Set.of("materials-v2","normals","shadows","wind","translucency","water","reflections","material-lighting","world-post-v1"):java.util.Set.of();}
     @Override public synchronized String terrainEffectOwner(){return terrainRequests.isEmpty()?"":terrainRequests.firstKey();}
 
     private DirectRenderApi() {

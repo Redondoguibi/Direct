@@ -246,13 +246,15 @@ public final class TerrainMeshStore {
     }
 
     public static void uploadPending() {
-        long uploadStart=RendererMetrics.recording?System.nanoTime():0;
+        long uploadStart=System.nanoTime();
+        final long timeBudget = ClientConfig.MAX_MESH_UPLOAD_MICROS.get() * 1000L;
         final int maxUpdates = ClientConfig.MAX_MESH_UPLOADS_PER_FRAME.get();
         final long maxBytes = ClientConfig.MAX_MESH_UPLOAD_MIB_PER_FRAME.get() * 1024L * 1024L;
         int uploaded = 0;
         long uploadedBytes = 0L;
 
         while (uploaded < maxUpdates) {
+            if (uploaded > 0 && timeBudget > 0 && System.nanoTime() - uploadStart >= timeBudget) break;
             SectionMesh update;
             synchronized (LOCK) {
                 update=PENDING.poll(maxBytes-uploadedBytes,uploaded==0,
@@ -381,6 +383,15 @@ public final class TerrainMeshStore {
         }
     }
     static boolean owns(long key){synchronized(LOCK){return captureEnabled&&!captureFaulted&&OWNERSHIP.current(key);}}
+    /** One consistent ownership read per visible selection, without holding the lock across renderer calls. */
+    static void copyOwnership(long[] keys,int count,boolean[] owned){
+        java.util.Objects.checkFromIndexSize(0,count,keys.length);
+        java.util.Objects.checkFromIndexSize(0,count,owned.length);
+        synchronized(LOCK){
+            if(captureEnabled&&!captureFaulted)OWNERSHIP.copyCurrent(keys,count,owned);
+            else java.util.Arrays.fill(owned,0,count,false);
+        }
+    }
     static long[] shadowKeys(){synchronized(LOCK){return OWNERSHIP.nativeKeys();}}
 
     /** Must be called while holding LOCK. */

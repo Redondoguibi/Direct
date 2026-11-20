@@ -1,6 +1,7 @@
 {
   "required": true,
   "package": "com.redondoguibi.direct.mixin",
+  "plugin": "com.redondoguibi.direct.compat.DirectMixinPlugin",
   "compatibilityLevel": "JAVA_21",
   "client": [
     "LevelRendererMixin",

@@ -10,7 +10,20 @@ import java.util.List;
  */
 public interface DirectRenderService {
     /** Current public API semantic version. */
-    String API_VERSION = "1.4.0";
+    String API_VERSION = "1.5.0";
+
+    /** Executes HLSL against the completed world color/depth, before hand and GUI (API 1.5).
+     * @param sources one to eight HLSL passes
+     * @param uniforms 252 floats per pass
+     * @return true when the current scene was processed by DX12
+     */
+    default boolean renderWorld(String[] sources, float[] uniforms) { return false; }
+    /** @return most recent world shader rejection, or empty */
+    default String worldFailure(){return "";}
+    /** Sets the shaderpack's native terrain fog multiplier; restore 1 on release.
+     * @param distance multiplier in [0.25, 3]
+     */
+    default void shaderFogDistance(float distance) {}
 
     /**
      * Returns the active service. The service is available on the client after client setup.

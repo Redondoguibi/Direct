@@ -46,7 +46,10 @@ authors="Redondoguibi"
 
 # The description text for the mod (multi line!) (#mandatory)
 description='''
-Implements DirectX 12 for Minecraft (Windows only!)
+Direct3D 12 terrain rendering for Windows x86-64, with vanilla fallback.
+Open the Direct dashboard from Mods > Config, F7, or /direct menu.
+Resource profiles, renderer recovery and diagnostics are included.
+Raydiance visual effects are optional. Requires a compatible D3D12/WGL driver.
 '''
 
 # The [[mixins]] block allows you to declare your mixin config to FML so that it gets loaded.
