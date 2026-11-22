@@ -1,0 +1,64 @@
+{
+ "inputs": [
+  {
+   "name": "Position",
+   "location": 0,
+   "type": "vec4"
+  }
+ ],
+ "cbufferSize": 144,
+ "uniforms": [
+  {
+   "name": "ProjMat",
+   "offset": 0,
+   "type": "mat4"
+  },
+  {
+   "name": "InScale",
+   "offset": 72,
+   "type": "vec2"
+  },
+  {
+   "name": "InOffset",
+   "offset": 80,
+   "type": "vec2"
+  },
+  {
+   "name": "InRotation",
+   "offset": 88,
+   "type": "float"
+  },
+  {
+   "name": "Scissor",
+   "offset": 96,
+   "type": "vec4"
+  },
+  {
+   "name": "Vignette",
+   "offset": 112,
+   "type": "vec4"
+  },
+  {
+   "name": "OutSize",
+   "offset": 128,
+   "type": "vec2"
+  }
+ ],
+ "samplers": [
+  "DiffuseSampler",
+  "BlurSampler"
+ ],
+ "usedSamplers": [
+  "BlurSampler",
+  "DiffuseSampler"
+ ],
+ "blend": {
+  "func": "add",
+  "srcrgb": "one",
+  "dstrgb": "zero"
+ },
+ "name": "spider",
+ "kind": "program",
+ "vertexSource": "rotscale",
+ "fragmentSource": "spiderclip"
+}

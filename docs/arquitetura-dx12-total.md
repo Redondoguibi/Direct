@@ -72,4 +72,6 @@ Um backend DX12 na fronteira do `blaze3d`, a mesma técnica do VulkanMod com Vul
 
 ## Próximo passo
 
-A fase 0 passou nos três portões (22/11/2026): apresentação DXGI estável na janela do NeoForge, 56/56 shaders traduzidos e compilados, e 6,0–6,2 ms de GPU para terreno + Lus + GUI simples sem OpenGL. Detalhes em [fase0-dx12-total.md](fase0-dx12-total.md). Próximo: fase 1 (GUI e menus).
+A fase 0 passou nos três portões (22/11/2026): apresentação DXGI estável na janela do NeoForge, 56/56 shaders traduzidos e compilados, e 6,0–6,2 ms de GPU para terreno + Lus + GUI simples sem OpenGL. Detalhes em [fase0-dx12-total.md](fase0-dx12-total.md).
+
+A fase 1 passou (22/11/2026). O título e cinco menus foram renderizados pelo backend DX12 com pixels iguais aos do OpenGL (diferença máxima de 1/255 nos menus; no título, só nas bordas do texto girado). Com os desenhos do OpenGL cancelados e a apresentação pelo DXGI, a tela mostrou a imagem do DX12 em 18 de 18 verificações. Detalhes em [fase1-dx12-total.md](fase1-dx12-total.md). Próximo: fase 2 (mundo).

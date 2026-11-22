@@ -1,0 +1,68 @@
+{
+ "inputs": [
+  {
+   "name": "Position",
+   "location": 0,
+   "type": "vec3"
+  },
+  {
+   "name": "Color",
+   "location": 1,
+   "type": "vec4"
+  },
+  {
+   "name": "UV0",
+   "location": 2,
+   "type": "vec2"
+  }
+ ],
+ "cbufferSize": 224,
+ "uniforms": [
+  {
+   "name": "ModelViewMat",
+   "offset": 0,
+   "type": "mat4"
+  },
+  {
+   "name": "ProjMat",
+   "offset": 64,
+   "type": "mat4"
+  },
+  {
+   "name": "TextureMat",
+   "offset": 128,
+   "type": "mat4"
+  },
+  {
+   "name": "ColorModulator",
+   "offset": 192,
+   "type": "vec4"
+  },
+  {
+   "name": "FogStart",
+   "offset": 208,
+   "type": "float"
+  },
+  {
+   "name": "FogEnd",
+   "offset": 212,
+   "type": "float"
+  },
+  {
+   "name": "FogShape",
+   "offset": 216,
+   "type": "int"
+  }
+ ],
+ "samplers": [
+  "Sampler0"
+ ],
+ "usedSamplers": [
+  "Sampler0"
+ ],
+ "blend": null,
+ "name": "rendertype_energy_swirl",
+ "kind": "core",
+ "vertexSource": "rendertype_energy_swirl",
+ "fragmentSource": "rendertype_energy_swirl"
+}

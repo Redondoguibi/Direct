@@ -1,0 +1,68 @@
+{
+ "inputs": [
+  {
+   "name": "Position",
+   "location": 0,
+   "type": "vec3"
+  },
+  {
+   "name": "UV0",
+   "location": 1,
+   "type": "vec2"
+  }
+ ],
+ "cbufferSize": 224,
+ "uniforms": [
+  {
+   "name": "ModelViewMat",
+   "offset": 0,
+   "type": "mat4"
+  },
+  {
+   "name": "ProjMat",
+   "offset": 64,
+   "type": "mat4"
+  },
+  {
+   "name": "ColorModulator",
+   "offset": 128,
+   "type": "vec4"
+  },
+  {
+   "name": "GlintAlpha",
+   "offset": 144,
+   "type": "float"
+  },
+  {
+   "name": "FogStart",
+   "offset": 148,
+   "type": "float"
+  },
+  {
+   "name": "FogEnd",
+   "offset": 152,
+   "type": "float"
+  },
+  {
+   "name": "FogShape",
+   "offset": 156,
+   "type": "int"
+  },
+  {
+   "name": "TextureMat",
+   "offset": 160,
+   "type": "mat4"
+  }
+ ],
+ "samplers": [
+  "Sampler0"
+ ],
+ "usedSamplers": [
+  "Sampler0"
+ ],
+ "blend": null,
+ "name": "rendertype_entity_glint",
+ "kind": "core",
+ "vertexSource": "rendertype_entity_glint",
+ "fragmentSource": "rendertype_entity_glint"
+}

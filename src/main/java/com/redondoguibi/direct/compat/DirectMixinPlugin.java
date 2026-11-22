@@ -10,6 +10,9 @@ import org.spongepowered.asm.mixin.extensibility.IMixinInfo;
 /** Avoid applying vanilla terrain injection points to a different terrain renderer. */
 public final class DirectMixinPlugin implements IMixinConfigPlugin {
     @Override public boolean shouldApplyMixin(String targetClassName, String mixinClassName) {
+        if (mixinClassName.endsWith("ShadowMixin") && !Boolean.getBoolean("direct.phase1.shadow")) {
+            return false;
+        }
         if (mixinClassName.endsWith(".PhaseZeroWindowMixin") && !Boolean.getBoolean("direct.phase0.present")) {
             return false;
         }

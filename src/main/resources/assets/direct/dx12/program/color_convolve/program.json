@@ -1,0 +1,77 @@
+{
+ "inputs": [
+  {
+   "name": "Position",
+   "location": 0,
+   "type": "vec4"
+  }
+ ],
+ "cbufferSize": 176,
+ "uniforms": [
+  {
+   "name": "ProjMat",
+   "offset": 0,
+   "type": "mat4"
+  },
+  {
+   "name": "InSize",
+   "offset": 64,
+   "type": "vec2"
+  },
+  {
+   "name": "OutSize",
+   "offset": 72,
+   "type": "vec2"
+  },
+  {
+   "name": "Gray",
+   "offset": 80,
+   "type": "vec3"
+  },
+  {
+   "name": "RedMatrix",
+   "offset": 96,
+   "type": "vec3"
+  },
+  {
+   "name": "GreenMatrix",
+   "offset": 112,
+   "type": "vec3"
+  },
+  {
+   "name": "BlueMatrix",
+   "offset": 128,
+   "type": "vec3"
+  },
+  {
+   "name": "Offset",
+   "offset": 144,
+   "type": "vec3"
+  },
+  {
+   "name": "ColorScale",
+   "offset": 160,
+   "type": "vec3"
+  },
+  {
+   "name": "Saturation",
+   "offset": 172,
+   "type": "float"
+  }
+ ],
+ "samplers": [
+  "DiffuseSampler"
+ ],
+ "usedSamplers": [
+  "DiffuseSampler"
+ ],
+ "blend": {
+  "func": "add",
+  "srcrgb": "one",
+  "dstrgb": "zero"
+ },
+ "name": "color_convolve",
+ "kind": "program",
+ "vertexSource": "sobel",
+ "fragmentSource": "color_convolve"
+}

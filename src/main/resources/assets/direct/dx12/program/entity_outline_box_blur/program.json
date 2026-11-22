@@ -1,0 +1,47 @@
+{
+ "inputs": [
+  {
+   "name": "Position",
+   "location": 0,
+   "type": "vec4"
+  }
+ ],
+ "cbufferSize": 96,
+ "uniforms": [
+  {
+   "name": "ProjMat",
+   "offset": 0,
+   "type": "mat4"
+  },
+  {
+   "name": "InSize",
+   "offset": 64,
+   "type": "vec2"
+  },
+  {
+   "name": "OutSize",
+   "offset": 72,
+   "type": "vec2"
+  },
+  {
+   "name": "BlurDir",
+   "offset": 80,
+   "type": "vec2"
+  }
+ ],
+ "samplers": [
+  "DiffuseSampler"
+ ],
+ "usedSamplers": [
+  "DiffuseSampler"
+ ],
+ "blend": {
+  "func": "add",
+  "srcrgb": "one",
+  "dstrgb": "zero"
+ },
+ "name": "entity_outline_box_blur",
+ "kind": "program",
+ "vertexSource": "blur",
+ "fragmentSource": "entity_outline_box_blur"
+}

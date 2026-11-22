@@ -10,7 +10,7 @@ if(NOT JAVA_HOME)
     message(FATAL_ERROR "JAVA_HOME must point to the JDK used to run Gradle.")
 endif()
 
-add_library(direct_renderer SHARED dx12_gl_interop.cpp bc7_encoder.cpp terrain_packer.cpp phase0_present.cpp)
+add_library(direct_renderer SHARED dx12_gl_interop.cpp bc7_encoder.cpp terrain_packer.cpp phase0_present.cpp dx12_backend.cpp)
 target_compile_features(direct_renderer PRIVATE cxx_std_17)
 # The vertex packer must match Java's IEEE float results bit for bit: no FMA contraction.
 set_source_files_properties(terrain_packer.cpp PROPERTIES COMPILE_OPTIONS "/fp:precise")

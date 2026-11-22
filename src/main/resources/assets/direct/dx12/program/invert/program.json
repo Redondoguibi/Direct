@@ -1,0 +1,42 @@
+{
+ "inputs": [
+  {
+   "name": "Position",
+   "location": 0,
+   "type": "vec4"
+  }
+ ],
+ "cbufferSize": 80,
+ "uniforms": [
+  {
+   "name": "ProjMat",
+   "offset": 0,
+   "type": "mat4"
+  },
+  {
+   "name": "OutSize",
+   "offset": 64,
+   "type": "vec2"
+  },
+  {
+   "name": "InverseAmount",
+   "offset": 72,
+   "type": "float"
+  }
+ ],
+ "samplers": [
+  "DiffuseSampler"
+ ],
+ "usedSamplers": [
+  "DiffuseSampler"
+ ],
+ "blend": {
+  "func": "add",
+  "srcrgb": "one",
+  "dstrgb": "zero"
+ },
+ "name": "invert",
+ "kind": "program",
+ "vertexSource": "blit",
+ "fragmentSource": "invert"
+}

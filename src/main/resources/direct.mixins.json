@@ -13,7 +13,13 @@
     "NativeImageAccessor",
     "LightTextureMixin",
     "WindowMixin",
-    "PhaseZeroWindowMixin"
+    "PhaseZeroWindowMixin",
+    "GlStateManagerShadowMixin",
+    "VertexBufferShadowMixin",
+    "ShaderInstanceShadowMixin",
+    "EffectInstanceShadowMixin",
+    "WindowShadowMixin",
+    "RenderSystemShadowMixin"
   ],
   "injectors": {
     "defaultRequire": 1
