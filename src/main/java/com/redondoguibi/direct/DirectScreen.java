@@ -14,7 +14,7 @@ import net.neoforged.neoforge.common.ModConfigSpec.ConfigValue;
 
 /** Main player-facing entry point, shared by Mods, the key binding and /direct menu. */
 public final class DirectScreen extends Screen {
-    private static final String[] PAGES = {"overview", "memory", "advanced"};
+    private static final String[] PAGES = {"overview", "memory", "textures", "advanced"};
     private final Screen parent;
     private DirectSettings draft;
     private int page;
@@ -34,7 +34,7 @@ public final class DirectScreen extends Screen {
         if (draft == null) draft = new DirectSettings();
         panelWidth = Math.min(420, width - 20);
         left = (width - panelWidth) / 2;
-        int tabWidth = panelWidth / 3;
+        int tabWidth = panelWidth / PAGES.length;
         for (int i = 0; i < PAGES.length; i++) {
             final int next = i;
             var tab = button(text(PAGES[i]), left + i * tabWidth, 28, tabWidth - 3, () -> { page = next; error = Component.empty(); rebuildWidgets(); });
@@ -76,17 +76,23 @@ public final class DirectScreen extends Screen {
             number(ClientConfig.MAX_TERRAIN_ARENA_MIB, 64, 4096, right, 102, half);
             number(ClientConfig.TERRAIN_ARENA_PAGE_MIB, 8, 256, left, 126, half);
             number(ClientConfig.MAX_PENDING_MESH_MIB, 64, 2048, right, 126, half);
-            number(ClientConfig.ANIMATED_ATLAS_REFRESH_MILLIS, 50, 2000, left, 150, half);
-            number(ClientConfig.BC7_ENCODER_THREADS, 1, 16, right, 150, half);
-            toggle(ClientConfig.COMPRESS_BLOCK_ATLAS, left, 174, half);
-            number(ClientConfig.MAX_MESH_UPLOAD_MICROS, 0, 20000, right, 174, half);
+            number(ClientConfig.MAX_MESH_UPLOAD_MICROS, 0, 20000, left, 150, half);
+        } else if (page == 2) {
+            toggle(ClientConfig.COMPRESS_BLOCK_ATLAS, left, 78, half);
+            number(ClientConfig.BC7_ENCODER_THREADS, 1, 16, right, 78, half);
+            number(ClientConfig.ANIMATED_ATLAS_REFRESH_MILLIS, 50, 2000, left, 102, half);
+            toggle(ClientConfig.CPU_ATLAS_ANIMATION, right, 102, half);
         } else {
-            toggle(ClientConfig.USE_GPU_SEMAPHORE_SYNC, left, 78, panelWidth);
-            toggle(ClientConfig.PREFER_DIRECT_COLOR_INTEROP, left, 102, panelWidth);
+            toggle(ClientConfig.USE_GPU_SEMAPHORE_SYNC, left, 78, half);
+            toggle(ClientConfig.FACE_CULLING, right, 78, half);
+            nativeSharing(left, 102, half);
+            toggle(ClientConfig.NATIVE_VERTEX_PACKING, right, 102, half);
             toggle(ClientConfig.PARALLEL_SECTION_RECORDING, left, 126, half);
             toggle(ClientConfig.USE_EXECUTE_INDIRECT, right, 126, half);
-            toggle(ClientConfig.DX12_TRANSLUCENCY, left, 150, panelWidth);
-            var distance = number(ClientConfig.TERRAIN_RENDER_DISTANCE_PERCENT, 25, 100, left, 174, panelWidth);
+            toggle(ClientConfig.DX12_TRANSLUCENCY, left, 150, half);
+            number(ClientConfig.MAX_SECTION_ADOPTIONS_PER_FRAME, 1, 512, right, 150, half);
+            var distance = number(ClientConfig.TERRAIN_RENDER_DISTANCE_PERCENT, 25, 100, left, 174, half);
+            toggle(ClientConfig.FLUSH_OPENGL_STAGES, right, 174, half);
             distance.active = !draft.get(ClientConfig.REPLACE_VANILLA_TERRAIN);
         }
         button(text("save"), left, height - 26, half, this::save);
@@ -103,6 +109,21 @@ public final class DirectScreen extends Screen {
     }
 
     private static String key(ConfigValue<?> setting) { return String.join(".", setting.getPath()); }
+
+    /** One control for both sharing switches: off, color only, color and depth (direct bridge). */
+    private void nativeSharing(int x, int y, int w) {
+        boolean color = draft.get(ClientConfig.PREFER_DIRECT_COLOR_INTEROP);
+        int level = !color ? 0 : draft.get(ClientConfig.DIRECT_BRIDGE) ? 2 : 1;
+        var control = button(Component.translatable("direct.control.nativeSharing")
+                        .append(": ").append(Component.translatable("direct.control.nativeSharing." + level)),
+                x, y, w, () -> {
+                    int next = (level + 1) % 3;
+                    draft.set(ClientConfig.PREFER_DIRECT_COLOR_INTEROP, next != 0);
+                    draft.set(ClientConfig.DIRECT_BRIDGE, next == 2);
+                    rebuildWidgets();
+                });
+        control.setTooltip(Tooltip.create(Component.translatable("direct.help.nativeSharing")));
+    }
 
     private void toggle(BooleanValue setting, int x, int y, int w) {
         var label = Component.translatable("direct.control." + key(setting));

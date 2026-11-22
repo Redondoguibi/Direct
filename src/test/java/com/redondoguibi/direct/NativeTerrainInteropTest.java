@@ -17,6 +17,7 @@ import org.lwjgl.system.MemoryStack;
 @EnabledOnOs(OS.WINDOWS)
 abstract class NativeTerrainInteropTestBase {
     boolean aliased(){return false;}
+    boolean bridged(){return false;}
     @Test
     void transfersCurrentColorDepthLightAndAnimatedPatchesThroughRealWgl() {
         System.load(Path.of("build/generated/nativeResources/META-INF/native/windows-x86_64/direct_renderer.dll").toAbsolutePath().toString());
@@ -41,8 +42,9 @@ abstract class NativeTerrainInteropTestBase {
             int color = GL11.glGenTextures();
             int depth = GL11.glGenTextures();
             colorObject = register(device, aliased()?NativeDx12.acquireColorInteropTarget():handles[1], color);
-            depthObject = register(device, handles[4], depth);
+            depthObject = register(device, bridged() ? NativeDx12.acquireDepthBridgeTarget() : handles[4], depth);
             NativeDx12.configureColorAlias(aliased());
+            if (bridged()) NativeDx12.configureDirectBridge(true);
             ByteBuffer atlas = ByteBuffer.allocateDirect(4 * 4 * 4);
             for (int i = 0; i < 16; i++) atlas.putInt(-1);
             atlas.flip();
@@ -50,6 +52,8 @@ abstract class NativeTerrainInteropTestBase {
             ByteBuffer light = ByteBuffer.allocateDirect(1024);
             for (int i = 0; i < 256; i++) light.putInt(-1);
             light.flip();
+            // Create and patch slot 63 on the same upload list. The first draw must use white.
+            NativeDx12.updateLightmap(ByteBuffer.allocateDirect(1024));
             NativeDx12.updateLightmap(light);
             ByteBuffer vertices = ByteBuffer.allocateDirect(64).order(ByteOrder.nativeOrder());
             float[][] positions = {{-.75f,-.75f,.25f}, {.75f,-.75f,.25f}, {.75f,.75f,.25f}, {-.75f,.75f,.25f}};
@@ -137,6 +141,21 @@ abstract class NativeTerrainInteropTestBase {
             assertTrue(NativeDx12.updateAtlasRegion(encoded, 1, 0, 0, 2, 2));
             NativeDx12.encodeAtlasRegion(red, encoded, 1, 1, 1);
             assertTrue(NativeDx12.updateAtlasRegion(encoded, 2, 0, 0, 1, 1));
+
+            // Activation path: the whole chain is BC7-encoded off-thread and uploaded as-is.
+            // Encodes the same red texels so the following red-center assertion still applies.
+            ByteBuffer[] preEncoded = new ByteBuffer[3];
+            for (int level = 0; level < 3; level++) {
+                int size = 4 >> level;
+                preEncoded[level] = ByteBuffer.allocateDirect(16);
+                NativeDx12.encodeAtlasRegion(red, preEncoded[level], size, size, 1);
+            }
+            NativeDx12.updateTerrainAtlas(preEncoded, 4, 4, true, 1, true);
+            assertTrue(NativeDx12.isAtlasCompressed());
+            assertEquals(3, NativeDx12.atlasMipLevels());
+            assertThrows(IllegalStateException.class,
+                    () -> NativeDx12.updateTerrainAtlas(preEncoded, 4, 4, false, 1, true),
+                    "pre-encoded data is only valid as BC7");
             NativeDx12.updateTerrainSection(1, 0, 0, 0, vertices, 4, indices, new int[] {6,0,0});
             NativeDx12.renderInterop(constants, 0, 0, 0, 256, 3, 0, new float[0], true, true);
             NativeDx12.waitInteropFrame(4);
@@ -179,7 +198,7 @@ abstract class NativeTerrainInteropTestBase {
             NativeDx12.configureRenderPasses(new String[] {green});
             assertThrows(IllegalArgumentException.class,
                     () -> NativeDx12.configureRenderPasses(new String[] {green, "invalid HLSL"}));
-            float[] tint = new float[60];
+            float[] tint = new float[com.redondoguibi.direct.api.DirectRenderApi.MAX_UNIFORM_FLOATS];
             tint[1] = 1; tint[3] = 1;
             NativeDx12.renderInterop(constants, 0, 0, 0, 256, 6, 0, tint, false, true);
             NativeDx12.waitInteropFrame(7);
@@ -195,7 +214,7 @@ abstract class NativeTerrainInteropTestBase {
             // Every pass must see the ORIGINAL terrain depth at t1, including ping-pong input.
             String depthShader="Texture2D<float> DirectDepth:register(t1); float4 main(float4 p:SV_Position):SV_Target0 {float d=DirectDepth.Load(int3(int2(p.xy),0));return float4(d,d,d,1);}";
             NativeDx12.configureRenderPasses(new String[]{depthShader,depthShader});
-            NativeDx12.renderInterop(constants,0,0,0,256,7,0,new float[120],false,true);assertTrue(NativeDx12.waitInteropFrame(8));
+            NativeDx12.renderInterop(constants,0,0,0,256,7,0,new float[2*com.redondoguibi.direct.api.DirectRenderApi.MAX_UNIFORM_FLOATS],false,true);assertTrue(NativeDx12.waitInteropFrame(8));
             assertTrue(WGLNVDXInterop.wglDXLockObjectsNV(device,objects));GL11.glBindTexture(GL11.GL_TEXTURE_2D,color);GL11.glGetTexImage(GL11.GL_TEXTURE_2D,0,GL11.GL_RGBA,GL11.GL_UNSIGNED_BYTE,colors);
             assertEquals(64,Byte.toUnsignedInt(colors.get(center)),1,"depth .25 must be sampled by second HLSL pass");assertEquals(255,Byte.toUnsignedInt(colors.get(0)),"clear depth must remain 1");
             assertTrue(WGLNVDXInterop.wglDXUnlockObjectsNV(device,objects));GL11.glFinish();NativeDx12.signalInteropFence(8);NativeDx12.configureRenderPasses(new String[0]);
@@ -254,6 +273,72 @@ abstract class NativeTerrainInteropTestBase {
                 GL11.glBindTexture(GL11.GL_TEXTURE_2D,resizedDepth);GL11.glGetTexImage(GL11.GL_TEXTURE_2D,0,GL11.GL_RED,GL11.GL_FLOAT,cleared);
                 assertEquals(.25f,cleared.get(8*16+8),1e-5);
                 assertTrue(WGLNVDXInterop.wglDXUnlockObjectsNV(device,resizedObjects));GL11.glFinish();NativeDx12.signalInteropFence(12);
+                String customGeometry = """
+                        VertexOutput packVertex(VertexInput input, VertexOutput vanilla) {
+                            vanilla.position.z += 0.125 * vanilla.position.w;
+                            return vanilla;
+                        }
+                        float4 packOpaque(VertexOutput input, float4 vanilla) {
+                            return float4(0, PackOptions[0].x, 0, 1);
+                        }
+                        float4 packCutout(VertexOutput input, float4 vanilla) {
+                            clip(vanilla.a - alphaCutoff);
+                            return float4(vanilla.rgb, 1);
+                        }
+                        float4 packTranslucent(VertexOutput input, float4 vanilla) { return vanilla; }
+                        void packShadow(VertexOutput input, float alpha) { clip(alpha - alphaCutoff); }
+                        """;
+                NativeDx12.configurePackGeometry(customGeometry);
+                assertThrows(IllegalArgumentException.class, () -> NativeDx12.configurePackGeometry("invalid shader"));
+                float[] options = new float[32];
+                options[0] = 0.5f;
+                NativeDx12.setPackGeometryOptions(options, false, false);
+                String first = """
+                        // direct:target=rgba16f
+                        // direct:fullscreen-vertex
+                        cbuffer Frame : register(b0) { float4 sizeAndTime; };
+                        struct Screen { float4 position:SV_Position; nointerpolation float blue:TEXCOORD0; };
+                        Screen passVertex(uint id:SV_VertexID) {
+                            Screen v;
+                            v.position=float4(float2((id<<1)&2,id&2)*float2(2,-2)+float2(-1,1),0,1);
+                            v.blue=sizeAndTime.y/8.0; // width 16
+                            return v;
+                        }
+                        float4 main(Screen v):SV_Target0 { return float4(0, 0, v.blue, 1); }
+                        """;
+                String second = """
+                        Texture2D<float4> hdr : register(t0);
+                        Texture2D<float4> original : register(t2);
+                        float4 main(float4 p:SV_Position):SV_Target0 {
+                            int3 pixel = int3(int2(p.xy), 0);
+                            return hdr.Load(pixel).b > 1.5 ? original.Load(pixel) : float4(1, 0, 1, 1);
+                        }
+                        """;
+                NativeDx12.configureRenderPasses(new String[]{first, second});
+                assertEquals(0, NativeDx12.renderInterop(constants,0,0,0,256,12,0,new float[504],false,true));
+                assertTrue(NativeDx12.waitInteropFrame(13));
+                assertTrue(WGLNVDXInterop.wglDXLockObjectsNV(device, resizedObjects));
+                GL11.glBindTexture(GL11.GL_TEXTURE_2D, resizedColor);
+                GL11.glGetTexImage(GL11.GL_TEXTURE_2D, 0, GL11.GL_RGBA, GL11.GL_UNSIGNED_BYTE, result);
+                assertEquals(128, Byte.toUnsignedInt(result.get(pixel + 1)), 1);
+                assertEquals(0, Byte.toUnsignedInt(result.get(pixel + 2)));
+                GL11.glBindTexture(GL11.GL_TEXTURE_2D, resizedDepth);
+                GL11.glGetTexImage(GL11.GL_TEXTURE_2D, 0, GL11.GL_RED, GL11.GL_FLOAT, cleared);
+                assertEquals(.375f, cleared.get(8 * 16 + 8), 1e-5);
+                assertTrue(WGLNVDXInterop.wglDXUnlockObjectsNV(device, resizedObjects));
+                GL11.glFinish();
+                NativeDx12.signalInteropFence(13);
+                NativeDx12.configureRenderPasses(new String[0]);
+                NativeDx12.configurePackGeometry("");
+                assertEquals(0, NativeDx12.renderInterop(constants,0,0,0,256,13,0,new float[0],false,true));
+                assertTrue(NativeDx12.waitInteropFrame(14));
+                assertTrue(WGLNVDXInterop.wglDXLockObjectsNV(device, resizedObjects));
+                GL11.glBindTexture(GL11.GL_TEXTURE_2D, resizedColor);
+                GL11.glGetTexImage(GL11.GL_TEXTURE_2D, 0, GL11.GL_RGBA, GL11.GL_UNSIGNED_BYTE, result);
+                assertTrue(Byte.toUnsignedInt(result.get(pixel)) > 240);
+                assertTrue(WGLNVDXInterop.wglDXUnlockObjectsNV(device, resizedObjects));
+                GL11.glFinish();
+                NativeDx12.signalInteropFence(14);
             }finally{updates.close();GL11.glDeleteTextures(glAtlas);}
             assertFalse(NativeDx12.hasInteropGpuSyncFault());
             assertEquals(GL11.GL_NO_ERROR, GL11.glGetError());
@@ -345,4 +430,8 @@ abstract class NativeTerrainInteropTestBase {
 class NativeTerrainInteropTest extends NativeTerrainInteropTestBase {}
 class NativeAliasedTerrainInteropTest extends NativeTerrainInteropTestBase {
     @Override boolean aliased(){return true;}
+}
+class NativeBridgedTerrainInteropTest extends NativeTerrainInteropTestBase {
+    @Override boolean aliased(){return true;}
+    @Override boolean bridged(){return true;}
 }

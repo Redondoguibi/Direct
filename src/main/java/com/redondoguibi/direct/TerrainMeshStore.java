@@ -31,12 +31,20 @@ public final class TerrainMeshStore {
     private static final ThreadLocal<CaptureToken> CAPTURE_TOKEN = ThreadLocal.withInitial(CaptureToken::new);
     private static final java.util.Set<Long> NATIVE_PRESENT=new java.util.HashSet<>();
     private static final TerrainOwnership<SectionMesh> OWNERSHIP = new TerrainOwnership<>();
+    // Sections already asked to rebuild for capture in this generation; guarded by LOCK.
+    private static final it.unimi.dsi.fastutil.longs.LongOpenHashSet ADOPTION_REQUESTED = new it.unimi.dsi.fastutil.longs.LongOpenHashSet();
     private static RenderType[] layers;
     private static long generation; // guarded by LOCK
     private static int activeCaptures; // guarded by LOCK
     private static long successfulCaptures; // guarded by LOCK
     private static long lastCaptureActivityNanos; // guarded by LOCK
     private static boolean reportedPendingBudgetOverrun; // guarded by LOCK
+    // Arena-full back-off: sections that did not fit stay on vanilla and are not re-requested until it ends.
+    private static volatile long arenaBackoffUntilNanos;
+    // Only track rejected mesh sizes. A normal vanilla rebuild can always submit different geometry.
+    private static final Long2LongOpenHashMap rejectedMeshBytes = new Long2LongOpenHashMap();
+    private static long nextCapacityCheckNanos, largestAllocationBytes;
+    private static long arenaRejections, lastArenaWarningNanos; // guarded by LOCK
     private static volatile boolean captureEnabled;
     private static volatile boolean captureFaulted;
     private static volatile boolean captureReady;
@@ -171,6 +179,8 @@ public final class TerrainMeshStore {
         synchronized (LOCK) {
             captureReady = false;
             OWNERSHIP.remove(key);
+            ADOPTION_REQUESTED.remove(key);
+            rejectedMeshBytes.remove(key);
             lastCaptureActivityNanos = System.nanoTime();
             VERSIONS.addTo(key, 1L);
             if(NATIVE_PRESENT.contains(key)||PENDING.containsKey(key))enqueuePendingLocked(SectionMesh.empty(key));
@@ -185,7 +195,9 @@ public final class TerrainMeshStore {
             generation++;
             VERSIONS.clear();
             PENDING.clear();
-            OWNERSHIP.clear();NATIVE_PRESENT.clear();
+            OWNERSHIP.clear();NATIVE_PRESENT.clear();ADOPTION_REQUESTED.clear();
+            rejectedMeshBytes.clear();
+            nextCapacityCheckNanos = arenaBackoffUntilNanos = 0;
             successfulCaptures = 0L;
             replacementSafe = true;
             captureReady = false;
@@ -231,6 +243,11 @@ public final class TerrainMeshStore {
     public static boolean hasCaptureFault() {
         return captureFaulted;
     }
+    /** True while sections that did not fit the GPU arena are being left on vanilla rendering. */
+    static boolean arenaBackoffActive() { return System.nanoTime() < arenaBackoffUntilNanos; }
+
+    static long arenaRejections() { synchronized (LOCK) { return arenaRejections; } }
+
     static long[] pendingMetrics(){synchronized(LOCK){return new long[]{PENDING.bytes(),PENDING.size(),activeCaptures};}}
 
     /** Closes a capture if SectionCompiler.compile exits exceptionally before its return hook. */
@@ -252,27 +269,52 @@ public final class TerrainMeshStore {
         final long maxBytes = ClientConfig.MAX_MESH_UPLOAD_MIB_PER_FRAME.get() * 1024L * 1024L;
         int uploaded = 0;
         long uploadedBytes = 0L;
+        int attempted = 0;
+        long attemptedBytes = 0L;
 
-        while (uploaded < maxUpdates) {
-            if (uploaded > 0 && timeBudget > 0 && System.nanoTime() - uploadStart >= timeBudget) break;
+        while (attempted < maxUpdates) {
+            if (attempted > 0 && timeBudget > 0 && System.nanoTime() - uploadStart >= timeBudget) break;
             SectionMesh update;
             synchronized (LOCK) {
-                update=PENDING.poll(maxBytes-uploadedBytes,uploaded==0,
+                update=PENDING.poll(maxBytes-attemptedBytes,attempted==0,
                         candidate->candidate.vertices()==null||OWNERSHIP.accepts(candidate.key(),candidate.receipt()));
                 LOCK.notifyAll();
             }
             if (update == null) {
                 break;
             }
+            // A rejected native allocation still consumes render-thread work. Keep success metrics separate.
+            attempted++;
+            attemptedBytes += update.byteSize();
             if (update.vertices() == null) {
                 NativeDx12.removeTerrainSection(update.key());
             } else {
                 NativeDx12.updateTerrainSection(update.key(), update.sectionX(), update.sectionY(),
                         update.sectionZ(), update.vertices(), update.vertexCount(), update.indices(),
                         update.layerIndexCounts());
+                if (NativeDx12.consumeArenaRejection()) {
+                    // Not a failure: this section stays on vanilla rendering while the rest remains native.
+                    long now = System.nanoTime();
+                    boolean warn;
+                    synchronized (LOCK) {
+                        arenaRejections++;
+                        ADOPTION_REQUESTED.remove(update.key());
+                        rejectedMeshBytes.put(update.key(), update.arenaBytes());
+                        nextCapacityCheckNanos = 0;
+                        arenaBackoffUntilNanos = now + 2_000_000_000L;
+                        warn = now - lastArenaWarningNanos > 30_000_000_000L;
+                        if (warn) lastArenaWarningNanos = now;
+                    }
+                    if (warn) {
+                        Direct.LOGGER.warn("Direct terrain GPU arena is full ({} MiB): sections that do not fit stay on vanilla rendering. "
+                                + "Raise maxTerrainArenaMiB or lower the render distance.", ClientConfig.MAX_TERRAIN_ARENA_MIB.get());
+                    }
+                    continue;
+                }
             }
             synchronized (LOCK) {
                 if(update.vertices()==null)NATIVE_PRESENT.remove(update.key());else NATIVE_PRESENT.add(update.key());
+                rejectedMeshBytes.remove(update.key());
                 OWNERSHIP.nativeUploaded(update.key(),update.receipt());
             }
             uploaded++;
@@ -392,6 +434,34 @@ public final class TerrainMeshStore {
             else java.util.Arrays.fill(owned,0,count,false);
         }
     }
+    /**
+     * Marks up to {@code limit} of the given unowned sections as requested for a capture rebuild.
+     * Writes the positions in {@code keys} that the caller should mark dirty into {@code selected}
+     * and returns their count. Each section is requested at most once per generation, so a
+     * section whose rebuild is in flight (or that never becomes ownable) is never re-queued.
+     */
+    static int requestAdoption(long[] keys,int count,int limit,int[] selected){
+        java.util.Objects.checkFromIndexSize(0,count,keys.length);
+        int chosen=0;
+        synchronized(LOCK){
+            if(!captureEnabled||captureFaulted)return 0;
+            if (!rejectedMeshBytes.isEmpty()) {
+                long now = System.nanoTime();
+                if (nextCapacityCheckNanos == 0 || now - nextCapacityCheckNanos >= 0) {
+                    largestAllocationBytes = NativeDx12.largestTerrainAllocation();
+                    nextCapacityCheckNanos = now + 500_000_000L;
+                }
+            }
+            for(int i=0;i<count&&chosen<limit&&chosen<selected.length;i++){
+                long key=keys[i];
+                if(OWNERSHIP.current(key)){ADOPTION_REQUESTED.remove(key);continue;}
+                if (rejectedMeshBytes.get(key) > largestAllocationBytes) continue;
+                if(ADOPTION_REQUESTED.add(key))selected[chosen++]=i;
+            }
+        }
+        return chosen;
+    }
+    static int adoptionRequestedCount(){synchronized(LOCK){return ADOPTION_REQUESTED.size();}}
     static long[] shadowKeys(){synchronized(LOCK){return OWNERSHIP.nativeKeys();}}
 
     /** Must be called while holding LOCK. */
@@ -438,6 +508,12 @@ public final class TerrainMeshStore {
             ByteBuffer vertices, int vertexCount, ByteBuffer indices, int[] layerIndexCounts,Object receipt) {
         long byteSize() {
             return vertices == null ? 0L : (long) vertices.remaining() + indices.remaining();
+        }
+
+        long arenaBytes() {
+            // Native terrain packs 32-bit source indices into 16 bits when every vertex fits.
+            long indexBytes = vertexCount <= 65536 ? indices.remaining() / 2L : indices.remaining();
+            return vertices.remaining() + indexBytes;
         }
 
         static SectionMesh empty(long key) {

@@ -12,12 +12,17 @@ import java.nio.file.Path;
 @Tag("graphics")
 abstract class NativeMaterialsInteropTestBase {
     boolean aliased(){return false;}
+    /** Depth through the native R32F bridge instead of the D3D11 copy (requires the aliased color). */
+    boolean bridged(){return false;}
     private void registerTargets(long color,long depth){
         GL11.glDeleteTextures(sharedColor);
         var target=InteropColorTarget.create(device,color,64,64,aliased());
         assertEquals(aliased(),target.direct,target.fallbackReason);
         sharedColor=target.texture;colorObject=target.object;
-        depthObject=register(depth,sharedDepth);
+        if(bridged()){
+            long bridge=NativeDx12.acquireDepthBridgeTarget();assertNotEquals(0,bridge,"Native depth bridge unavailable");
+            depthObject=register(bridge,sharedDepth);NativeDx12.configureDirectBridge(true);
+        }else depthObject=register(depth,sharedDepth);
     }
     private long window,device,colorObject,depthObject;private int sharedColor,sharedDepth;
     @BeforeEach void open(){
@@ -40,7 +45,7 @@ abstract class NativeMaterialsInteropTestBase {
     @Test void rejectedNativeStorageRetainsCopiedBridgeAfterResize(){
         float[] frame=matrix(new Matrix4f());
         NativeDx12.configureRenderPasses(new String[]{"float4 main(float4 p:SV_Position):SV_Target0{return float4(1,0,0,1);}"});
-        assertEquals(0,NativeDx12.renderInterop(frame,0,0,0,256,0,0,new float[60],false,true));finish(0);
+        assertEquals(0,NativeDx12.renderInterop(frame,0,0,0,256,0,0,new float[com.redondoguibi.direct.api.DirectRenderApi.MAX_UNIFORM_FLOATS],false,true));finish(0);
         var before=readShared();assertEquals(255,Byte.toUnsignedInt(before.get(0)));
         assertTrue(WGLNVDXInterop.wglDXUnregisterObjectNV(device,colorObject));colorObject=0;
         assertTrue(WGLNVDXInterop.wglDXUnregisterObjectNV(device,depthObject));depthObject=0;
@@ -51,7 +56,7 @@ abstract class NativeMaterialsInteropTestBase {
         sharedColor=target.texture;colorObject=target.object;
         assertFalse(target.direct);assertTrue(target.fallbackReason.contains("64x64; expected 32x64"));
         sharedDepth=GL11.glGenTextures();depthObject=register(resized[1],sharedDepth);
-        assertEquals(0,NativeDx12.renderInterop(frame,0,0,0,256,1,0,new float[60],false,true));finish(1);
+        assertEquals(0,NativeDx12.renderInterop(frame,0,0,0,256,1,0,new float[com.redondoguibi.direct.api.DirectRenderApi.MAX_UNIFORM_FLOATS],false,true));finish(1);
         assertEquals(before,readShared(),"Rejected alias must preserve the copied output after resize");
         assertEquals(GL11.GL_NO_ERROR,GL11.glGetError());
     }
@@ -61,15 +66,25 @@ abstract class NativeMaterialsInteropTestBase {
         NativeDx12.setProfilingEnabled(true);NativeDx12.renderInterop(frame,0,0,0,256,0,0,new float[0],false,true);finish(0);
         int fbo=GL30.glGenFramebuffers(),color=GL11.glGenTextures(),depth=GL11.glGenTextures();
         var seed=ByteBuffer.allocateDirect(64*64*4);var depthSeed=ByteBuffer.allocateDirect(64*64*4).order(ByteOrder.nativeOrder()).asFloatBuffer();
-        for(int y=0;y<64;y++)for(int x=0;x<64;x++){seed.put((byte)(x*3)).put((byte)(y*3)).put((byte)(x+y)).put((byte)255);depthSeed.put(.2f+y*.009f);}seed.flip();depthSeed.flip();
+        for(int y=0;y<64;y++)for(int x=0;x<64;x++){seed.put((byte)(x*3)).put((byte)(y*3)).put((byte)(x+y)).put((byte)(x*4+y));depthSeed.put(.2f+y*.009f);}seed.flip();depthSeed.flip();
         try(InteropSceneCapture capture=new InteropSceneCapture();MemoryStack stack=MemoryStack.stackPush()){
             GL11.glBindTexture(GL11.GL_TEXTURE_2D,color);GL11.glTexImage2D(GL11.GL_TEXTURE_2D,0,GL11.GL_RGBA8,64,64,0,GL11.GL_RGBA,GL11.GL_UNSIGNED_BYTE,seed);
             GL11.glBindTexture(GL11.GL_TEXTURE_2D,depth);GL11.glTexImage2D(GL11.GL_TEXTURE_2D,0,GL30.GL_DEPTH_COMPONENT32F,64,64,0,GL11.GL_DEPTH_COMPONENT,GL11.GL_FLOAT,depthSeed);GL11.glTexParameteri(GL11.GL_TEXTURE_2D,GL11.GL_TEXTURE_MIN_FILTER,GL11.GL_NEAREST);GL11.glTexParameteri(GL11.GL_TEXTURE_2D,GL11.GL_TEXTURE_MAG_FILTER,GL11.GL_NEAREST);
             GL30.glBindFramebuffer(GL30.GL_FRAMEBUFFER,fbo);GL30.glFramebufferTexture2D(GL30.GL_FRAMEBUFFER,GL30.GL_COLOR_ATTACHMENT0,GL11.GL_TEXTURE_2D,color,0);GL30.glFramebufferTexture2D(GL30.GL_FRAMEBUFFER,GL30.GL_DEPTH_ATTACHMENT,GL11.GL_TEXTURE_2D,depth,0);
             GL11.glViewport(2,3,37,41);GL11.glEnable(GL11.GL_BLEND);GL11.glEnable(GL11.GL_CULL_FACE);GL11.glEnable(GL11.GL_DEPTH_TEST);GL11.glEnable(GL11.GL_SCISSOR_TEST);GL11.glScissor(7,8,12,13);GL11.glDepthMask(false);GL11.glColorMask(true,false,true,false);GL13.glActiveTexture(GL13.GL_TEXTURE3);
             GL30.glDisablei(GL11.GL_BLEND,1);GL30.glColorMaski(1,false,true,false,true);
+            int previousSampler = GL33.glGenSamplers();
+            GL33.glBindSampler(1, previousSampler);
+            GL13.glActiveTexture(GL13.GL_TEXTURE1);
+            GL11.glBindTexture(GL11.GL_TEXTURE_2D, color);
+            GL13.glActiveTexture(GL13.GL_TEXTURE3);
             var objects=stack.pointers(colorObject,depthObject);assertTrue(WGLNVDXInterop.wglDXLockObjectsNV(device,objects));capture.capture(fbo,depth,sharedColor,sharedDepth,64,64);assertTrue(WGLNVDXInterop.wglDXUnlockObjectsNV(device,objects));GL11.glFinish();
             assertEquals(GL13.GL_TEXTURE3,GL11.glGetInteger(GL13.GL_ACTIVE_TEXTURE));assertTrue(GL11.glIsEnabled(GL11.GL_BLEND));assertFalse(GL11.glGetBoolean(GL11.GL_DEPTH_WRITEMASK));
+            GL13.glActiveTexture(GL13.GL_TEXTURE1);
+            assertEquals(color, GL11.glGetInteger(GL11.GL_TEXTURE_BINDING_2D));
+            assertEquals(previousSampler, GL11.glGetInteger(GL33.GL_SAMPLER_BINDING));
+            GL33.glDeleteSamplers(previousSampler);
+            GL13.glActiveTexture(GL13.GL_TEXTURE3);
             assertEquals(0,NativeDx12.renderTranslucentInterop(frame,0,0,0,1));assertTrue(NativeDx12.waitInteropFrame(2));assertTrue(NativeDx12.frameMetrics()[0]>=0);
             // Give the scene different color and depth so each presentation mode is observable.
             GL11.glDisable(GL11.GL_SCISSOR_TEST);
@@ -97,7 +112,20 @@ abstract class NativeMaterialsInteropTestBase {
             GL11.glReadPixels(0,0,64,64,GL11.GL_DEPTH_COMPONENT,GL11.GL_FLOAT,depths);
             assertEquals(seed,pixels,"Color-only presentation must restore every color row");
             for(int i=0;i<depths.capacity();i++)assertEquals(.875f,depths.get(i));
-            assertTrue(WGLNVDXInterop.wglDXLockObjectsNV(device,objects));capture.present(fbo,sharedColor,sharedDepth,64,64);assertTrue(WGLNVDXInterop.wglDXUnlockObjectsNV(device,objects));GL11.glFinish();NativeDx12.signalInteropFence(2);
+            var sharedPixels = readShared();
+            var sharedDepths = readDepth();
+            assertTrue(WGLNVDXInterop.wglDXLockObjectsNV(device, objects));
+            try {
+                capture.present(fbo, sharedColor, sharedDepth, 64, 64);
+                // World capture takes over the read/write lock held by translucent presentation.
+                capture.capture(fbo, depth, sharedColor, sharedDepth, 64, 64);
+            } finally {
+                assertTrue(WGLNVDXInterop.wglDXUnlockObjectsNV(device, objects));
+            }
+            GL11.glFinish();
+            NativeDx12.signalInteropFence(2);
+            assertEquals(sharedPixels, readShared());
+            assertEquals(sharedDepths, readDepth());
             assertEquals(fbo,GL11.glGetInteger(GL30.GL_DRAW_FRAMEBUFFER_BINDING));assertEquals(GL13.GL_TEXTURE3,GL11.glGetInteger(GL13.GL_ACTIVE_TEXTURE));assertTrue(GL11.glIsEnabled(GL11.GL_SCISSOR_TEST));assertTrue(GL11.glIsEnabled(GL11.GL_CULL_FACE));assertTrue(GL11.glIsEnabled(GL11.GL_BLEND));assertFalse(GL11.glGetBoolean(GL11.GL_DEPTH_WRITEMASK));
             int[] viewport=new int[4];GL11.glGetIntegerv(GL11.GL_VIEWPORT,viewport);assertArrayEquals(new int[]{2,3,37,41},viewport);
             var mask=stack.malloc(4);GL11.glGetBooleanv(GL11.GL_COLOR_WRITEMASK,mask);assertEquals(0,mask.get(1));assertNotEquals(0,mask.get(2));
@@ -259,6 +287,60 @@ abstract class NativeMaterialsInteropTestBase {
         }
         assertEquals(GL11.GL_NO_ERROR,GL11.glGetError());
     }
+    /** Unit cube with outward-facing CCW quads (u x v = normal), one quad per face. */
+    private ByteBuffer cube(int material){
+        var b=ByteBuffer.allocateDirect(24*20).order(ByteOrder.nativeOrder());
+        float[][][] faces={ // center, u, v
+            {{1,.5f,.5f},{0,1,0},{0,0,1}},{{0,.5f,.5f},{0,0,1},{0,1,0}},
+            {{.5f,1,.5f},{0,0,1},{1,0,0}},{{.5f,0,.5f},{1,0,0},{0,0,1}},
+            {{.5f,.5f,1},{1,0,0},{0,1,0}},{{.5f,.5f,0},{0,1,0},{1,0,0}}};
+        int[] colors={0xff0000ff,0xff00ff00,0xffff0000,0xff00ffff,0xffff00ff,0xffffff00};
+        for(int f=0;f<6;f++){float[] c=faces[f][0],u=faces[f][1],v=faces[f][2];
+            for(float[] s:new float[][]{{-.5f,-.5f},{.5f,-.5f},{.5f,.5f},{-.5f,.5f}})
+                vertex(b,c[0]+u[0]*s[0]+v[0]*s[1],c[1]+u[1]*s[0]+v[1]*s[1],c[2]+u[2]*s[0]+v[2]*s[1],colors[f],material);}
+        return b.flip();
+    }
+    @Test void faceCullingSkipsBackFacingGroupsWithoutChangingTheImage(){
+        NativeDx12.updateTerrainSection(1,0,0,0,cube(1),24,indices(6),new int[]{36,0,0,0});NativeDx12.setVisibleSections(new long[]{1},1,true);
+        float[] frame=matrix(new Matrix4f().perspective(1.0f,1,.05f,100,true).lookAt(3,2.5f,4,.5f,.5f,.5f,0,1,0));
+        NativeDx12.setFaceCullingEnabled(false);
+        assertEquals(0,NativeDx12.renderInterop(frame,0,0,0,256,0,0,new float[0],false,true));finish(0);
+        assertArrayEquals(new long[]{36,36},NativeDx12.faceCullingStats(),"disabled culling submits every face");
+        var reference=readShared();var referenceDepth=readDepth();
+        int lit=0;for(int i=0;i<64*64;i++)if(Byte.toUnsignedInt(reference.get(i*4+3))>0)lit++;assertTrue(lit>200,"cube must cover the view: "+lit);
+        NativeDx12.setFaceCullingEnabled(true);
+        for(boolean indirect:new boolean[]{true,false}){
+            long frameIndex=indirect?1:2;
+            assertEquals(0,NativeDx12.renderInterop(frame,0,0,0,256,frameIndex,0,new float[0],false,indirect));finish(frameIndex);
+            assertArrayEquals(new long[]{36,18},NativeDx12.faceCullingStats(),"only the three camera-facing faces are submitted");
+            assertEquals(reference,readShared(),"culling must not change color (indirect="+indirect+")");
+            assertEquals(referenceDepth,readDepth(),"culling must not change depth (indirect="+indirect+")");
+        }
+        // Wind moves foliage in the vertex shader, so an animated layer is never face-culled.
+        NativeDx12.updateTerrainSection(1,0,0,0,cube(3),24,indices(6),new int[]{36,0,0,0});
+        NativeDx12.setTerrainEffects(new float[]{0,0,0,1,0,.7f,.7f,0,0,0});
+        assertEquals(0,NativeDx12.renderInterop(frame,0,0,0,256,3,0,new float[0],false,true));finish(3);
+        assertArrayEquals(new long[]{36,36},NativeDx12.faceCullingStats());
+        NativeDx12.setTerrainEffects(new float[10]);
+        assertEquals(0,NativeDx12.renderInterop(frame,0,0,0,256,4,0,new float[0],false,true));finish(4);
+        assertArrayEquals(new long[]{36,18},NativeDx12.faceCullingStats(),"still culled once wind is off");
+        String pixelPack = """
+                VertexOutput packVertex(VertexInput input, VertexOutput v) { return v; }
+                float4 packOpaque(VertexOutput v, float4 color) { return color; }
+                float4 packCutout(VertexOutput v, float4 color) { clip(color.a-alphaCutoff); return color; }
+                float4 packTranslucent(VertexOutput v, float4 color) { return color; }
+                void packShadow(VertexOutput v, float alpha) { clip(alpha-alphaCutoff); }
+                """;
+        NativeDx12.configurePackGeometry(pixelPack);
+        assertEquals(0,NativeDx12.renderInterop(frame,0,0,0,256,5,0,new float[0],false,true));finish(5);
+        assertArrayEquals(new long[]{36,18},NativeDx12.faceCullingStats(),"pixel-only hooks preserve face culling");
+        assertEquals(reference,readShared());
+        assertEquals(referenceDepth,readDepth());
+        NativeDx12.configurePackGeometry(pixelPack.replace("return v;", "v.position.x *= -1; return v;"));
+        assertEquals(0,NativeDx12.renderInterop(frame,0,0,0,256,6,0,new float[0],false,true));finish(6);
+        assertArrayEquals(new long[]{36,36},NativeDx12.faceCullingStats(),"custom vertex motion must submit all faces");
+        assertEquals(GL11.GL_NO_ERROR,GL11.glGetError());
+    }
     @Test void nativeWindChangesFoliageGeometry(){
         var vertices=ByteBuffer.allocateDirect(80).order(ByteOrder.nativeOrder());for(float[] p:new float[][]{{-.7f,-.7f},{.7f,-.7f},{.7f,.7f},{-.7f,.7f}})vertex(vertices,p[0],p[1],.4f,-1,3);vertices.flip();
         NativeDx12.updateTerrainSection(1,0,0,0,vertices,4,indices(1),new int[]{0,6,0,0});NativeDx12.setVisibleSections(new long[]{1},1,true);float[] frame=matrix(new Matrix4f());
@@ -299,6 +381,10 @@ abstract class NativeMaterialsInteropTestBase {
 }
 
 class NativeMaterialsInteropTest extends NativeMaterialsInteropTestBase {}
+class NativeBridgedMaterialsInteropTest extends NativeMaterialsInteropTestBase {
+    @Override boolean aliased(){return true;}
+    @Override boolean bridged(){return true;}
+}
 class NativeAliasedMaterialsInteropTest extends NativeMaterialsInteropTestBase {
     @Override boolean aliased(){return true;}
 }

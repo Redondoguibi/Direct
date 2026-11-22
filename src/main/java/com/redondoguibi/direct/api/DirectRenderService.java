@@ -10,16 +10,54 @@ import java.util.List;
  */
 public interface DirectRenderService {
     /** Current public API semantic version. */
-    String API_VERSION = "1.5.0";
+    String API_VERSION = "1.7.0";
+
+    /** Queues a shaderpack terrain program and its 32 options on the render thread.
+     * An empty source restores the built-in vertex and pixel shaders.
+     * @param source HLSL terrain hooks, with includes already expanded
+     * @param options live shaderpack uniform values, in manifest order
+     * @param translucent whether Direct should render the pack's translucent terrain
+     * @param sceneInputs whether to expose read-only color and depth captured before translucency
+     * @param shadows whether to render a terrain shadow map for the pack
+     */
+    default void shaderPackGeometry(String source, float[] options, boolean translucent, boolean sceneInputs, boolean shadows) {}
+
+    /** @return rejection for the current shaderpack geometry source, or an empty string */
+    default String shaderPackGeometryFailure() { return ""; }
+
 
     /** Executes HLSL against the completed world color/depth, before hand and GUI (API 1.5).
-     * @param sources one to eight HLSL passes
+     *
+     * <p>API 1.7 world graph, declared by directives on their own lines in the sources (a pass without them
+     * keeps the 1.5 chain contract):</p>
+     * <ul>
+     *   <li>{@code // direct:buffer <0-7> <format> [scale=<0.125-1>] [history] [clear]} declares a pack buffer;
+     *       formats rgba8, rgba16f, rgba32f, r11g11b10f, rg16f, r16f, r32f, rgba16, rg8, r8. Every pass that
+     *       declares a buffer must declare it identically.</li>
+     *   <li>{@code // direct:outputs color,<i>,...} up to four render targets; {@code color} (the chain
+     *       output) must come first. All outputs of one pass have the same size.</li>
+     *   <li>{@code // direct:compute} runs {@code main} as a compute shader with its {@code numthreads}
+     *       over the size of its outputs, which must be buffers (typed UAV stores).</li>
+     *   <li>{@code // direct:terrain-depth} binds a terrain-only depth snapshot (before entities, particles
+     *       and translucency) at t3.</li>
+     * </ul>
+     * <p>Bindings: t0 chain input, t1 scene depth, t2 original color, t3 terrain depth, t4-t11 buffers,
+     * t12-t19 their previous frame (history buffers) or current content, u0-u7 compute outputs, b0 frame
+     * data and uniforms, {@code b1 { float4 DirectTarget; float4 DirectBufferSize[8]; }} (width, height and
+     * reciprocals), s0 linear clamp and s1 point clamp. The final pass writes the chain color in rgba8.</p>
+     * @param sources one to sixteen HLSL passes
      * @param uniforms 252 floats per pass
      * @return true when the current scene was processed by DX12
      */
     default boolean renderWorld(String[] sources, float[] uniforms) { return false; }
     /** @return most recent world shader rejection, or empty */
     default String worldFailure(){return "";}
+    /** Lets the world passes draw the sky and/or clouds themselves (API 1.7): Direct skips the vanilla
+     * draws while the world stage keeps running, and restores them as soon as it stops. Release with false.
+     * @param sky skip the vanilla sky (sky dome, sun, moon and stars)
+     * @param clouds skip the vanilla clouds
+     */
+    default void worldReplacesVanilla(boolean sky, boolean clouds) {}
     /** Sets the shaderpack's native terrain fog multiplier; restore 1 on release.
      * @param distance multiplier in [0.25, 3]
      */

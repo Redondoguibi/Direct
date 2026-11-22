@@ -2,6 +2,8 @@ package com.redondoguibi.direct.mixin;
 
 import org.joml.Matrix4f;
 
+import com.llamalad7.mixinextras.injector.ModifyExpressionValue;
+import com.llamalad7.mixinextras.sugar.Local;
 import com.llamalad7.mixinextras.injector.wrapmethod.WrapMethod;
 import com.llamalad7.mixinextras.injector.wrapoperation.Operation;
 import org.spongepowered.asm.mixin.Mixin;
@@ -17,6 +19,7 @@ import net.minecraft.client.renderer.GameRenderer;
 import net.minecraft.client.renderer.LevelRenderer;
 import net.minecraft.client.renderer.LightTexture;
 import net.minecraft.client.renderer.RenderType;
+import net.minecraft.client.renderer.chunk.SectionRenderDispatcher;
 
 @Mixin(LevelRenderer.class)
 abstract class LevelRendererMixin {
@@ -45,13 +48,17 @@ abstract class LevelRendererMixin {
         original.call(renderType, x, y, z, frustumMatrix, projectionMatrix);
     }
 
-    @com.llamalad7.mixinextras.injector.wrapoperation.WrapOperation(method = "renderSectionLayer",
-            at = @At(value = "INVOKE", target = "Lcom/mojang/blaze3d/vertex/VertexBuffer;draw()V"))
-    private void direct$countVanillaDraw(com.mojang.blaze3d.vertex.VertexBuffer buffer, Operation<Void> original) {
-        if(!Dx12GlInterop.shouldSkipVanillaBuffer(buffer)){
-            com.redondoguibi.direct.RendererMetrics.vanillaDraw();
-            original.call(buffer);
-        }
+    // A mixed layer still runs vanilla's traversal. Filter before it uploads CHUNK_OFFSET and binds the VAO.
+    @ModifyExpressionValue(method = "renderSectionLayer", at = @At(value = "INVOKE",
+            target = "Lnet/minecraft/client/renderer/chunk/SectionRenderDispatcher$CompiledSection;isEmpty(Lnet/minecraft/client/renderer/RenderType;)Z"))
+    private boolean direct$filterNativeSection(boolean empty, @Local(argsOnly = true) RenderType layer,
+            @Local SectionRenderDispatcher.RenderSection section) {
+        return empty || Dx12GlInterop.shouldSkipVanillaSection(section, layer);
+    }
+
+    @Inject(method = "renderSectionLayer", at = @At(value = "INVOKE", target = "Lcom/mojang/blaze3d/vertex/VertexBuffer;draw()V"))
+    private void direct$countVanillaDraw(CallbackInfo callback) {
+        com.redondoguibi.direct.RendererMetrics.vanillaDraw();
     }
 
     @Inject(method = "renderLevel", at = @At(value = "INVOKE",
@@ -70,6 +77,26 @@ abstract class LevelRendererMixin {
             Matrix4f projectionMatrix, CallbackInfo callback) {
         com.redondoguibi.direct.RendererMetrics.frame();
         Dx12GlInterop.captureLevelMatrices(camera, frustumMatrix, projectionMatrix);
+    }
+
+    @Inject(method = "renderLevel", at = @At("RETURN"))
+    private void direct$levelEnd(DeltaTracker deltaTracker, boolean renderBlockOutline, Camera camera,
+            GameRenderer gameRenderer, LightTexture lightTexture, Matrix4f frustumMatrix,
+            Matrix4f projectionMatrix, CallbackInfo callback) {
+        com.redondoguibi.direct.RendererMetrics.levelEnd();
+    }
+
+    // World packs that draw their own sky or clouds (API 1.7); vanilla returns as soon as the pack stops.
+    @Inject(method = "renderSky", at = @At("HEAD"), cancellable = true)
+    private void direct$replaceSky(Matrix4f frustumMatrix, Matrix4f projectionMatrix, float partialTick, Camera camera,
+            boolean foggy, Runnable skyFogSetup, CallbackInfo callback) {
+        if (Dx12GlInterop.skipVanillaSky()) callback.cancel();
+    }
+
+    @Inject(method = "renderClouds", at = @At("HEAD"), cancellable = true)
+    private void direct$replaceClouds(com.mojang.blaze3d.vertex.PoseStack poseStack, Matrix4f frustumMatrix,
+            Matrix4f projectionMatrix, float partialTick, double cameraX, double cameraY, double cameraZ, CallbackInfo callback) {
+        if (Dx12GlInterop.skipVanillaClouds()) callback.cancel();
     }
 
     // Composite current DX12 color and depth before deciding whether vanilla draws are necessary.

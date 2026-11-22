@@ -1,0 +1,16 @@
+modLoader = "javafml"
+loaderVersion = "[1,)"
+license = "All Rights Reserved"
+
+[[mods]]
+modId = "benchfps"
+version = "1.0.0"
+displayName = "Bench FPS (test only)"
+description = "Benchmark-only frame logger for renderer comparisons. Not distributed."
+
+[[dependencies.benchfps]]
+modId = "minecraft"
+type = "required"
+versionRange = "[1.21.1]"
+ordering = "NONE"
+side = "CLIENT"

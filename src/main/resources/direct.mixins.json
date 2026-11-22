@@ -10,6 +10,7 @@
     "VertexBufferMixin",
     "TextureAtlasMixin",
     "SpriteContentsMixin",
+    "NativeImageAccessor",
     "LightTextureMixin",
     "WindowMixin"
   ],

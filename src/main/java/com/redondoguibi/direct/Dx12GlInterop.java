@@ -2,7 +2,6 @@ package com.redondoguibi.direct;
 
 import java.io.IOException;
 import java.nio.ByteBuffer;
-import java.util.ArrayList;
 import java.util.List;
 
 import net.minecraft.client.Camera;
@@ -19,7 +18,6 @@ import org.lwjgl.opengl.GL11;
 import org.lwjgl.opengl.GL12;
 import org.lwjgl.opengl.GL13;
 import org.lwjgl.opengl.GL14;
-import org.lwjgl.opengl.GL15;
 import org.lwjgl.opengl.GL20;
 import org.lwjgl.opengl.GL30;
 import org.lwjgl.opengl.GL32;
@@ -40,8 +38,8 @@ import com.redondoguibi.direct.api.DirectRenderPass;
 
 public final class Dx12GlInterop {
     private static final int[] NO_OBJECTS = new int[0];
-    private static final int MAX_ATLAS_LEVELS = 16;
     private static final AtlasRegionUpdates ATLAS_REGIONS = new AtlasRegionUpdates();
+    private static final AtlasFullUpload FULL_ATLAS = new AtlasFullUpload();
     private static final InteropSceneCapture SCENE_CAPTURE=new InteropSceneCapture();
     private static final long RETRY_DELAY_NANOS = 5_000_000_000L;
     private static final int MAX_FAILURES = 3;
@@ -82,8 +80,8 @@ public final class Dx12GlInterop {
             }
             """;
 
-    // GL e D3D projetam NDC +Y para o topo da viewport; apenas o intervalo Z precisa de conversão.
-    // O winding CW do D3D é configurado no PSO para o sistema de coordenadas da viewport.
+    // GL e D3D projetam NDC +Y para o topo da viewport; apenas o intervalo Z precisa de conversÃƒÂ£o.
+    // O winding CW do D3D ÃƒÂ© configurado no PSO para o sistema de coordenadas da viewport.
     private static final Matrix4f CLIP_CORRECTION = new Matrix4f().m22(0.5f).m32(0.5f);
     private static final Matrix4f CAPTURED_VIEW = new Matrix4f();
     private static final Matrix4f CAPTURED_PROJECTION = new Matrix4f();
@@ -97,11 +95,22 @@ public final class Dx12GlInterop {
     private static int[] visibleSectionIndices = new int[256];
     private static byte[] visibleLayerMasks = new byte[256];
     private static boolean[] visibleOwnership = new boolean[256];
+    // Visible, non-empty sections still drawn by vanilla this frame (adoption candidates).
+    private static long[] fallbackKeys = new long[256];
+    private static int[] fallbackSectionIndices = new int[256];
+    private static int fallbackCount;
+    private static int[] adoptionSelection = new int[32];
+    private static long adoptedSections;
+    // Activation timing, reported once per activation.
+    private static long activationStartedNanos;
+    private static boolean activationReported;
+    private static long activationInitNanos;
+    private static long activationAtlasNanos;
     private static int visibleCount;
     private static int visibleTranslucentCount;
     private static List<SectionRenderDispatcher.RenderSection> currentVisibleSections=List.of();
     private static int fallbackSections;
-    private static int fallbackBaseSections;
+    private static int fallbackLayerMask;
     private static boolean translucentCovered;
     private static final java.util.Set<com.mojang.blaze3d.vertex.VertexBuffer> ownedBuffers=java.util.Collections.newSetFromMap(new java.util.IdentityHashMap<>());
     private static boolean reportedTranslucentBudget;
@@ -155,6 +164,56 @@ public final class Dx12GlInterop {
     private static long[] submittedShadowKeys;
     private static final float[] materialScratch = new float[4];
     private static final float[] geometryScratch = new float[10];
+    private static final float[] packGeometryOptions = new float[32];
+    private static String requestedPackGeometry = "";
+    private static String configuredPackGeometry = "";
+    private static String packGeometryFailure = "";
+    private static boolean packGeometryActive, packOptionsDirty;
+    private static boolean packTranslucent, packSceneInputs, packShadows;
+
+    public static void shaderPackGeometry(String source, float[] options, boolean translucent, boolean sceneInputs, boolean shadows) {
+        RenderSystem.assertOnRenderThread();
+        if (source == null || source.length() > 1048576 || options == null || options.length != packGeometryOptions.length
+                || (sceneInputs && !translucent))
+            throw new IllegalArgumentException("Invalid shaderpack geometry layout");
+        for (float value : options) {
+            if (!Float.isFinite(value)) throw new IllegalArgumentException("Invalid geometry option");
+        }
+        if (!requestedPackGeometry.equals(source)) {
+            requestedPackGeometry = source;
+            packGeometryFailure = "";
+        }
+        System.arraycopy(options, 0, packGeometryOptions, 0, options.length);
+        packOptionsDirty = true;
+        packTranslucent = translucent;
+        packSceneInputs = sceneInputs;
+        packShadows = shadows;
+    }
+
+    public static String shaderPackGeometryFailure() { return packGeometryFailure; }
+
+    private static void configurePackGeometry() {
+        String source = shouldCompositeBeforeVanilla() ? requestedPackGeometry : "";
+        if (!source.equals(configuredPackGeometry)) {
+            try {
+                NativeDx12.configurePackGeometry(source);
+                packGeometryActive = !source.isEmpty();
+                packOptionsDirty = packGeometryActive;
+                packGeometryFailure = "";
+            } catch (IllegalArgumentException ex) {
+                NativeDx12.configurePackGeometry("");
+                packGeometryActive = false;
+                packGeometryFailure = ex.getMessage();
+                Direct.LOGGER.warn("Rejected shaderpack terrain programs", ex);
+            }
+            configuredPackGeometry = source;
+        }
+        if (packGeometryActive && packOptionsDirty) {
+            NativeDx12.setPackGeometryOptions(packGeometryOptions, packSceneInputs, packShadows);
+            packOptionsDirty = false;
+        }
+    }
+
     private static String[] worldSources = NO_PASS_SOURCES;
     private static String[] rejectedWorldSources;
     private static String worldFailure="";
@@ -163,33 +222,68 @@ public final class Dx12GlInterop {
     /** Complete-world post processing; all effect calculations run in native HLSL. */
     public static boolean renderWorld(String[] sources,float[] uniforms){
         RenderSystem.assertOnRenderThread();
-        if(sources==null||sources.length<1||sources.length>8||uniforms==null||uniforms.length!=sources.length*DirectRenderApi.MAX_UNIFORM_FLOATS)
+        try{
+            boolean rendered=renderWorldFrame(sources,uniforms);
+            if(rendered)worldRanThisFrame=true;
+            return rendered;
+        }finally{
+            // A frame that skipped the capture must still return the images before D3D12 uses them.
+            releaseHeldSceneLock();
+        }
+    }
+
+    private static boolean renderWorldFrame(String[] sources,float[] uniforms){
+        if(sources==null||sources.length<1||sources.length>DirectRenderApi.MAX_WORLD_PASSES||uniforms==null||uniforms.length!=sources.length*DirectRenderApi.MAX_UNIFORM_FLOATS)
             throw new IllegalArgumentException("Invalid world pass layout");
         for(String source:sources)if(source==null||source.isBlank()||source.length()>1048576)throw new IllegalArgumentException("Invalid world shader source");
         for(float value:uniforms)if(!Float.isFinite(value))throw new IllegalArgumentException("Non-finite world uniform");
         if(java.util.Arrays.equals(rejectedWorldSources,sources))return false;
+        if (rejectedWorldSources != null) {
+            rejectedWorldSources = null;
+            worldFailure = "";
+        }
         if(!initialized||disabled||!ClientConfig.ENABLE_DX12.get()||!ClientConfig.REPLACE_VANILLA_TERRAIN.get())return false;
         var mc=Minecraft.getInstance();var target=mc.getMainRenderTarget();
         if(Minecraft.useShaderTransparency()||target.width!=width||target.height!=height||GL11.glGetInteger(GL30.GL_DRAW_FRAMEBUFFER_BINDING)!=target.frameBufferId)return false;
         try(MemoryStack stack=MemoryStack.stackPush()){
             if(!lastSubmittedFrameReady("world post")||!NativeDx12.isWorldFrameReady())return false;
             if(!java.util.Arrays.equals(worldSources,sources)){NativeDx12.configureWorldPasses(sources);worldSources=sources.clone();}
-            finishPendingGlSync();
             var objects=stack.pointers(interopObject,depthInteropObject);
-            if(!WGLNVDXInterop.wglDXLockObjectsNV(interopDevice,objects))throw new IllegalStateException("Cannot lock world input");
+            boolean profile = RendererMetrics.recording;
+            long start = profile ? System.nanoTime() : 0;
+            lockSceneForCapture(objects);
             try{SCENE_CAPTURE.capture(target.frameBufferId,target.getDepthTextureId(),texture,depthTexture,width,height);}
             finally{if(!WGLNVDXInterop.wglDXUnlockObjectsNV(interopDevice,objects))throw new IllegalStateException("Cannot unlock world input");}
-            GL11.glFinish();
+            finishGlWork();
+            long captured = profile ? System.nanoTime() : 0;
             if(frameIndex>=Long.MAX_VALUE-1)throw new IllegalStateException("World timeline exhausted");
             int result=NativeDx12.renderWorldInterop(uniforms,frameIndex);
             if(result==NativeDx12.FRAME_SKIPPED_BUSY)return false;
             if(result!=0)throw new IllegalStateException("World render failed: "+result);
             long value=++frameIndex;
             if(!NativeDx12.waitInteropFrame(value))throw new IllegalStateException("World output incomplete");
-            if(!WGLNVDXInterop.wglDXLockObjectsNV(interopDevice,objects))throw new IllegalStateException("Cannot lock world output");
+            long rendered = profile ? System.nanoTime() : 0;
+            sceneAccess(WGLNVDXInterop.WGL_ACCESS_READ_ONLY_NV);
+            var colorOnly = stack.pointers(interopObject);
+            if(!WGLNVDXInterop.wglDXLockObjectsNV(interopDevice,colorOnly))throw new IllegalStateException("Cannot lock world output");
             try{SCENE_CAPTURE.presentColor(target.frameBufferId,texture,width,height);}
-            finally{if(!WGLNVDXInterop.wglDXUnlockObjectsNV(interopDevice,objects))throw new IllegalStateException("Cannot unlock world output");}
-            queueCpuGlSync(value);worldFailure="";return true;
+            finally{if(!WGLNVDXInterop.wglDXUnlockObjectsNV(interopDevice,colorOnly))throw new IllegalStateException("Cannot unlock world output");}
+            queueCpuGlSync(value);
+            if (profile) {
+                // GPU time of the latest completed world frame (the one just waited for).
+                double[] gpu = NativeDx12.worldFrameMetrics();
+                if (gpu != null && gpu[0] >= 0 && gpu[1] >= 0) {
+                    RendererMetrics.worldGpuFrames++;
+                    RendererMetrics.worldGpuImportNanos += (long) (gpu[0] * 1e6);
+                    RendererMetrics.worldGpuPassNanos += (long) (gpu[1] * 1e6);
+                }
+                RendererMetrics.worldFrames++;
+                RendererMetrics.worldCaptureNanos += captured - start;
+                RendererMetrics.worldRenderNanos += rendered - captured;
+                RendererMetrics.worldPresentNanos += System.nanoTime() - rendered;
+            }
+            worldFailure="";
+            return true;
         }catch(IllegalArgumentException exception){worldFailure=exception.getMessage();rejectedWorldSources=sources.clone();Direct.LOGGER.error("Rejected world shader",exception);return false;}
         catch(RuntimeException|UnsatisfiedLinkError exception){worldFailure=exception.getMessage();rendererFailed("world post",exception);return false;}
     }
@@ -199,6 +293,8 @@ public final class Dx12GlInterop {
 
     /** Chamado pelo LevelRendererMixin com as matrizes reais do frame. */
     public static void captureLevelMatrices(Camera camera, Matrix4f viewRotation, Matrix4f projection) {
+        worldRanLastFrame = worldRanThisFrame;
+        worldRanThisFrame = false;
         if(!ClientConfig.ENABLE_DX12.get()){matricesCaptured=false;return;}
         CAPTURED_VIEW.set(viewRotation);
         CAPTURED_PROJECTION.set(projection);
@@ -221,7 +317,7 @@ public final class Dx12GlInterop {
         if(!ClientConfig.ENABLE_DX12.get()||!shouldCompositeBeforeVanilla()||!initialized||!lastFrameSucceeded||!replacementFrame)return false;
         var mc=Minecraft.getInstance();var target=mc.getMainRenderTarget();
         var effects=DirectRenderApi.terrainEffects();
-        if(!ClientConfig.DX12_TRANSLUCENCY.get()&&effects.water()==0&&effects.reflections()==0&&DirectRenderApi.terrainSettings().materials().waterAbsorption()==0)return false;
+        if(!(packGeometryActive&&packTranslucent)&&!ClientConfig.DX12_TRANSLUCENCY.get()&&effects.water()==0&&effects.reflections()==0&&DirectRenderApi.terrainSettings().materials().waterAbsorption()==0)return false;
         if(Minecraft.useShaderTransparency()||GL11.glGetInteger(GL30.GL_DRAW_FRAMEBUFFER_BINDING)!=target.frameBufferId)return false;
         if(!PENDING_VIEW.matches(CAPTURED_VIEW,CAPTURED_PROJECTION,cameraX,cameraY,cameraZ)||!translucentCovered)return false;
         if(visibleTranslucentCount==0)return true;
@@ -235,14 +331,13 @@ public final class Dx12GlInterop {
             }
             if(readiness!=NativeDx12.FRAME_RENDERED_CPU_SYNC)throw new IllegalStateException("Translucent preflight failed");
             long captureStart=System.nanoTime();
-            finishPendingGlSync();
             var objects=stack.pointers(interopObject,depthInteropObject);
-            if(!WGLNVDXInterop.wglDXLockObjectsNV(interopDevice,objects))throw new IllegalStateException("Cannot lock scene capture");
+            lockSceneForCapture(objects);
             try{SCENE_CAPTURE.capture(target.frameBufferId,target.getDepthTextureId(),texture,depthTexture,width,height);}
             finally{if(!WGLNVDXInterop.wglDXUnlockObjectsNV(interopDevice,objects))throw new IllegalStateException("Cannot unlock scene capture");}
             // Imported scene writes must complete before D3D12 can sample them. The shared
-            // consumption fence cannot be reused here: it already signaled for the base layer.
-            GL11.glFinish();
+            // consumption fence alone only covers the preceding base-layer draw.
+            finishGlWork();
             if(RendererMetrics.recording)RendererMetrics.translucentCaptureNanos+=System.nanoTime()-captureStart;
             long submitStart=System.nanoTime();
             int result=NativeDx12.renderTranslucentInterop(MATRIX,cameraX,cameraY,cameraZ,frameIndex);
@@ -255,9 +350,18 @@ public final class Dx12GlInterop {
             if(RendererMetrics.recording)RendererMetrics.translucentWaitNanos+=System.nanoTime()-waitStart;
             if(RendererMetrics.recording){var metrics=NativeDx12.frameMetrics();if(metrics!=null&&metrics[0]>=0){RendererMetrics.translucentGpuNanos+=(long)(metrics[0]*1e6);RendererMetrics.translucentDraws+=(long)metrics[2];}}
             long presentStart=System.nanoTime();
+            // The world pass captures these same two images after vanilla finishes the scene.
+            boolean holdForWorld = worldRanLastFrame;
+            sceneAccess(holdForWorld ? WGLNVDXInterop.WGL_ACCESS_READ_WRITE_NV : WGLNVDXInterop.WGL_ACCESS_READ_ONLY_NV);
             if(!WGLNVDXInterop.wglDXLockObjectsNV(interopDevice,objects))throw new IllegalStateException("Cannot lock transparent output");
-            try{SCENE_CAPTURE.present(target.frameBufferId,texture,depthTexture,width,height);}
-            finally{if(!WGLNVDXInterop.wglDXUnlockObjectsNV(interopDevice,objects))throw new IllegalStateException("Cannot unlock transparent output");}
+            try {
+                SCENE_CAPTURE.present(target.frameBufferId, texture, depthTexture, width, height);
+                heldSceneLock = holdForWorld;
+                heldSceneWritable = holdForWorld;
+            } finally {
+                if (!heldSceneLock && !WGLNVDXInterop.wglDXUnlockObjectsNV(interopDevice, objects))
+                    throw new IllegalStateException("Cannot unlock transparent output");
+            }
             queueCpuGlSync(value);
             if(RendererMetrics.recording){RendererMetrics.translucentPresentNanos+=System.nanoTime()-presentStart;RendererMetrics.translucentFrames++;}
             return true;
@@ -276,13 +380,16 @@ public final class Dx12GlInterop {
 
     private static void selectUploadedSections() {
         var sections=currentVisibleSections;
-        visibleCount=0;visibleTranslucentCount=0;fallbackSections=fallbackBaseSections=0;translucentCovered=true;ownedBuffers.clear();
+        visibleCount=0;visibleTranslucentCount=0;fallbackSections=fallbackLayerMask=0;translucentCovered=true;ownedBuffers.clear();
         if(!ClientConfig.ENABLE_DX12.get())return;
+        fallbackCount=0;
         if(visibleKeys.length<sections.size()){
             visibleKeys=new long[sections.size()];
             visibleSectionIndices=new int[sections.size()];
             visibleLayerMasks=new byte[sections.size()];
             visibleOwnership=new boolean[sections.size()];
+            fallbackKeys=new long[sections.size()];
+            fallbackSectionIndices=new int[sections.size()];
         }
         int candidates=0;
         for(int i=0;i<sections.size();i++){
@@ -300,10 +407,17 @@ public final class Dx12GlInterop {
         TerrainMeshStore.copyOwnership(visibleKeys,candidates,visibleOwnership);
         for(int i=0;i<candidates;i++){
             int mask=visibleLayerMasks[i];
-            boolean translucent=(mask&8)!=0,base=(mask&7)!=0;
+            boolean translucent=(mask&8)!=0;
             boolean owned=visibleOwnership[i];
             if(translucent){visibleTranslucentCount++;if(!owned)translucentCovered=false;}
-            if(!owned){fallbackSections++;if(base)fallbackBaseSections++;continue;}
+            if(!owned){
+                fallbackSections++;
+                fallbackLayerMask |= mask;
+                // Read before compaction overwrites lower indices; i >= visibleCount always holds.
+                fallbackKeys[fallbackCount]=visibleKeys[i];
+                fallbackSectionIndices[fallbackCount++]=visibleSectionIndices[i];
+                continue;
+            }
             // Compact in place, preserving vanilla order (including coplanar tie order).
             visibleKeys[visibleCount++]=visibleKeys[i];
             var section=sections.get(visibleSectionIndices[i]);
@@ -313,9 +427,56 @@ public final class Dx12GlInterop {
         }
     }
 
+    /**
+     * Requests asynchronous rebuilds for visible sections that were compiled before capture began.
+     * Vanilla keeps drawing their current mesh until the rebuilt one commits, so the world never
+     * empties; the visible list is near-first, so the closest terrain is adopted first.
+     */
+    private static void adoptFallbackSections(){
+        if(fallbackCount==0||TerrainMeshStore.arenaBackoffActive())return;
+        var sections=currentVisibleSections;
+        int clean=0;
+        for(int i=0;i<fallbackCount;i++){
+            var section=sections.get(fallbackSectionIndices[i]);
+            // Already dirty sections are rebuilt (and captured) by vanilla this frame.
+            if(section.isDirty())continue;
+            fallbackKeys[clean]=fallbackKeys[i];
+            fallbackSectionIndices[clean++]=fallbackSectionIndices[i];
+        }
+        int limit=ClientConfig.MAX_SECTION_ADOPTIONS_PER_FRAME.get();
+        if(adoptionSelection.length<limit)adoptionSelection=new int[limit];
+        int chosen=TerrainMeshStore.requestAdoption(fallbackKeys,clean,limit,adoptionSelection);
+        for(int i=0;i<chosen;i++)sections.get(fallbackSectionIndices[adoptionSelection[i]]).setDirty(false);
+        adoptedSections+=chosen;
+    }
+
+    /**
+     * World render stages after which recorded OpenGL work is handed to the GPU. Measured on the
+     * Intel UHD 630 driver (QueuePriorityBenchmark): without intermediate flushes the driver holds
+     * the frame tail until the swap, and the next DX12 terrain frame waits behind it.
+     */
+    static final java.util.Set<net.neoforged.neoforge.client.event.RenderLevelStageEvent.Stage> FLUSH_STAGES = java.util.Set.of(
+            net.neoforged.neoforge.client.event.RenderLevelStageEvent.Stage.AFTER_SKY,
+            net.neoforged.neoforge.client.event.RenderLevelStageEvent.Stage.AFTER_ENTITIES,
+            net.neoforged.neoforge.client.event.RenderLevelStageEvent.Stage.AFTER_BLOCK_ENTITIES,
+            net.neoforged.neoforge.client.event.RenderLevelStageEvent.Stage.AFTER_TRANSLUCENT_BLOCKS,
+            net.neoforged.neoforge.client.event.RenderLevelStageEvent.Stage.AFTER_PARTICLES,
+            net.neoforged.neoforge.client.event.RenderLevelStageEvent.Stage.AFTER_WEATHER,
+            net.neoforged.neoforge.client.event.RenderLevelStageEvent.Stage.AFTER_LEVEL);
+
+    /** Only while the DX12 backend runs: vanilla keeps the driver's own submission behavior. */
+    static void flushAfterStage() {
+        if (!initialized || disabled || !ClientConfig.ENABLE_DX12.get() || !ClientConfig.FLUSH_OPENGL_STAGES.get()) return;
+        GL11.glFlush();
+    }
+
     /** Frozen ownership for this frame; never suppress a buffer before successful composition. */
     public static boolean shouldSkipVanillaBuffer(com.mojang.blaze3d.vertex.VertexBuffer buffer){
         return lastFrameSucceeded&&replacementFrame&&ownedBuffers.contains(buffer);
+    }
+
+    public static boolean shouldSkipVanillaSection(SectionRenderDispatcher.RenderSection section, RenderType layer) {
+        return lastFrameSucceeded && replacementFrame && ownedBuffers.contains(section.getBuffer(layer));
     }
 
     /** Current-frame composition: never cancels vanilla until BOTH color and depth were imported. */
@@ -337,12 +498,15 @@ public final class Dx12GlInterop {
             if(!completed)
                 throw new IllegalStateException("D3D12 did not complete the current terrain frame.");
             if (ClientConfig.PROFILE_RENDERER.get()) {
+                long metricsStart = System.nanoTime();
                 double[] metrics = NativeDx12.frameMetrics();
+                RendererMetrics.compositeMetricsNanos += System.nanoTime() - metricsStart;
                 if (metrics != null && metrics[0] >= 0) {
                     RendererMetrics.gpuNanos += (long) (metrics[0] * 1e6);
                     RendererMetrics.nativeDraws += (long) metrics[2];
                     RendererMetrics.nativeFrames++;
                     if(metrics.length>=5){RendererMetrics.gpuArenaBytes=(long)metrics[3];RendererMetrics.uploadRingBytes=(long)metrics[4];}
+                    if(metrics.length>=7){RendererMetrics.faceVisibleIndices+=(long)metrics[5];RendererMetrics.faceSubmittedIndices+=(long)metrics[6];}
                 }
             }
             if (TerrainMeshStore.hasCaptureFault()) {
@@ -360,6 +524,7 @@ public final class Dx12GlInterop {
 
     public static void renderTerrainOverlay() {
         lastFrameSucceeded = false;
+        releaseHeldSceneLock();
         if (!reportedHook) {
             Direct.LOGGER.info("DX12/OpenGL interop terrain composite hook reached.");
             reportedHook = true;
@@ -430,11 +595,14 @@ public final class Dx12GlInterop {
 
             Minecraft minecraft = Minecraft.getInstance();
             if (!terrainCaptureEnabled) {
+                // No allChanged(): rebuilding the whole ViewArea at once froze the game. Sections
+                // compiled before capture keep their vanilla draw and are adopted a few per frame.
                 TerrainMeshStore.setCaptureEnabled(true);
                 terrainCaptureEnabled = true;
-                if (minecraft.level != null) {
-                    minecraft.levelRenderer.allChanged();
-                }
+                activationStartedNanos = System.nanoTime();
+                activationReported = false;
+                adoptedSections = 0;
+                activationAtlasNanos = 0;
             }
             if (minecraft.level != renderedLevel) {
                 if (renderedLevel != null) {
@@ -477,15 +645,20 @@ public final class Dx12GlInterop {
                 return;
             }
             if (!lastSubmittedFrameReady("terrain resource updates")) return;
+            configurePackGeometry();
             TerrainMeshStore.uploadPending();
             selectUploadedSections();
-            if(RendererMetrics.recording){RendererMetrics.ownershipFrames++;RendererMetrics.ownedSectionSamples+=visibleCount;RendererMetrics.fallbackSectionSamples+=fallbackSections;if(visibleCount>0&&fallbackBaseSections>0)RendererMetrics.mixedFrames++;}
+            adoptFallbackSections();
+            if(RendererMetrics.recording){RendererMetrics.ownershipFrames++;RendererMetrics.ownedSectionSamples+=visibleCount;RendererMetrics.fallbackSectionSamples+=fallbackSections;if(visibleCount>0&&(fallbackLayerMask&7)!=0)RendererMetrics.mixedFrames++;}
             replacementFrame = shouldCompositeBeforeVanilla() && ClientConfig.TERRAIN_RENDER_DISTANCE_PERCENT.get() == 100;
             if (shouldCompositeBeforeVanilla() && (!replacementFrame||visibleCount==0)) {
                 DirectStatusOverlay.setStatus(replacementFrame ? "uploads" : "distance");
                 return;
             }
-            uploadBlockAtlasIfNeeded(minecraft);
+            if (!uploadBlockAtlasIfNeeded(minecraft)) {
+                DirectStatusOverlay.setStatus("atlas");
+                return;
+            }
             uploadLightmap();
             NativeDx12.setVisibleSections(visibleKeys, visibleCount, replacementFrame);
             if(DirectRenderApi.terrainEffects().shadows()>0){
@@ -551,6 +724,8 @@ public final class Dx12GlInterop {
                         index * DirectRenderApi.MAX_UNIFORM_FLOATS);
             }
             NativeDx12.setProfilingEnabled(ClientConfig.PROFILE_RENDERER.get());
+            NativeDx12.setFaceCullingEnabled(ClientConfig.FACE_CULLING.get());
+            TerrainBufferPacker.nativePacking = ClientConfig.NATIVE_VERTEX_PACKING.get();
             var terrainSettings=DirectRenderApi.terrainSettings();
             var effects=terrainSettings.geometry();
             var materials=terrainSettings.materials();
@@ -606,6 +781,7 @@ public final class Dx12GlInterop {
     }
 
     private static void rendererFailed(String stage, Throwable exception) {
+        try { releaseHeldSceneLock(); } catch (RuntimeException ignored) { heldSceneLock = false; }
         lastFailure = stage + ": " + exception.getClass().getSimpleName() + ": " + exception.getMessage();
         Direct.LOGGER.error("Direct failed during {}; retaining vanilla terrain.", stage, exception);
         lastFrameSucceeded = false;
@@ -661,6 +837,11 @@ public final class Dx12GlInterop {
     }
 
     public static void shutdown() {
+        try { releaseHeldSceneLock(); } catch (RuntimeException exception) { Direct.LOGGER.warn("Held scene lock release failed during shutdown", exception); }
+        worldRanThisFrame = worldRanLastFrame = false;
+        configuredPackGeometry = "";
+        packGeometryFailure = "";
+        packGeometryActive = false;
         worldSources=NO_PASS_SOURCES;
         rejectedWorldSources=null;
         submittedShadowKeys = null;
@@ -669,11 +850,7 @@ public final class Dx12GlInterop {
         lastFrameSucceeded = false;
         ownedBuffers.clear();
         currentVisibleSections=List.of();
-        if (pendingGlSync != 0) {
-            finishPendingGlSync();
-        } else if (glDoneSemaphore != 0 || interopObject != 0) {
-            GL11.glFinish();
-        }
+        if (pendingGlSync != 0 || glDoneSemaphore != 0 || interopObject != 0) finishGlWork();
         if (glDoneSemaphore != 0) {
             EXTSemaphore.glDeleteSemaphoresEXT(glDoneSemaphore);
             glDoneSemaphore = 0;
@@ -681,6 +858,8 @@ public final class Dx12GlInterop {
         gpuSemaphoreInterop = false;
         wglInteropAvailable = false;
         ATLAS_REGIONS.close();
+        FULL_ATLAS.close();
+        blockAtlasDirty = true;
         SCENE_CAPTURE.close();
         unregisterTexture();
         if (interopDevice != 0) {
@@ -718,9 +897,43 @@ public final class Dx12GlInterop {
         ATLAS_REGIONS.reset();
     }
 
-    public static void blockAtlasRegionUpdated(int x, int y, int width, int height) {
-        if (!initialized || blockAtlasDirty || GL11.glGetInteger(GL11.GL_TEXTURE_BINDING_2D) != blockAtlasId) return;
-        ATLAS_REGIONS.mark(x, y, width, height);
+    private static final int ATLAS_SCOPE_NONE = 0, ATLAS_SCOPE_BLOCK = 1, ATLAS_SCOPE_OTHER = 2;
+    /** Which atlas is cycling its animations on the render thread; avoids a GL binding query per sprite upload. */
+    private static int atlasScope = ATLAS_SCOPE_NONE;
+
+    public static int enterAtlasAnimationScope(boolean blockAtlas) {
+        int previous = atlasScope;
+        atlasScope = blockAtlas ? ATLAS_SCOPE_BLOCK : ATLAS_SCOPE_OTHER;
+        return previous;
+    }
+
+    public static void exitAtlasAnimationScope(int previous) { atlasScope = previous; }
+
+    /** Vanilla is about to close the block atlas sprite images: drop references to them. */
+    public static void blockAtlasCleared() { ATLAS_REGIONS.forgetSources(); }
+
+    /**
+     * A sprite upload wrote {@code width x height} texels from {@code (frameX, frameY)} of {@code levels} at
+     * {@code (x, y)}. Inside {@link net.minecraft.client.renderer.texture.TextureAtlas#cycleAnimationFrames} the
+     * target atlas is known; other callers fall back to the bound GL texture, as before.
+     */
+    public static void blockAtlasRegionUpdated(int x, int y, int frameX, int frameY, int width, int height,
+                                               com.mojang.blaze3d.platform.NativeImage[] levels) {
+        if (!initialized || blockAtlasDirty || atlasScope == ATLAS_SCOPE_OTHER) return;
+        if (atlasScope == ATLAS_SCOPE_NONE && GL11.glGetInteger(GL11.GL_TEXTURE_BINDING_2D) != blockAtlasId) return;
+        ATLAS_REGIONS.markUpload(x, y, frameX, frameY, width, height, new SpriteImages(levels));
+    }
+
+    /** The CPU images vanilla passes to glTexSubImage2D; unusable levels report address 0 and are read back instead. */
+    private record SpriteImages(com.mojang.blaze3d.platform.NativeImage[] images) implements AtlasRegionUpdates.SpriteSource {
+        @Override public int levels() { return images.length; }
+        @Override public long address(int level) {
+            var image = images[level];
+            if (image == null || image.format() != com.mojang.blaze3d.platform.NativeImage.Format.RGBA) return 0;
+            return ((Object) image) instanceof com.redondoguibi.direct.mixin.NativeImageAccessor accessor ? accessor.direct$pixels() : 0;
+        }
+        @Override public int width(int level) { return images[level] == null ? 0 : images[level].getWidth(); }
+        @Override public int height(int level) { return images[level] == null ? 0 : images[level].getHeight(); }
     }
 
     private static void resolvePendingFrame(boolean captured) {
@@ -749,6 +962,7 @@ public final class Dx12GlInterop {
         }
         drawImportedTexture(useGpuSemaphore, frame);
         lastFrameSucceeded = true;
+        if (replacementFrame) reportActivation();
         // A successful submit is not proof of recovery: count only imported frames.
         if (successfulFrames < RECOVERY_FRAMES && ++successfulFrames == RECOVERY_FRAMES) consecutiveFailures = 0;
         DirectStatusOverlay.setStatus(replacementFrame ? (fallbackSections > 0 ? "mixed" : "active") : "overlay",
@@ -771,12 +985,12 @@ public final class Dx12GlInterop {
     public static boolean shouldSkipVanillaLayer(net.minecraft.client.renderer.RenderType layer) {
         if (!ClientConfig.REPLACE_VANILLA_TERRAIN.get() || !initialized || disabled
                 || ClientConfig.TERRAIN_RENDER_DISTANCE_PERCENT.get() < 100
-                || !lastFrameSucceeded || !replacementFrame || fallbackBaseSections!=0) {
+                || !lastFrameSucceeded || !replacementFrame) {
             return false;
         }
-        return layer == net.minecraft.client.renderer.RenderType.solid()
-                || layer == net.minecraft.client.renderer.RenderType.cutoutMipped()
-                || layer == net.minecraft.client.renderer.RenderType.cutout();
+        if (layer == RenderType.solid()) return (fallbackLayerMask & 1) == 0;
+        if (layer == RenderType.cutoutMipped()) return (fallbackLayerMask & 2) == 0;
+        return layer == RenderType.cutout() && (fallbackLayerMask & 4) == 0;
     }
 
     private static void disableTerrainCapture() {
@@ -788,10 +1002,12 @@ public final class Dx12GlInterop {
     }
 
     private static void initialize(int frameWidth, int frameHeight) throws IOException {
+        long initStarted = System.nanoTime();
         NativeLibrary.load();
-        long[] handles = NativeDx12.initializeInterop(frameWidth, frameHeight,
+        long[] handles = NativeDx12.initializeInteropCached(frameWidth, frameHeight,
                 ClientConfig.PARALLEL_SECTION_RECORDING.get(), ClientConfig.UPLOAD_RING_BUFFER_MIB.get(),
-                ClientConfig.TERRAIN_ARENA_PAGE_MIB.get(), ClientConfig.MAX_TERRAIN_ARENA_MIB.get());
+                ClientConfig.TERRAIN_ARENA_PAGE_MIB.get(), ClientConfig.MAX_TERRAIN_ARENA_MIB.get(),
+                cacheDirectory());
         if (handles == null || handles.length != 5 || handles[0] == 0 || handles[1] == 0 || handles[4] == 0) {
             throw new IllegalStateException("DX12 did not expose its D3D11 device and shared texture.");
         }
@@ -821,6 +1037,31 @@ public final class Dx12GlInterop {
         height = frameHeight;
         frameIndex = 0;
         startedAtNanos = System.nanoTime();
+        activationInitNanos = startedAtNanos - initStarted;
+        int[] cache = NativeDx12.initializationCacheStats();
+        Direct.LOGGER.info("Direct native renderer initialized in {} ms (shaders: {} cached, {} compiled; PSO library {}).",
+                activationInitNanos / 1_000_000L, cache[0], cache[1], cache[2] != 0 ? "loaded from disk" : "rebuilt");
+    }
+
+    /** Disk cache for shader bytecode and the PSO library; null (no cache) when unavailable. */
+    private static String cacheDirectory() {
+        try {
+            var directory = net.neoforged.fml.loading.FMLPaths.GAMEDIR.get().resolve("cache").resolve("direct");
+            java.nio.file.Files.createDirectories(directory);
+            return directory.toAbsolutePath().toString();
+        } catch (IOException | RuntimeException exception) {
+            Direct.LOGGER.warn("Direct shader cache is unavailable; shaders compile on every activation.", exception);
+            return null;
+        }
+    }
+
+    /** One summary line per activation, once the first replacement frame was imported. */
+    private static void reportActivation() {
+        if (activationReported || activationStartedNanos == 0) return;
+        activationReported = true;
+        Direct.LOGGER.info("Direct activation: first DX12 frame after {} ms (native init {} ms, atlas {} ms, {} sections adopted, {} still on vanilla).",
+                (System.nanoTime() - activationStartedNanos) / 1_000_000L, activationInitNanos / 1_000_000L,
+                activationAtlasNanos / 1_000_000L, adoptedSections, fallbackSections);
     }
 
     /**
@@ -843,8 +1084,8 @@ public final class Dx12GlInterop {
         return true;
     }
     private static void resize(int frameWidth, int frameHeight) {
-        GL11.glFinish();
-        finishPendingGlSync();
+        releaseHeldSceneLock();
+        finishGlWork();
         unregisterTexture();
         long[] sharedTexture = NativeDx12.resizeInterop(frameWidth, frameHeight);
         if (sharedTexture == null || sharedTexture.length != 2 || sharedTexture[0] == 0 || sharedTexture[1] == 0) {
@@ -867,13 +1108,119 @@ public final class Dx12GlInterop {
             if (color.fallbackReason != null) {
                 Direct.LOGGER.warn("Native terrain color sharing rejected; using copied color: {}", color.fallbackReason);
             }
-            Direct.LOGGER.info("DX12 terrain color interop: {}; depth uses the copied bridge.",
-                    color.direct ? "shared native target (no color export copy)" : "copied target");
             depthTexture = GL11.glGenTextures();
-            depthInteropObject = registerResource(sharedDepth, depthTexture);
+            directBridge = false;
+            if (color.direct && ClientConfig.DIRECT_BRIDGE.get()) {
+                String rejection = registerDirectBridge(frameWidth, frameHeight);
+                if (rejection != null) Direct.LOGGER.warn("Direct depth bridge rejected; using copied depth: {}", rejection);
+            }
+            if (!directBridge) depthInteropObject = registerResource(sharedDepth, depthTexture);
+            Direct.LOGGER.info("DX12 terrain color interop: {}; depth uses {}.",
+                    color.direct ? "shared native target (no color export copy)" : "copied target",
+                    directBridge ? "the native R32F bridge (no D3D11 depth copies)" : "the copied bridge");
+            interopAccess = WGLNVDXInterop.WGL_ACCESS_READ_WRITE_NV;
+            fixedInteropAccess = false;
         } finally {
             GL11.glBindTexture(GL11.GL_TEXTURE_2D, bound);
             GL13.glActiveTexture(active);
+        }
+    }
+
+    private static int interopAccess;
+    private static boolean fixedInteropAccess;
+    private static boolean directBridge;
+
+    static boolean directBridge() { return directBridge; }
+
+    /**
+     * Registers the native R32F depth bridge and validates its storage, then selects it in the native renderer
+     * (see {@code ClientConfig.DIRECT_BRIDGE}). Returns the rejection, or null on success; on rejection the GL
+     * name is fresh and the native renderer keeps the copied depth path.
+     */
+    private static String registerDirectBridge(int frameWidth, int frameHeight) {
+        long object = 0;
+        try {
+            long bridge = NativeDx12.acquireDepthBridgeTarget();
+            if (bridge == 0) return "the native depth bridge is unavailable";
+            object = registerResource(bridge, depthTexture);
+            try (MemoryStack stack = MemoryStack.stackPush()) {
+                var objects = stack.pointers(object);
+                if (!WGLNVDXInterop.wglDXLockObjectsNV(interopDevice, objects)) throw new IllegalStateException("cannot lock the depth bridge");
+                try {
+                    int w = GL11.glGetTexLevelParameteri(GL11.GL_TEXTURE_2D, 0, GL11.GL_TEXTURE_WIDTH);
+                    int h = GL11.glGetTexLevelParameteri(GL11.GL_TEXTURE_2D, 0, GL11.GL_TEXTURE_HEIGHT);
+                    int format = GL11.glGetTexLevelParameteri(GL11.GL_TEXTURE_2D, 0, GL11.GL_TEXTURE_INTERNAL_FORMAT);
+                    if (w != frameWidth || h != frameHeight || format != GL30.GL_R32F)
+                        throw new IllegalStateException("depth bridge storage is " + w + "x" + h + " format 0x" + Integer.toHexString(format));
+                } finally {
+                    if (!WGLNVDXInterop.wglDXUnlockObjectsNV(interopDevice, objects)) throw new IllegalStateException("cannot unlock the depth bridge");
+                }
+            }
+            NativeDx12.configureDirectBridge(true);
+            depthInteropObject = object;
+            directBridge = true;
+            return null;
+        } catch (RuntimeException exception) {
+            if (object != 0 && !WGLNVDXInterop.wglDXUnregisterObjectNV(interopDevice, object))
+                throw new IllegalStateException("Cannot unregister the rejected depth bridge", exception);
+            GL11.glDeleteTextures(depthTexture);
+            depthTexture = GL11.glGenTextures();
+            NativeDx12.configureDirectBridge(false);
+            return exception.toString();
+        }
+    }
+
+    // Capture overwrites both full-size textures; presentation only samples them. Tell WGL
+    // before locking, so drivers with separate GL storage need only transfer in one direction.
+    private static void sceneAccess(int access) {
+        if (interopAccess == access || fixedInteropAccess) return;
+        if (WGLNVDXInterop.wglDXObjectAccessNV(interopObject, access)
+                && WGLNVDXInterop.wglDXObjectAccessNV(depthInteropObject, access)) {
+            interopAccess = access;
+            return;
+        }
+        if (!WGLNVDXInterop.wglDXObjectAccessNV(interopObject, WGLNVDXInterop.WGL_ACCESS_READ_WRITE_NV)
+                || !WGLNVDXInterop.wglDXObjectAccessNV(depthInteropObject, WGLNVDXInterop.WGL_ACCESS_READ_WRITE_NV)) {
+            throw new IllegalStateException("Cannot restore shared texture access");
+        }
+        fixedInteropAccess = true;
+        Direct.LOGGER.info("Using read/write WGL locks for this render target");
+    }
+
+    /**
+     * Held from the terrain composite until the world capture when a world pack ran last frame: one WGL
+     * lock (a synchronous D3D/GL transfer, about 2 ms on Intel UHD 630) less per frame. D3D12 does not use
+     * the images in between; every D3D12 submission and teardown path releases a held lock first.
+     * {@link #heldSceneWritable} tells whether the held lock may be taken over by a capture that writes them.
+     */
+    private static boolean heldSceneLock;
+    private static boolean heldSceneWritable;
+    private static boolean worldRanThisFrame, worldRanLastFrame;
+
+    /** Vanilla sky/clouds are skipped only while a world pack that draws them actually ran last frame. */
+    public static boolean skipVanillaSky() { return worldRanLastFrame && initialized && !disabled && DirectRenderApi.worldReplacesSky(); }
+    public static boolean skipVanillaClouds() { return worldRanLastFrame && initialized && !disabled && DirectRenderApi.worldReplacesClouds(); }
+
+    private static void lockSceneForCapture(org.lwjgl.PointerBuffer objects) {
+        if (heldSceneLock && heldSceneWritable) {
+            heldSceneLock = false; // the capture's unlock now owns it
+            heldSceneWritable = false;
+            if (RendererMetrics.recording) RendererMetrics.worldHeldLocks++;
+            return;
+        }
+        // A read-only hold (no capture was expected) cannot be written: return it and lock for writing.
+        releaseHeldSceneLock();
+        sceneAccess(WGLNVDXInterop.WGL_ACCESS_WRITE_DISCARD_NV);
+        if (!WGLNVDXInterop.wglDXLockObjectsNV(interopDevice, objects)) throw new IllegalStateException("Cannot lock scene capture");
+    }
+
+    private static void releaseHeldSceneLock() {
+        if (!heldSceneLock) return;
+        heldSceneLock = false;
+        heldSceneWritable = false;
+        try (MemoryStack stack = MemoryStack.stackPush()) {
+            if (!WGLNVDXInterop.wglDXUnlockObjectsNV(interopDevice, stack.pointers(interopObject, depthInteropObject)))
+                throw new IllegalStateException("Cannot release the held scene lock");
         }
     }
 
@@ -915,61 +1262,41 @@ public final class Dx12GlInterop {
         }
     }
 
-    private static void uploadBlockAtlasIfNeeded(Minecraft minecraft) {
+    /**
+     * Keeps the native atlas in sync with Minecraft's block atlas. A full transfer (activation,
+     * resource reload) never blocks the render thread: it is read back behind a fence and BC7
+     * encoded on a worker. Returns false while that transfer runs; the caller then keeps vanilla
+     * terrain for the frame instead of drawing with a missing or stale atlas.
+     */
+    private static boolean uploadBlockAtlasIfNeeded(Minecraft minecraft) {
         int atlasTexture = minecraft.getTextureManager().getTexture(InventoryMenu.BLOCK_ATLAS).getId();
         if (atlasTexture != blockAtlasId) {
             blockAtlasId = atlasTexture;
             blockAtlasDirty = true;
         }
-        if (!blockAtlasDirty) {
-            ATLAS_REGIONS.update(atlasTexture, ClientConfig.ANIMATED_ATLAS_REFRESH_MILLIS.get(),
-                    ClientConfig.BC7_ENCODER_THREADS.get());
-            return;
-        }
-        ATLAS_REGIONS.reset();
-        int previousActiveTexture = GL11.glGetInteger(GL13.GL_ACTIVE_TEXTURE);
-        GL13.glActiveTexture(GL13.GL_TEXTURE0);
-        int previousTexture = GL11.glGetInteger(GL11.GL_TEXTURE_BINDING_2D);
-        int previousPackBuffer = GL11.glGetInteger(GL30.GL_PIXEL_PACK_BUFFER_BINDING);
-        int previousPackAlignment = GL11.glGetInteger(GL11.GL_PACK_ALIGNMENT);
-        try {
-            GL15.glBindBuffer(GL30.GL_PIXEL_PACK_BUFFER, 0);
-            GL11.glBindTexture(GL11.GL_TEXTURE_2D, atlasTexture);
-            GL11.glPixelStorei(GL11.GL_PACK_ALIGNMENT, 1);
-            int baseWidth = GL11.glGetTexLevelParameteri(GL11.GL_TEXTURE_2D, 0, GL11.GL_TEXTURE_WIDTH);
-            int baseHeight = GL11.glGetTexLevelParameteri(GL11.GL_TEXTURE_2D, 0, GL11.GL_TEXTURE_HEIGHT);
-            if (baseWidth <= 0 || baseHeight <= 0) {
-                return;
-            }
-            int maxLevel = Math.min(GL11.glGetTexParameteri(GL11.GL_TEXTURE_2D, GL12.GL_TEXTURE_MAX_LEVEL),
-                    MAX_ATLAS_LEVELS - 1);
-            List<ByteBuffer> levels = new ArrayList<>();
-            for (int level = 0; level <= maxLevel; level++) {
-                int levelWidth = GL11.glGetTexLevelParameteri(GL11.GL_TEXTURE_2D, level, GL11.GL_TEXTURE_WIDTH);
-                int levelHeight = GL11.glGetTexLevelParameteri(GL11.GL_TEXTURE_2D, level, GL11.GL_TEXTURE_HEIGHT);
-                if (levelWidth != Math.max(1, baseWidth >> level) || levelHeight != Math.max(1, baseHeight >> level)) {
-                    break;
-                }
-                long byteCount = (long) levelWidth * levelHeight * 4;
-                if (byteCount > Integer.MAX_VALUE) {
-                    throw new IllegalStateException("Minecraft block atlas exceeds the supported DX12 upload size.");
-                }
-                ByteBuffer pixels = ByteBuffer.allocateDirect((int) byteCount);
-                GL11.glGetTexImage(GL11.GL_TEXTURE_2D, level, GL11.GL_RGBA, GL11.GL_UNSIGNED_BYTE, pixels);
-                levels.add(pixels);
-            }
-            NativeDx12.updateTerrainAtlas(levels.toArray(ByteBuffer[]::new), baseWidth, baseHeight,
-                    ClientConfig.COMPRESS_BLOCK_ATLAS.get(), ClientConfig.BC7_ENCODER_THREADS.get());
+        int threads = ClientConfig.BC7_ENCODER_THREADS.get();
+        if (blockAtlasDirty) {
             blockAtlasDirty = false;
-            } finally {
-            GL11.glPixelStorei(GL11.GL_PACK_ALIGNMENT, previousPackAlignment);
-            GL15.glBindBuffer(GL30.GL_PIXEL_PACK_BUFFER, previousPackBuffer);
-            GL11.glBindTexture(GL11.GL_TEXTURE_2D, previousTexture);
-            GL13.glActiveTexture(previousActiveTexture);
+            ATLAS_REGIONS.reset();
+            if (!FULL_ATLAS.start(atlasTexture, ClientConfig.COMPRESS_BLOCK_ATLAS.get())) {
+                blockAtlasDirty = true; // atlas has no size yet; retry next frame
+                return false;
+            }
         }
+        if (FULL_ATLAS.active()) {
+            if (!FULL_ATLAS.poll(threads)) return false;
+            activationAtlasNanos = FULL_ATLAS.elapsedNanos();
+            Direct.LOGGER.info("Direct block atlas transferred in {} ms ({} ms on the render thread).",
+                    activationAtlasNanos / 1_000_000L, FULL_ATLAS.renderThreadNanos() / 1_000_000L);
+            return true;
+        }
+        ATLAS_REGIONS.update(atlasTexture, FULL_ATLAS.baseWidth(), FULL_ATLAS.baseHeight(),
+                ClientConfig.ANIMATED_ATLAS_REFRESH_MILLIS.get(), threads, ClientConfig.CPU_ATLAS_ANIMATION.get());
+        return true;
     }
 
     private static void drawImportedTexture(boolean useGpuSemaphore, long frame) {
+        long drawStart = System.nanoTime();
         int previousProgram = GL11.glGetInteger(GL20.GL_CURRENT_PROGRAM);
         int previousVertexArray = GL11.glGetInteger(GL30.GL_VERTEX_ARRAY_BINDING);
         int previousActiveTexture = GL11.glGetInteger(GL13.GL_ACTIVE_TEXTURE);
@@ -1004,9 +1331,16 @@ public final class Dx12GlInterop {
             }
             var objects = stack.mallocPointer(2);
             objects.put(0, interopObject).put(1, depthInteropObject);
+            // A world pack captures this same scene later in the frame: keep the lock instead of a second one.
+            // Holding it in every frame was measured (2026-11-22): 5 ms less CPU wait, no FPS change (GPU-bound).
+            boolean hold = worldRanLastFrame && writeDepth && !heldSceneLock;
+            boolean writable = true;
+            sceneAccess(hold ? WGLNVDXInterop.WGL_ACCESS_READ_WRITE_NV : WGLNVDXInterop.WGL_ACCESS_READ_ONLY_NV);
+            long lockStart = System.nanoTime();
             if (!WGLNVDXInterop.wglDXLockObjectsNV(interopDevice, objects)) {
                 throw new IllegalStateException("WGL_NV_DX_interop2 could not lock the shared texture.");
             }
+            if (RendererMetrics.recording) RendererMetrics.compositeLockNanos += System.nanoTime() - lockStart;
             boolean drawn = false;
             try {
                 setEnabled(GL11.GL_DEPTH_TEST, writeDepth);
@@ -1036,7 +1370,8 @@ public final class Dx12GlInterop {
                 drawn = true;
             } finally {
                 objects.put(0, interopObject).put(1, depthInteropObject);
-                boolean unlocked = WGLNVDXInterop.wglDXUnlockObjectsNV(interopDevice, objects);
+                boolean unlocked = hold && drawn || WGLNVDXInterop.wglDXUnlockObjectsNV(interopDevice, objects);
+                if (hold && drawn) { heldSceneLock = true; heldSceneWritable = writable; }
                 if (!unlocked) {
                     if (drawn) {
                         throw new IllegalStateException("WGL_NV_DX_interop2 could not unlock the shared texture.");
@@ -1067,6 +1402,9 @@ public final class Dx12GlInterop {
             setEnabled(GL11.GL_SCISSOR_TEST, scissorEnabled);
             setEnabled(GL11.GL_STENCIL_TEST, stencilEnabled);
         }
+        long syncStart = System.nanoTime();
+        // Includes the lock; the log subtracts it.
+        if (RendererMetrics.recording) RendererMetrics.compositeDrawNanos += syncStart - drawStart;
 
         if (useGpuSemaphore) {
             if (!signalGlDoneFence(frame + 1)) {
@@ -1076,6 +1414,7 @@ public final class Dx12GlInterop {
         } else {
             queueCpuGlSync(frame + 1);
         }
+        if (RendererMetrics.recording) RendererMetrics.compositeSyncNanos += System.nanoTime() - syncStart;
     }
 
     private static void queueCpuGlSync(long value) {
@@ -1098,27 +1437,25 @@ public final class Dx12GlInterop {
         }
         int result = GL32.glClientWaitSync(pendingGlSync, 0, 0L);
         if (result == GL32.GL_ALREADY_SIGNALED || result == GL32.GL_CONDITION_SATISFIED) {
-            long value = pendingGlFenceValue;
-            GL32.glDeleteSync(pendingGlSync);
-            pendingGlSync = 0;
-            pendingGlFenceValue = 0;
-            NativeDx12.signalInteropFence(value);
+            signalCompletedGlSync();
             return true;
         }
         if (result == GL32.GL_WAIT_FAILED) {
-            // finishPendingGlSync deletes the failed GLsync before CPU-signaling the native timeline.
-            finishPendingGlSync();
+            // finishGlWork deletes the failed GLsync before CPU-signaling the native timeline.
+            finishGlWork();
             return true;
         }
         return false;
     }
 
-    /** Used only during resize/shutdown, when waiting is required before releasing shared resources. */
-    private static void finishPendingGlSync() {
-        if (pendingGlSync == 0) {
-            return;
-        }
+    // Capture and the preceding composite are ordered in the same GL context. One finish
+    // after WGL unlock covers both before native code reads the captured scene.
+    private static void finishGlWork() {
         GL11.glFinish();
+        if (pendingGlSync != 0) signalCompletedGlSync();
+    }
+
+    private static void signalCompletedGlSync() {
         long value = pendingGlFenceValue;
         GL32.glDeleteSync(pendingGlSync);
         pendingGlSync = 0;

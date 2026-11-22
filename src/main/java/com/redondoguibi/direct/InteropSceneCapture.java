@@ -5,7 +5,7 @@ import org.lwjgl.system.MemoryStack;
 
 /** Only the GL/DX transfer; transparent geometry and material shading execute in D3D12. */
 final class InteropSceneCapture implements AutoCloseable {
-    private int fbo,program,vao,depthProgram;
+    private int fbo,presentFbo,program,vao,depthProgram;
     private int shader(int type,String source){int shader=GL20.glCreateShader(type);GL20.glShaderSource(shader,source);GL20.glCompileShader(shader);if(GL20.glGetShaderi(shader,GL20.GL_COMPILE_STATUS)==0){String error=GL20.glGetShaderInfoLog(shader);GL20.glDeleteShader(shader);throw new IllegalStateException(error);}return shader;}
     private void initialize(){
         if(program!=0)return;
@@ -14,7 +14,7 @@ final class InteropSceneCapture implements AutoCloseable {
             fragment=shader(GL20.GL_FRAGMENT_SHADER,"#version 150\nuniform sampler2D SceneDepth;in vec2 texCoord;out float depth;void main(){depth=texture(SceneDepth,vec2(texCoord.x,1.0-texCoord.y)).r;}");
             candidate=GL20.glCreateProgram();GL20.glAttachShader(candidate,vertex);GL20.glAttachShader(candidate,fragment);GL20.glLinkProgram(candidate);
             if(GL20.glGetProgrami(candidate,GL20.GL_LINK_STATUS)==0)throw new IllegalStateException(GL20.glGetProgramInfoLog(candidate));
-            fbo=GL30.glGenFramebuffers();vao=GL30.glGenVertexArrays();program=candidate;candidate=0;
+            fbo=GL30.glGenFramebuffers();presentFbo=GL30.glGenFramebuffers();vao=GL30.glGenVertexArrays();program=candidate;candidate=0;
         }finally{if(candidate!=0)GL20.glDeleteProgram(candidate);GL20.glDeleteShader(vertex);if(fragment!=0)GL20.glDeleteShader(fragment);}
     }
     private void attach(int color,int depth){GL30.glFramebufferTexture2D(GL30.GL_DRAW_FRAMEBUFFER,GL30.GL_COLOR_ATTACHMENT0,GL11.GL_TEXTURE_2D,color,0);GL30.glFramebufferTexture2D(GL30.GL_DRAW_FRAMEBUFFER,GL30.GL_COLOR_ATTACHMENT1,GL11.GL_TEXTURE_2D,depth,0);if(GL30.glCheckFramebufferStatus(GL30.GL_DRAW_FRAMEBUFFER)!=GL30.GL_FRAMEBUFFER_COMPLETE)throw new IllegalStateException("Shared scene FBO incomplete");}
@@ -48,7 +48,7 @@ final class InteropSceneCapture implements AutoCloseable {
             initialize();
             if (sharedDepth != 0) initializeDepth();
             GL11.glDisable(GL11.GL_SCISSOR_TEST);
-            GL30.glBindFramebuffer(GL30.GL_READ_FRAMEBUFFER, fbo);
+            GL30.glBindFramebuffer(GL30.GL_READ_FRAMEBUFFER, presentFbo);
             GL30.glFramebufferTexture2D(GL30.GL_READ_FRAMEBUFFER, GL30.GL_COLOR_ATTACHMENT0,
                     GL11.GL_TEXTURE_2D, sharedColor, 0);
             GL11.glReadBuffer(GL30.GL_COLOR_ATTACHMENT0);
@@ -77,5 +77,5 @@ final class InteropSceneCapture implements AutoCloseable {
             }finally{GL30.glColorMaski(0,mask.get(0)!=0,mask.get(1)!=0,mask.get(2)!=0,mask.get(3)!=0);}
         }finally{GL20.glUseProgram(previousProgram);GL30.glBindVertexArray(previousVao);GL11.glBindTexture(GL11.GL_TEXTURE_2D,texture);GL33.glBindSampler(0,sampler);GL13.glActiveTexture(active);GL11.glDepthFunc(depthFunc);GL11.glDepthMask(depthMask);GL11.glViewport(viewport[0],viewport[1],viewport[2],viewport[3]);for(int i=0;i<flags.length;i++){if(enabled[i])GL11.glEnable(flags[i]);else GL11.glDisable(flags[i]);}if(blend0)GL30.glEnablei(GL11.GL_BLEND,0);else GL30.glDisablei(GL11.GL_BLEND,0);}
     }
-    public void close(){if(program!=0)GL20.glDeleteProgram(program);if(depthProgram!=0)GL20.glDeleteProgram(depthProgram);if(fbo!=0)GL30.glDeleteFramebuffers(fbo);if(vao!=0)GL30.glDeleteVertexArrays(vao);program=fbo=vao=depthProgram=0;}
+    public void close(){if(program!=0)GL20.glDeleteProgram(program);if(depthProgram!=0)GL20.glDeleteProgram(depthProgram);if(fbo!=0)GL30.glDeleteFramebuffers(fbo);if(presentFbo!=0)GL30.glDeleteFramebuffers(presentFbo);if(vao!=0)GL30.glDeleteVertexArrays(vao);program=fbo=presentFbo=vao=depthProgram=0;}
 }

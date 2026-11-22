@@ -76,6 +76,16 @@ final class DirectDiagnosticsScreen extends Screen {
         }
         text.append('\n').append(DirectScreen.text("saved_settings").getString()).append('\n');
         for (var value : DirectSettings.VALUES) text.append(String.join(".", value.getPath())).append(" = ").append(value.get()).append('\n');
+        text.append('\n').append("Game optimizations (config/").append(com.redondoguibi.direct.optimization.OptimizationSettings.FILE_NAME).append("):\n");
+        var optimizations = com.redondoguibi.direct.optimization.OptimizationMixinPlugin.settings();
+        var applied = com.redondoguibi.direct.optimization.OptimizationMixinPlugin.applied();
+        for (var feature : com.redondoguibi.direct.optimization.OptimizationSettings.Feature.values()) {
+            text.append(feature.key).append(": ");
+            if (optimizations == null) text.append("not loaded");
+            else if (!optimizations.enabled(feature)) text.append("off, ").append(optimizations.decision(feature).reason());
+            else text.append("on, applied ").append(feature.mixins.stream().filter(applied::containsKey).count()).append('/').append(feature.mixins.size());
+            text.append('\n');
+        }
         text.append('\n').append(DirectScreen.text("diagnostic_hint").getString());
         return text.toString();
     }

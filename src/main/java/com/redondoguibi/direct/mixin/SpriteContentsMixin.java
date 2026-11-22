@@ -14,8 +14,9 @@ abstract class SpriteContentsMixin {
     @Shadow public abstract int width();
     @Shadow public abstract int height();
 
+    /** Passes the exact CPU images and offsets vanilla just uploaded, so DX12 can copy them without a GL readback. */
     @Inject(method = "upload(IIII[Lcom/mojang/blaze3d/platform/NativeImage;)V", at = @At("RETURN"))
     private void direct$changedRegion(int x, int y, int sourceX, int sourceY, NativeImage[] levels, CallbackInfo ci) {
-        Dx12GlInterop.blockAtlasRegionUpdated(x, y, width(), height());
+        Dx12GlInterop.blockAtlasRegionUpdated(x, y, sourceX, sourceY, width(), height(), levels);
     }
 }

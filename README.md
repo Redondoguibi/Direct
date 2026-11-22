@@ -1,6 +1,37 @@
-# Direct 1.7.3
+# Direct 1.9.1
 
 Direct is a Windows x86-64 native Direct3D 12 terrain renderer and render-pass extension platform for Minecraft Java 1.21.1 / NeoForge 21.1. It is not a shader-pack loader and does not provide Iris compatibility. HLSL shaders and shader-pack UX belong in separate mods that depend on Direct's public Java API.
+
+## Rendering changes in 1.9.1
+
+When a world shader follows DX12 translucency, Direct can keep the shared color and depth textures locked through the next scene capture. In mixed terrain layers, Minecraft skips the buffer bind and chunk-offset upload for geometry already composited by DX12. When the terrain arena fills, failed uploads count toward the frame budget, and Direct checks whether a rejected mesh can fit before asking Minecraft to rebuild it. In the development client with a fixed Solaris scene (1920×1080, hidden window, no VSync), 1.9.1 ran at 18.4–19.4 FPS against 16.8–17.6 for 1.9.0 before and after it, and world capture dropped from about 5.4 to 3.1 ms. With a full 64 MiB arena at distance 24 (one old/new pair), it went from 20.7 to 23.9 FPS and arena rejections stopped growing. These are not certified in-game FPS gains. See [measurements, rejected alternative and validation](docs/desempenho-1.9.1.md).
+
+## Shaderpack performance and world graph in 1.9.0
+
+With a world pack (Raydiance + Lus, Desempenho preset) about 30 of the ~35 ms of each frame were the render thread waiting on DX12/OpenGL hand-offs. On the tested Intel UHD 630, each WGL lock of an image owned by D3D11On12 is a synchronous transfer of about 2 ms, even with an idle GPU. Direct 1.9.0 removes work around those hand-offs without changing the image:
+
+- the terrain composite keeps its lock until the world capture (one lock less per frame);
+- a native R32F **depth bridge** replaces the D3D11 depth copies, and the world stage samples OpenGL's depth directly (**Advanced > Native sharing**: Color and depth / Color / Off);
+- pack terrain programs get a lean variant without Direct's built-in effects, selected only while those effects are all inactive;
+- `Direct world post` log lines now include GPU time, held locks and the depth bridge state.
+
+In an isolated whole-frame benchmark (1920×1080, the real Lus sources, pixels verified against 1.8.2), a frame with the Lus world pass went from 49.7 to 41.0 ms and a frame without it from 26.2 to 23.7 ms. That is not an in-game FPS measurement. API 1.7 adds a **world graph**: up to 16 world passes, eight pack buffers with their own format and scale, up to four render targets per pass, previous-frame history, compute passes, a terrain-only depth input and optional replacement of the vanilla sky and clouds. See [measurements, rejected alternatives and validation](docs/desempenho-1.9.0.md) and [the world graph contract](docs/grafo-de-mundo-1.9.md).
+
+## Animated atlas from the CPU
+
+Animated block sprites no longer need a recurring OpenGL readback. Each changed atlas region is read from OpenGL once, as its baseline. After that, every new animation frame is copied into the DX12 atlas from the same CPU `NativeImage` bytes Minecraft hands to `glTexSubImage2D`, and the target atlas is recognised without a GL binding query. Pixels are byte-identical to the OpenGL readback in a GL test that includes uninitialised gaps and overlapping mip patches. Unusable sources fall back to the readback. **Textures > CPU atlas animation** (`cpuAtlasAnimation`, on by default, off in the Compatibility preset) switches it, and `atlasGlReads` in the `Direct costs` log counts the remaining readbacks. See [design, fallback and validation](docs/atlas-animado-cpu.md); in-game behavior still needs confirmation.
+
+## DX12 wait in 1.7.6
+
+The render thread waited about 13 ms per frame for DX12 terrain that occupies the GPU for about 3 ms. The rest was OpenGL work queued ahead of it, because the driver held the previous frame's recorded commands until the buffer swap. While DX12 terrain is active, Direct now flushes OpenGL at the end of each world render stage (**Advanced > Flush OpenGL per stage**). The image is unchanged. In a synthetic benchmark, the wait dropped to the DX12 GPU time alone (26.3 → 16.2 ms, frame 45.2 → 35.6 ms). See [evidence, measurements and limits](docs/espera-dx12-1.7.6.md); no in-game FPS gain is certified yet.
+
+## Activation in 1.7.4
+
+Enabling DX12 terrain no longer rebuilds the whole world at once. Sections compiled before activation keep their vanilla draw and are adopted a few per frame (**Advanced > Adoptions per frame**). The block atlas is read back behind a fence and BC7-encoded off the render thread. Terrain shaders compile in parallel and are cached with the D3D12 pipeline library under `.minecraft/cache/direct/`, so later activations skip compilation. Activation timings are logged to `latest.log`. See [details and validation](docs/ativacao-1.7.4.md); in-game behavior still needs confirmation.
+
+Opaque and cutout quads are also grouped by exact facing in the native backend, and groups that face entirely away from the camera are not submitted (the block-face culling technique of Sodium, reimplemented in C++). The image is unchanged and draw counts stay the same; animated wind/wave layers are never culled. In a synthetic 1080p terrain benchmark, 17–19% fewer opaque indices were submitted, with GPU-time differences within run-to-run variation. **Advanced > Face culling** toggles it. See [technique, measurements and limits](docs/culling-faces-1.7.4.md); no FPS gain is certified.
+
+Direct 1.7.4 also ships general game optimizations modelled on Lithium, ModernFix and FerriteCore (1.21.1): uncached biome temperatures, identity maps for entity-section lookups and tracker sets, lower background-thread priority, shared block-state arrays and empty neighbour tables, and multipart model deduplication. They are independent of the terrain renderer, switched in `config/direct-optimizations.properties`, and each one is skipped when its source mod (or a port) is installed. Captured chunk meshes are now converted to Direct's vertex format in C++ (byte-identical to the Java converter, about 1.5–1.7× faster in a synthetic benchmark). See [details, exclusions and validation](docs/otimizacoes-jogo-1.7.4.md); mixin application in the full modpack still needs in-game confirmation.
 
 ## Terrain CPU work in 1.7.3
 
@@ -61,7 +92,7 @@ Direct 1.2.4 uses a single terrain color target and copies the actual D32 depth 
 - Opaque and cutout command lists can be recorded concurrently; the renderer falls back to one recording thread if worker creation fails. Both lists bind the color/depth targets explicitly with `OMSetRenderTargets` instead of `BeginRenderPass`: a D3D12 render pass may not span command lists, and the runtime removes a command list that violates this.
 - Terrain capture retains vanilla vertex colors/AO and both light coordinates inside the original 16-byte prefix. The native vertex shader samples the CPU-captured vanilla lightmap. The pixel shader applies vanilla fog distance/shape, smoothstep fog, color modulation and the layer-specific alpha cutoff. Counter-clockwise front faces and back-face culling are verified by the WGL integration test.
 - Replacement uses the actual vanilla visible-section selection, including occlusion, with no additional spherical-distance rejection that could create holes. Missing, pending or incompatible visible meshes retain vanilla rendering. The selection and capture readiness are rechecked after compilation before composition.
-- The full block atlas is uploaded on load/reload. Actual sprite uploads mark changed rectangles; subsequent animation updates read only those rectangles and their mipmaps. BC7 encoding of private pixel snapshots runs on a daemon worker, with block-aligned patches, reused buffers, reload generation checks and upload-ring backpressure. BC7 remains optional and lossy. The lightmap is captured from its CPU image only when vanilla updates it, avoiding a per-frame GL readback.
+- The full block atlas is uploaded on load/reload. Actual sprite uploads mark changed rectangles; each rectangle and its mipmaps are read from OpenGL once, then later animation frames are copied from the sprites' CPU images (`cpuAtlasAnimation`). BC7 encoding of private pixel snapshots runs on a daemon worker, with block-aligned patches, reused buffers, reload generation checks and upload-ring backpressure. BC7 remains optional and lossy. The lightmap is captured from its CPU image only when vanilla updates it, avoiding a per-frame GL readback.
 - Native D3D12 renders one color target and the actual depth buffer, without a shader-written depth export. D3D11On12 shares the acquired color target with WGL when registration exposes valid storage; otherwise it copies color. Depth is always copied. Acquire/release and Flush preserve queue order. Replacement waits for the current output fence at composition, then writes `gl_FragDepth`; it does not use a previous camera frame during movement. GPU semaphores or a real GLsync protect subsequent reuse. A watchdog rejects stalled/device-removed work; the optional translucent stage additionally completes the current GL scene capture before native import; this synchronization cost is measured separately.
 - On initialization, the public API reports the adapter name, hardware/software adapter status, descriptor tier, pipeline-library availability, semaphore status, and WGL support. `renderPasses` is reported as `false` because Direct binds targets explicitly. The in-game status overlay shows whether Direct, CPU fallback, or vanilla rendering is active.
 
@@ -81,6 +112,7 @@ Open the Direct dashboard using F7, `/direct menu`, or the mod configuration but
 - `profileRenderer` — log FPS, bounded frame-time percentiles, CPU/GPU costs, atlas traffic and draw counts.
 - `compressBlockAtlas` — compress the D3D12 block atlas with BC7 (on by default).
 - `animatedAtlasRefreshMillis` — minimum interval between animated-atlas refreshes (250 ms by default).
+- `cpuAtlasAnimation` — copy animated sprite frames from their CPU images instead of re-reading them from OpenGL (on by default).
 - `showRendererStatus` — show Direct's backend status in the HUD.
 - `dx12Translucency` — request native translucent blocks without water/reflection effects (off by default).
 - `uploadRingBufferMiB` — bounded staging/sorted-index budget; increasing it consumes memory.

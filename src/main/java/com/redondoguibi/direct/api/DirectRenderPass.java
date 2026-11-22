@@ -10,7 +10,8 @@ package com.redondoguibi.direct.api;
  * pass output and write a distinct color target. API 1.2 additionally binds a read-only
  * {@code Texture2D<float>} at {@code t1}: original terrain device depth, 0..1,
  * top-left texel origin, clear value 1. Use {@code Load} for exact depth texels.
- * Check {@code capabilities().depthInput()} before registering a depth-dependent pass.</p>
+ * Check {@code capabilities().depthInput()} before registering a depth-dependent pass.
+ * API 1.6 also binds the original stage color to {@code t2}, before the first pass.</p>
  */
 public interface DirectRenderPass {
     /**

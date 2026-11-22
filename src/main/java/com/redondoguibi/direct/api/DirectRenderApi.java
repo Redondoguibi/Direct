@@ -16,13 +16,25 @@ import java.util.regex.Pattern;
 public final class DirectRenderApi implements DirectRenderService {
     /** Maximum number of extension passes accepted by the current native backend. */
     public static final int MAX_PASSES = 8;
+    /** Maximum number of complete-world passes ({@link DirectRenderService#renderWorld}); API 1.7. */
+    public static final int MAX_WORLD_PASSES = 16;
     /** Number of packed float components reserved for each pass's HLSL uniform buffer. */
     public static final int MAX_UNIFORM_FLOATS = 252;
     private static volatile float shaderFog=1;
+    private static volatile boolean replacesSky, replacesClouds;
+    @Override public void worldReplacesVanilla(boolean sky, boolean clouds){replacesSky=sky;replacesClouds=clouds;}
+    public static boolean worldReplacesSky(){return replacesSky;}
+    public static boolean worldReplacesClouds(){return replacesClouds;}
     @Override public void shaderFogDistance(float distance){if(!Float.isFinite(distance)||distance<.25f||distance>3)throw new IllegalArgumentException("Invalid shader fog");shaderFog=distance;}
     /** @return active native terrain fog multiplier */
     public static float shaderFogDistance(){return shaderFog;}
     @Override public boolean renderWorld(String[] sources,float[] uniforms){return com.redondoguibi.direct.Dx12GlInterop.renderWorld(sources,uniforms);}
+    @Override public void shaderPackGeometry(String source, float[] options, boolean translucent, boolean sceneInputs, boolean shadows) {
+        com.redondoguibi.direct.Dx12GlInterop.shaderPackGeometry(source, options, translucent, sceneInputs, shadows);
+    }
+    @Override public String shaderPackGeometryFailure() {
+        return com.redondoguibi.direct.Dx12GlInterop.shaderPackGeometryFailure();
+    }
     @Override public String worldFailure(){return com.redondoguibi.direct.Dx12GlInterop.worldFailure();}
 
     /**
@@ -64,7 +76,7 @@ public final class DirectRenderApi implements DirectRenderService {
         terrainRequests.put(owner,request);terrainSettings=terrainRequests.firstEntry().getValue();
     }
     @Override public synchronized void releaseTerrainEffects(String owner){terrainRequests.remove(owner);terrainSettings=terrainRequests.isEmpty()?NO_TERRAIN_EFFECTS:terrainRequests.firstEntry().getValue();}
-    @Override public java.util.Set<String> terrainFeatures(){return capabilities.nativeTerrain()?java.util.Set.of("materials-v2","normals","shadows","wind","translucency","water","reflections","material-lighting","world-post-v1"):java.util.Set.of();}
+    @Override public java.util.Set<String> terrainFeatures(){return capabilities.nativeTerrain()?java.util.Set.of("materials-v2","normals","shadows","wind","translucency","water","reflections","material-lighting","world-post-v1","pack-geometry-v1"):java.util.Set.of();}
     @Override public synchronized String terrainEffectOwner(){return terrainRequests.isEmpty()?"":terrainRequests.firstKey();}
 
     private DirectRenderApi() {

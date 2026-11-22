@@ -12,6 +12,8 @@ import net.minecraft.commands.Commands;
 import net.neoforged.neoforge.client.event.RegisterKeyMappingsEvent;
 import net.neoforged.neoforge.client.event.RegisterClientCommandsEvent;
 import net.neoforged.neoforge.client.event.ClientTickEvent;
+import net.neoforged.neoforge.client.event.RenderLevelStageEvent;
+import net.neoforged.bus.api.EventPriority;
 import net.neoforged.neoforge.common.NeoForge;
 import org.lwjgl.glfw.GLFW;
 
@@ -34,6 +36,10 @@ public class DirectClient {
             }
         });
         NeoForge.EVENT_BUS.addListener(DirectClient::registerCommands);
+        // LOWEST: other mods' drawing at the same stage is handed to the GPU by the same flush.
+        NeoForge.EVENT_BUS.addListener(EventPriority.LOWEST, (RenderLevelStageEvent event) -> {
+            if (Dx12GlInterop.FLUSH_STAGES.contains(event.getStage())) Dx12GlInterop.flushAfterStage();
+        });
         Direct.LOGGER.info("Direct DX12 client initialized.");
     }
 

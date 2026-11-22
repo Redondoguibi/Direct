@@ -24,6 +24,13 @@ public final class ClientConfig {
                     "Falls back to the original bridge when registration is incompatible. Applied on backend initialization/resize.")
             .define("preferDirectColorInterop", true);
 
+    public static final ModConfigSpec.BooleanValue DIRECT_BRIDGE = BUILDER
+            .comment("With shared native color, also share the depth image natively: an R32F D3D12 image replaces the",
+                    "D3D11 depth copies (terrain export, translucency import) and the world stage samples OpenGL's",
+                    "depth without an import copy. Falls back to the copied depth bridge when the driver rejects it.",
+                    "Applied on backend initialization/resize.")
+            .define("directBridge", true);
+
     // Spread chunk uploads over multiple frames to avoid large GPU submission spikes.
     public static final ModConfigSpec.IntValue MAX_MESH_UPLOADS_PER_FRAME = BUILDER
             .comment("Maximum number of compiled terrain sections uploaded to D3D12 per frame.")
@@ -38,6 +45,12 @@ public final class ClientConfig {
                     "At least one queued section may progress. Complements the byte/count budgets.")
             .defineInRange("maxMeshUploadMicros", 2000, 0, 20000);
 
+    public static final ModConfigSpec.IntValue MAX_SECTION_ADOPTIONS_PER_FRAME = BUILDER
+            .comment("Visible sections compiled before Direct was enabled that are queued for an asynchronous",
+                    "rebuild per frame. Vanilla keeps drawing them until the rebuilt mesh is captured, so",
+                    "activation never rebuilds the whole world at once.")
+            .defineInRange("maxSectionAdoptionsPerFrame", 32, 1, 512);
+
     public static final ModConfigSpec.IntValue TERRAIN_RENDER_DISTANCE_PERCENT = BUILDER
             .comment("Direct terrain visibility distance as a percentage of Minecraft's configured render distance.")
             .defineInRange("terrainRenderDistancePercent", 100, 25, 100);
@@ -47,11 +60,25 @@ public final class ClientConfig {
                     "Disable to force the CPU synchronization fallback.")
             .define("useGpuSemaphoreSync", true);
 
+    public static final ModConfigSpec.BooleanValue FLUSH_OPENGL_STAGES = BUILDER
+            .comment("While DX12 terrain is active, hand recorded OpenGL work to the GPU at the end of each world",
+                    "render stage (sky, entities, block entities, translucency, particles, weather, level).",
+                    "Some drivers otherwise hold the whole frame until the buffer swap, and the next DX12",
+                    "terrain frame then waits behind it while the render thread blocks. No effect in vanilla.")
+            .define("flushOpenGlStages", true);
+
     public static final ModConfigSpec.IntValue ANIMATED_ATLAS_REFRESH_MILLIS = BUILDER
             .comment("Minimum interval between DX12 block-atlas refreshes caused by animated sprites.",
                     "Only changed sprite regions are read; BC7 compression runs off the render thread. Lower",
                     "values increase readback frequency. Animated blocks update at this rate.")
             .defineInRange("animatedAtlasRefreshMillis", 250, 50, 2000);
+
+    public static final ModConfigSpec.BooleanValue CPU_ATLAS_ANIMATION = BUILDER
+            .comment("Copy animated sprite frames into the DX12 block atlas from the CPU images Minecraft uploads",
+                    "to OpenGL, instead of reading the changed regions back from OpenGL. Each region is read",
+                    "from OpenGL once, as its baseline; later frames copy the same bytes OpenGL receives.",
+                    "Disable for mods that write the block atlas outside vanilla sprite uploads.")
+            .define("cpuAtlasAnimation", true);
 
     public static final ModConfigSpec.IntValue BC7_ENCODER_THREADS = BUILDER
             .comment("Maximum CPU threads used by the BC7 block-atlas encoder.",
@@ -65,6 +92,17 @@ public final class ClientConfig {
     public static final ModConfigSpec.BooleanValue USE_EXECUTE_INDIRECT = BUILDER
             .comment("Submit terrain draw commands through D3D12 ExecuteIndirect when supported.")
             .define("useExecuteIndirect", true);
+
+    public static final ModConfigSpec.BooleanValue FACE_CULLING = BUILDER
+            .comment("Group opaque/cutout quads by exact facing and skip groups that are entirely back-facing",
+                    "for the current camera, instead of vertex-shading them for the rasterizer to discard.",
+                    "Layers with active wind/wave animation are never culled. Output is unchanged.")
+            .define("faceCulling", true);
+
+    public static final ModConfigSpec.BooleanValue NATIVE_VERTEX_PACKING = BUILDER
+            .comment("Convert captured chunk meshes to Direct's vertex format in C++ on the meshing threads.",
+                    "Byte-identical to the Java converter, which remains the fallback.")
+            .define("nativeVertexPacking", true);
 
     public static final ModConfigSpec.BooleanValue REPLACE_VANILLA_TERRAIN = BUILDER
             .comment("Replace vanilla solid/cutout terrain with DX12 color AND depth when the current visible set is complete.",

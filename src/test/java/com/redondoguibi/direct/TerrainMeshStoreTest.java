@@ -69,6 +69,30 @@ class TerrainMeshStoreTest {
                 Short.toUnsignedInt(packed.getShort(6)));
     }
 
+    @Test
+    void adoptionRequestsEachSectionOnceWithinThePerFrameLimit() {
+        long[] keys = {11, 12, 13, 14, 15};
+        int[] selected = new int[8];
+        try {
+            TerrainMeshStore.setCaptureEnabled(false);
+            org.junit.jupiter.api.Assertions.assertEquals(0, TerrainMeshStore.requestAdoption(keys, 5, 3, selected),
+                    "nothing is adopted while capture is off");
+            TerrainMeshStore.setCaptureEnabled(true);
+            org.junit.jupiter.api.Assertions.assertEquals(3, TerrainMeshStore.requestAdoption(keys, 5, 3, selected));
+            assertArrayEquals(new int[] {0, 1, 2}, java.util.Arrays.copyOf(selected, 3), "nearest sections first");
+            org.junit.jupiter.api.Assertions.assertEquals(2, TerrainMeshStore.requestAdoption(keys, 5, 3, selected));
+            assertArrayEquals(new int[] {3, 4}, java.util.Arrays.copyOf(selected, 2));
+            org.junit.jupiter.api.Assertions.assertEquals(0, TerrainMeshStore.requestAdoption(keys, 5, 3, selected),
+                    "in-flight rebuilds are never re-queued");
+            TerrainMeshStore.clear();
+            org.junit.jupiter.api.Assertions.assertEquals(3, TerrainMeshStore.requestAdoption(keys, 5, 3, selected),
+                    "a new generation (restart / world change) adopts again");
+        } finally {
+            TerrainMeshStore.setCaptureEnabled(false);
+            TerrainMeshStore.clear();
+        }
+    }
+
     private static void assertEqualsIndices(ByteBuffer destination, int[] expected) {
         destination.flip();
         int[] actual = new int[expected.length];

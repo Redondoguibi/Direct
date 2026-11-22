@@ -50,9 +50,28 @@ final class TerrainBufferPacker {
             destination.putShort(packUnorm16(sourceVertices.getFloat(offset + uvOffset)));
             destination.putShort(packUnorm16(sourceVertices.getFloat(offset + uvOffset + Float.BYTES)));
     }
+    /** Set from the client config each frame; read by chunk-meshing workers. */
+    static volatile boolean nativePacking = true;
+
     static void packVertices20(ByteBuffer destination,ByteBuffer source,int count,int stride,int position,int color,int uv,int light,int normal,byte[] materials){
+        validate20(destination,source,count,stride,position,color,uv,light,normal,materials);
+        // One JNI call per layer covers thousands of vertices; output is byte-identical (NativeTerrainPackerTest).
+        if(nativePacking&&NativeLibrary.isLoaded()&&source.isDirect()&&destination.isDirect()&&destination.order()==ByteOrder.nativeOrder()){
+            NativeDx12.packTerrainVertices20(destination,destination.position(),source,source.position(),count,stride,position,color,uv,light,normal,materials);
+            destination.position(destination.position()+count*20);
+            return;
+        }
+        packVertices20Java(destination,source,count,stride,position,color,uv,light,normal,materials);
+    }
+
+    private static void validate20(ByteBuffer destination,ByteBuffer source,int count,int stride,int position,int color,int uv,int light,int normal,byte[] materials){
         if(count<0||stride<1||position<0||(long)position+12>stride||color<0||(long)color+4>stride||uv<0||(long)uv+8>stride||light<0||(long)light+4>stride||normal<0||(long)normal+3>stride
                 ||(long)count*stride>source.remaining()||(long)count*20>destination.remaining()||materials.length<((long)count+3)/4)throw new IllegalArgumentException("Invalid V2 vertex range");
+    }
+
+    /** Reference implementation and fallback when the native library is unavailable. */
+    static void packVertices20Java(ByteBuffer destination,ByteBuffer source,int count,int stride,int position,int color,int uv,int light,int normal,byte[] materials){
+        validate20(destination,source,count,stride,position,color,uv,light,normal,materials);
         ByteBuffer input=source.duplicate().order(ByteOrder.nativeOrder());
         float minY=0;boolean waterTop=false;
         for(int i=0;i<count;i++){

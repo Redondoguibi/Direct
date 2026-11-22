@@ -56,6 +56,11 @@ Raydiance visual effects are optional. Requires a compatible D3D12/WGL driver.
 [[mixins]]
 config="${mod_id}.mixins.json"
 
+# General game optimizations (Lithium/ModernFix/FerriteCore techniques); independent of the
+# terrain renderer and switched by config/direct-optimizations.properties.
+[[mixins]]
+config="${mod_id}.optimizations.mixins.json"
+
 # The [[accessTransformers]] block allows you to declare where your AT file is.
 # If this block is omitted, a fallback attempt will be made to load an AT from META-INF/accesstransformer.cfg
 #[[accessTransformers]]
