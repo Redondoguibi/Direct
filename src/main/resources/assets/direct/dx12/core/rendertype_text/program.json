@@ -1,0 +1,75 @@
+{
+ "inputs": [
+  {
+   "name": "Position",
+   "location": 0,
+   "type": "vec3"
+  },
+  {
+   "name": "Color",
+   "location": 1,
+   "type": "vec4"
+  },
+  {
+   "name": "UV0",
+   "location": 2,
+   "type": "vec2"
+  },
+  {
+   "name": "UV2",
+   "location": 3,
+   "type": "ivec2"
+  }
+ ],
+ "cbufferSize": 192,
+ "uniforms": [
+  {
+   "name": "ModelViewMat",
+   "offset": 0,
+   "type": "mat4"
+  },
+  {
+   "name": "ProjMat",
+   "offset": 64,
+   "type": "mat4"
+  },
+  {
+   "name": "ColorModulator",
+   "offset": 128,
+   "type": "vec4"
+  },
+  {
+   "name": "FogStart",
+   "offset": 144,
+   "type": "float"
+  },
+  {
+   "name": "FogEnd",
+   "offset": 148,
+   "type": "float"
+  },
+  {
+   "name": "FogColor",
+   "offset": 160,
+   "type": "vec4"
+  },
+  {
+   "name": "FogShape",
+   "offset": 176,
+   "type": "int"
+  }
+ ],
+ "samplers": [
+  "Sampler0",
+  "Sampler2"
+ ],
+ "usedSamplers": [
+  "Sampler0",
+  "Sampler2"
+ ],
+ "blend": null,
+ "name": "rendertype_text",
+ "kind": "core",
+ "vertexSource": "rendertype_text",
+ "fragmentSource": "rendertype_text"
+}

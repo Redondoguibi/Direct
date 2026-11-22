@@ -1,0 +1,54 @@
+{
+ "inputs": [
+  {
+   "name": "Position",
+   "location": 0,
+   "type": "vec3"
+  },
+  {
+   "name": "Color",
+   "location": 1,
+   "type": "vec4"
+  }
+ ],
+ "cbufferSize": 160,
+ "uniforms": [
+  {
+   "name": "ModelViewMat",
+   "offset": 0,
+   "type": "mat4"
+  },
+  {
+   "name": "ProjMat",
+   "offset": 64,
+   "type": "mat4"
+  },
+  {
+   "name": "ColorModulator",
+   "offset": 128,
+   "type": "vec4"
+  },
+  {
+   "name": "FogStart",
+   "offset": 144,
+   "type": "float"
+  },
+  {
+   "name": "FogEnd",
+   "offset": 148,
+   "type": "float"
+  },
+  {
+   "name": "FogShape",
+   "offset": 152,
+   "type": "int"
+  }
+ ],
+ "samplers": [],
+ "usedSamplers": [],
+ "blend": null,
+ "name": "rendertype_lightning",
+ "kind": "core",
+ "vertexSource": "rendertype_lightning",
+ "fragmentSource": "rendertype_lightning"
+}

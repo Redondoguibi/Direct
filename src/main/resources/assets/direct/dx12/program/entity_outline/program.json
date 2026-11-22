@@ -1,0 +1,42 @@
+{
+ "inputs": [
+  {
+   "name": "Position",
+   "location": 0,
+   "type": "vec4"
+  }
+ ],
+ "cbufferSize": 80,
+ "uniforms": [
+  {
+   "name": "ProjMat",
+   "offset": 0,
+   "type": "mat4"
+  },
+  {
+   "name": "InSize",
+   "offset": 64,
+   "type": "vec2"
+  },
+  {
+   "name": "OutSize",
+   "offset": 72,
+   "type": "vec2"
+  }
+ ],
+ "samplers": [
+  "DiffuseSampler"
+ ],
+ "usedSamplers": [
+  "DiffuseSampler"
+ ],
+ "blend": {
+  "func": "add",
+  "srcrgb": "srcalpha",
+  "dstrgb": "1-srcalpha"
+ },
+ "name": "entity_outline",
+ "kind": "program",
+ "vertexSource": "sobel",
+ "fragmentSource": "entity_sobel"
+}

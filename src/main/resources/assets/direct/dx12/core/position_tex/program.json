@@ -1,0 +1,43 @@
+{
+ "inputs": [
+  {
+   "name": "Position",
+   "location": 0,
+   "type": "vec3"
+  },
+  {
+   "name": "UV0",
+   "location": 1,
+   "type": "vec2"
+  }
+ ],
+ "cbufferSize": 144,
+ "uniforms": [
+  {
+   "name": "ModelViewMat",
+   "offset": 0,
+   "type": "mat4"
+  },
+  {
+   "name": "ProjMat",
+   "offset": 64,
+   "type": "mat4"
+  },
+  {
+   "name": "ColorModulator",
+   "offset": 128,
+   "type": "vec4"
+  }
+ ],
+ "samplers": [
+  "Sampler0"
+ ],
+ "usedSamplers": [
+  "Sampler0"
+ ],
+ "blend": null,
+ "name": "position_tex",
+ "kind": "core",
+ "vertexSource": "position_tex",
+ "fragmentSource": "position_tex"
+}

@@ -1,0 +1,253 @@
+--- a/src/main/cpp/dx12_gl_interop.cpp
++++ b/src/main/cpp/dx12_gl_interop.cpp
+@@ -1,6 +1,6 @@
+ #include <jni.h>
+ #include <windows.h>
+-#include <d3d11.h>
++#include <d3d11_4.h>
+ #include <d3d11on12.h>
+ #include <d3d12.h>
+ #include <d3dcompiler.h>
+@@ -277,6 +277,8 @@
+     ID3D12CommandAllocator* cutout;
+     ID3D12CommandAllocator* extension;
+     ID3D12CommandAllocator* finish;
++    ID3D12CommandAllocator* bridgeIn;
++    ID3D12CommandAllocator* bridgeOut;
+     ID3D12CommandAllocator* shadow;
+     ID3D12CommandAllocator* translucent;
+     ID3D12Resource* uploadBuffer;
+@@ -347,6 +349,16 @@
+     ID3D11Device* d3d11Device;
+     ID3D11DeviceContext* d3d11Context;
+     ID3D11On12Device* d3d11On12;
++    bool nativeBridge;
++    ID3D11Texture2D* sharedColor11;
++    ID3D11Texture2D* sharedDepth11;
++    ID3D11DeviceContext4* bridgeContext;
++    ID3D11Fence* bridgeFence11;
++    ID3D12Fence* bridgeFence12;
++    UINT64 bridgeValue;
++    ID3D12Resource* sharedColor12;
++    ID3D12Resource* sharedDepth12;
++    ID3D12GraphicsCommandList* bridgeList;
+     ID3D11Texture2D* interopTexture;
+     ID3D11Texture2D* wrappedColor;
+     bool colorAlias;
+@@ -901,6 +913,8 @@
+         renderer->d3d11Context->Flush();
+     }
+     releaseExtensionResources(renderer);
++    release(renderer->sharedColor11);release(renderer->sharedDepth11);
++    release(renderer->sharedColor12);release(renderer->sharedDepth12);
+     release(renderer->interopDepth);
+     release(renderer->depthTarget);
+     release(renderer->shadowMap);release(renderer->shadowDsv);release(renderer->sceneColor);release(renderer->sceneDepth);renderer->shadowSize=0;
+@@ -911,6 +925,26 @@
+     }
+     release(renderer->colorTarget);
+     release(renderer->interopTexture);
++}
++
++bool createNativeSharedImage(InteropRenderer* r, DXGI_FORMAT format, ID3D12Resource** resource,
++        ID3D11Texture2D** image) {
++    D3D11_TEXTURE2D_DESC desc={};desc.Width=r->width;desc.Height=r->height;
++    desc.MipLevels=1;desc.ArraySize=1;desc.Format=format;desc.SampleDesc.Count=1;
++    desc.Usage=D3D11_USAGE_DEFAULT;desc.BindFlags=D3D11_BIND_RENDER_TARGET|D3D11_BIND_SHADER_RESOURCE;
++    desc.MiscFlags=D3D11_RESOURCE_MISC_SHARED_NTHANDLE|D3D11_RESOURCE_MISC_SHARED;
++    HRESULT hr=r->d3d11Device->CreateTexture2D(&desc,nullptr,image);
++    HANDLE handle=nullptr;IDXGIResource1* shared=nullptr;
++    if(SUCCEEDED(hr))hr=(*image)->QueryInterface(IID_PPV_ARGS(&shared));
++    if(SUCCEEDED(hr))hr=shared->CreateSharedHandle(nullptr,DXGI_SHARED_RESOURCE_READ|DXGI_SHARED_RESOURCE_WRITE,nullptr,&handle);
++    if(SUCCEEDED(hr))hr=r->device->OpenSharedHandle(handle,IID_PPV_ARGS(resource));
++    release(shared);closeHandle(handle);
++    if(SUCCEEDED(hr)){
++        if(format==kColorFormat)r->sharedColor11=*image;else r->sharedDepth11=*image;
++        *image=nullptr;desc.MiscFlags=0;
++        hr=r->d3d11Device->CreateTexture2D(&desc,nullptr,image);
++    }
++    return SUCCEEDED(hr);
+ }
+ 
+ bool createSizeResources(InteropRenderer* renderer, JNIEnv* env) {
+@@ -923,6 +957,12 @@
+     color.SampleDesc.Count = 1;
+     color.Usage = D3D11_USAGE_DEFAULT;
+     color.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
++    if(renderer->nativeBridge){
++        if(!createNativeSharedImage(renderer,kColorFormat,&renderer->sharedColor12,&renderer->interopTexture)
++            ||!createNativeSharedImage(renderer,DXGI_FORMAT_R32_FLOAT,&renderer->sharedDepth12,&renderer->interopDepth)){
++            throwJava(env,"Native D3D11/D3D12 shared image creation failed");return false;
++        }
++    }else{
+     if (FAILED(renderer->d3d11Device->CreateTexture2D(&color, nullptr, &renderer->interopTexture))) {
+         throwJava(env, "DX12/OpenGL interop could not create the shared color target.");
+         return false;
+@@ -932,6 +972,7 @@
+     if (FAILED(renderer->d3d11Device->CreateTexture2D(&color, nullptr, &renderer->interopDepth))) {
+         throwJava(env, "Could not create the shared terrain depth image.");
+         return false;
++    }
+     }
+     D3D12_HEAP_PROPERTIES heap = {};
+     heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+@@ -974,6 +1015,7 @@
+         return false;
+     }
+ 
++    if(renderer->nativeBridge)return createExtensionResources(renderer,env);
+     D3D11_RESOURCE_FLAGS flags = {};
+     flags.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+     if (FAILED(renderer->d3d11On12->CreateWrappedResource(renderer->colorTarget, &flags,
+@@ -1042,6 +1084,7 @@
+     release(renderer->atlas);
+     release(renderer->extensionList);
+     release(renderer->finishList);
++    release(renderer->bridgeList);
+     release(renderer->timestampHeap);
+     release(renderer->timestampReadback);
+     release(renderer->cutoutList);
+@@ -1061,6 +1104,7 @@
+         release(slot.passConstants);
+         release(slot.extension);
+         release(slot.finish);
++        release(slot.bridgeIn);release(slot.bridgeOut);
+         release(slot.cutout);
+         release(slot.opaque);
+         release(slot.upload);release(slot.shadow);release(slot.translucent);
+@@ -1087,6 +1131,7 @@
+     release(renderer->srvHeap);
+     release(renderer->dsvHeap);
+     release(renderer->rtvHeap);
++    release(renderer->bridgeContext);release(renderer->bridgeFence11);release(renderer->bridgeFence12);
+     release(renderer->d3d11On12);
+     release(renderer->d3d11Context);
+     release(renderer->d3d11Device);
+@@ -1562,6 +1607,8 @@
+ 
+ bool createCommandObjects(InteropRenderer* renderer) {
+     for (FrameSlot& slot : renderer->slots) {
++        if(renderer->nativeBridge && (FAILED(renderer->device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,IID_PPV_ARGS(&slot.bridgeIn)))
++            ||FAILED(renderer->device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,IID_PPV_ARGS(&slot.bridgeOut)))))return false;
+         if (FAILED(renderer->device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+                     IID_PPV_ARGS(&slot.upload)))
+                 || FAILED(renderer->device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+@@ -1578,6 +1625,8 @@
+         }
+     }
+     FrameSlot& first = renderer->slots[0];
++    if(renderer->nativeBridge && (FAILED(renderer->device->CreateCommandList(0,D3D12_COMMAND_LIST_TYPE_DIRECT,
++        first.bridgeOut,nullptr,IID_PPV_ARGS(&renderer->bridgeList)))||FAILED(renderer->bridgeList->Close())))return false;
+     if (FAILED(renderer->device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, first.upload, nullptr,
+                 IID_PPV_ARGS(&renderer->uploadList)))
+             || FAILED(renderer->device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, first.opaque,
+@@ -1678,6 +1727,23 @@
+         throwJava(env, "DX12/OpenGL interop could not create a Direct3D 12 command queue.");
+         return false;
+     }
++    renderer->nativeBridge=GetEnvironmentVariableA("DIRECT_NATIVE_D3D11",nullptr,0)>0;
++    if(renderer->nativeBridge){
++        IDXGIFactory4* factory=nullptr;IDXGIAdapter* adapter=nullptr;
++        HRESULT hr=CreateDXGIFactory1(IID_PPV_ARGS(&factory));
++        if(SUCCEEDED(hr))hr=factory->EnumAdapterByLuid(renderer->device->GetAdapterLuid(),IID_PPV_ARGS(&adapter));
++        if(SUCCEEDED(hr))hr=D3D11CreateDevice(adapter,D3D_DRIVER_TYPE_UNKNOWN,nullptr,D3D11_CREATE_DEVICE_BGRA_SUPPORT,
++            nullptr,0,D3D11_SDK_VERSION,&renderer->d3d11Device,nullptr,&renderer->d3d11Context);
++        release(adapter);release(factory);
++        ID3D11Device5* modern=nullptr;HANDLE fenceHandle=nullptr;
++        if(SUCCEEDED(hr))hr=renderer->d3d11Device->QueryInterface(IID_PPV_ARGS(&modern));
++        if(SUCCEEDED(hr))hr=renderer->d3d11Context->QueryInterface(IID_PPV_ARGS(&renderer->bridgeContext));
++        if(SUCCEEDED(hr))hr=renderer->device->CreateFence(0,D3D12_FENCE_FLAG_SHARED,IID_PPV_ARGS(&renderer->bridgeFence12));
++        if(SUCCEEDED(hr))hr=renderer->device->CreateSharedHandle(renderer->bridgeFence12,nullptr,GENERIC_ALL,nullptr,&fenceHandle);
++        if(SUCCEEDED(hr))hr=modern->OpenSharedFence(fenceHandle,IID_PPV_ARGS(&renderer->bridgeFence11));
++        release(modern);closeHandle(fenceHandle);
++        if(FAILED(hr)){throwJava(env,"Native D3D11 device creation failed");return false;}
++    }else{
+     IUnknown* queues[] = {renderer->queue};
+     D3D_FEATURE_LEVEL featureLevels[] = {D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0};
+     if (FAILED(D3D11On12CreateDevice(renderer->device, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+@@ -1686,6 +1752,7 @@
+             || FAILED(renderer->d3d11Device->QueryInterface(IID_PPV_ARGS(&renderer->d3d11On12)))) {
+         throwJava(env, "DX12/OpenGL interop could not create a D3D11On12 device.");
+         return false;
++    }
+     }
+     if (!createDescriptorHeaps(renderer) || !createCommandObjects(renderer)
+             || !createUploadRingBuffers(renderer, uploadRingBytes, env)) {
+@@ -2003,7 +2070,47 @@
+     return true;
+ }
+ 
++bool transferNativeSharedImages(InteropRenderer* r, bool importing){
++    auto& slot=r->slots[r->slotIndex];auto* allocator=importing?slot.bridgeIn:slot.bridgeOut;
++    if(importing){
++        r->d3d11Context->CopyResource(r->sharedColor11,r->interopTexture);
++        r->d3d11Context->CopyResource(r->sharedDepth11,r->interopDepth);
++        UINT64 value=++r->bridgeValue;
++        if(FAILED(r->bridgeContext->Signal(r->bridgeFence11,value)))return false;
++        r->d3d11Context->Flush();
++        if(FAILED(r->queue->Wait(r->bridgeFence12,value)))return false;
++    }
++    auto* list=r->bridgeList;
++    if(FAILED(allocator->Reset())||FAILED(list->Reset(allocator,nullptr)))return false;
++    ID3D12Resource* shared[]={r->sharedColor12,r->sharedDepth12};
++    ID3D12Resource* targets[]={r->colorTarget,r->depthTarget};
++    D3D12_RESOURCE_STATES states[]={D3D12_RESOURCE_STATE_RENDER_TARGET,D3D12_RESOURCE_STATE_DEPTH_WRITE};
++    for(UINT i=0;i<2;i++){
++        auto sharedState=importing?D3D12_RESOURCE_STATE_COPY_SOURCE:D3D12_RESOURCE_STATE_COPY_DEST;
++        auto targetState=importing?D3D12_RESOURCE_STATE_COPY_DEST:D3D12_RESOURCE_STATE_COPY_SOURCE;
++        D3D12_RESOURCE_BARRIER before[]={transition(shared[i],D3D12_RESOURCE_STATE_COMMON,sharedState),
++            transition(targets[i],states[i],targetState)};list->ResourceBarrier(2,before);
++        list->CopyResource(importing?targets[i]:shared[i],importing?shared[i]:targets[i]);
++        D3D12_RESOURCE_BARRIER after[]={transition(shared[i],sharedState,D3D12_RESOURCE_STATE_COMMON),
++            transition(targets[i],targetState,states[i])};list->ResourceBarrier(2,after);
++    }
++    if(FAILED(list->Close()))return false;
++    ID3D12CommandList* lists[]={list};r->queue->ExecuteCommandLists(1,lists);
++    if(!importing){
++        UINT64 ready=++r->bridgeValue;
++        if(FAILED(r->queue->Signal(r->bridgeFence12,ready))||FAILED(r->bridgeContext->Wait(r->bridgeFence11,ready)))return false;
++        r->d3d11Context->CopyResource(r->interopTexture,r->sharedColor11);
++        r->d3d11Context->CopyResource(r->interopDepth,r->sharedDepth11);
++        UINT64 copied=++r->bridgeValue;
++        if(FAILED(r->bridgeContext->Signal(r->bridgeFence11,copied)))return false;
++        r->d3d11Context->Flush();
++        if(FAILED(r->queue->Wait(r->bridgeFence12,copied)))return false;
++    }
++    return SUCCEEDED(r->d3d11Device->GetDeviceRemovedReason());
++}
++
+ bool copyToInteropTexture(InteropRenderer* renderer) {
++    if(renderer->nativeBridge)return transferNativeSharedImages(renderer,false);
+     // Both APIs submit to the same queue. Acquire/release plus Flush preserve GPU order;
+     // a CPU wait before this copy serializes the renderer unnecessarily.
+     ID3D11Resource* wrapped[] = {renderer->wrappedColor, renderer->wrappedDepth};
+@@ -3029,12 +3136,14 @@
+ 
+ extern "C" JNIEXPORT jlong JNICALL Java_com_redondoguibi_direct_NativeDx12_acquireColorInteropTarget(JNIEnv* env,jclass){
+     auto* r=g_interopRenderer;if(!r){throwJava(env,"Interop not initialized");return 0;}
++    if(r->nativeBridge)return 0;
+     if(!r->colorAcquired){ID3D11Resource* color=r->wrappedColor;r->d3d11On12->AcquireWrappedResources(&color,1);r->d3d11Context->Flush();r->colorAcquired=true;}
+     return reinterpret_cast<jlong>(r->wrappedColor);
+ }
+ extern "C" JNIEXPORT void JNICALL Java_com_redondoguibi_direct_NativeDx12_configureColorAlias(JNIEnv* env,jclass,jboolean enabled){
+     auto* r=g_interopRenderer;if(!r){throwJava(env,"Interop not initialized");return;}
+     releaseColorInterop(r);
++    if(r->nativeBridge){r->colorAlias=false;return;}
+     if(enabled==JNI_TRUE){r->colorAlias=true;release(r->interopTexture);}
+     else{
+         if(!r->interopTexture){D3D11_TEXTURE2D_DESC desc={};desc.Width=r->width;desc.Height=r->height;desc.MipLevels=1;desc.ArraySize=1;desc.Format=kColorFormat;desc.SampleDesc.Count=1;desc.Usage=D3D11_USAGE_DEFAULT;desc.BindFlags=D3D11_BIND_RENDER_TARGET|D3D11_BIND_SHADER_RESOURCE;
+@@ -3054,10 +3163,14 @@
+     if(r->uploadOpen){throwJava(env,"Translucent frame cannot overtake pending uploads");return -1;}slot.uploadOffset=0;
+     // GL has finished capturing the current opaque scene and entities into the interop images.
+     releaseColorInterop(r);
++    if(r->nativeBridge){
++        if(!transferNativeSharedImages(r,true)){throwJava(env,"Native shared scene import failed");return -1;}
++    }else{
+     ID3D11Resource* wrapped[]={r->wrappedColor,r->wrappedDepth};r->d3d11On12->AcquireWrappedResources(wrapped,2);
+     if(!r->colorAlias)r->d3d11Context->CopyResource(r->wrappedColor,r->interopTexture);r->d3d11Context->CopyResource(r->wrappedDepth,r->interopDepth);
+     r->d3d11On12->ReleaseWrappedResources(wrapped,2);r->d3d11Context->Flush();
+     if(FAILED(r->d3d11Device->GetDeviceRemovedReason())){throwJava(env,"Scene import failed");return -1;}
++    }
+     env->GetFloatArrayRegion(matrix,0,28,r->viewProjection);
+     std::memcpy(slot.passConstantsMapped+kMaxExtensionPasses*256,r->geometryConstants,sizeof(r->geometryConstants));
+     auto* list=r->translucentList;if(FAILED(slot.translucent->Reset())||FAILED(list->Reset(slot.translucent,r->translucentPipeline))){throwJava(env,"Translucent list reset failed");return -1;}

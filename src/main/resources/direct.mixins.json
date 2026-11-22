@@ -1,15 +1,25 @@
 {
   "required": true,
   "package": "com.redondoguibi.direct.mixin",
+  "plugin": "com.redondoguibi.direct.compat.DirectMixinPlugin",
   "compatibilityLevel": "JAVA_21",
   "client": [
-    "GuiMixin",
     "LevelRendererMixin",
     "RenderSectionMixin",
-    "RenderSystemMixin",
     "SectionCompilerMixin",
+    "VertexBufferMixin",
     "TextureAtlasMixin",
-    "WindowMixin"
+    "SpriteContentsMixin",
+    "NativeImageAccessor",
+    "LightTextureMixin",
+    "WindowMixin",
+    "PhaseZeroWindowMixin",
+    "GlStateManagerShadowMixin",
+    "VertexBufferShadowMixin",
+    "ShaderInstanceShadowMixin",
+    "EffectInstanceShadowMixin",
+    "WindowShadowMixin",
+    "RenderSystemShadowMixin"
   ],
   "injectors": {
     "defaultRequire": 1

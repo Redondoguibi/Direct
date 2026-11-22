@@ -1,0 +1,3 @@
+TERRAIN order=near parallel=true uploadMs=10.322 arenaMiB=16.0 gpuP50=4.4206 gpuP95=5.4299 cpuP50=0.4627 wallP50=5.0783
+TERRAIN order=mixed parallel=true uploadMs=10.059 arenaMiB=16.0 gpuP50=5.9025 gpuP95=7.0146 cpuP50=0.3964 wallP50=6.4391
+TERRAIN order=far parallel=true uploadMs=9.072 arenaMiB=16.0 gpuP50=14.0673 gpuP95=15.8059 cpuP50=0.4180 wallP50=14.5887

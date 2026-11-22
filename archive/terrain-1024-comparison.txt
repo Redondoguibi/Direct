@@ -1,0 +1,12 @@
+old TERRAIN order=near parallel=true uploadMs=15.140 arenaMiB=32.0 gpuP50=5.8895 gpuP95=6.8482 cpuP50=0.4188 wallP50=6.4738
+old TERRAIN order=mixed parallel=true uploadMs=16.502 arenaMiB=32.0 gpuP50=8.8095 gpuP95=10.3879 cpuP50=0.4365 wallP50=9.4008
+old TERRAIN order=far parallel=true uploadMs=14.435 arenaMiB=32.0 gpuP50=28.5536 gpuP95=35.3339 cpuP50=0.5273 wallP50=29.1699
+new TERRAIN order=near parallel=true uploadMs=14.489 arenaMiB=24.0 gpuP50=5.9126 gpuP95=6.3287 cpuP50=0.4653 wallP50=6.4906
+new TERRAIN order=mixed parallel=true uploadMs=14.292 arenaMiB=24.0 gpuP50=5.7862 gpuP95=6.1538 cpuP50=0.4513 wallP50=6.3606
+new TERRAIN order=far parallel=true uploadMs=15.608 arenaMiB=24.0 gpuP50=5.6991 gpuP95=6.0901 cpuP50=0.4150 wallP50=6.2935
+new TERRAIN order=near parallel=true uploadMs=14.759 arenaMiB=24.0 gpuP50=6.0246 gpuP95=7.4904 cpuP50=0.5894 wallP50=6.7242
+new TERRAIN order=mixed parallel=true uploadMs=14.320 arenaMiB=24.0 gpuP50=5.9180 gpuP95=6.7209 cpuP50=0.5224 wallP50=6.5204
+new TERRAIN order=far parallel=true uploadMs=14.894 arenaMiB=24.0 gpuP50=5.7636 gpuP95=7.4792 cpuP50=0.3866 wallP50=6.3635
+old TERRAIN order=near parallel=true uploadMs=15.436 arenaMiB=32.0 gpuP50=6.1002 gpuP95=8.3950 cpuP50=0.5729 wallP50=7.1313
+old TERRAIN order=mixed parallel=true uploadMs=14.841 arenaMiB=32.0 gpuP50=8.4795 gpuP95=10.2858 cpuP50=0.4056 wallP50=8.9927
+old TERRAIN order=far parallel=true uploadMs=56.718 arenaMiB=32.0 gpuP50=26.7361 gpuP95=32.1557 cpuP50=0.4797 wallP50=27.3906

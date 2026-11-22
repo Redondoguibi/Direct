@@ -1,0 +1,42 @@
+{
+ "inputs": [
+  {
+   "name": "Position",
+   "location": 0,
+   "type": "vec4"
+  }
+ ],
+ "cbufferSize": 96,
+ "uniforms": [
+  {
+   "name": "ProjMat",
+   "offset": 0,
+   "type": "mat4"
+  },
+  {
+   "name": "OutSize",
+   "offset": 64,
+   "type": "vec2"
+  },
+  {
+   "name": "ColorModulate",
+   "offset": 80,
+   "type": "vec4"
+  }
+ ],
+ "samplers": [
+  "DiffuseSampler"
+ ],
+ "usedSamplers": [
+  "DiffuseSampler"
+ ],
+ "blend": {
+  "func": "add",
+  "srcrgb": "srcalpha",
+  "dstrgb": "1-srcalpha"
+ },
+ "name": "blit",
+ "kind": "program",
+ "vertexSource": "blit",
+ "fragmentSource": "blit"
+}

@@ -1,0 +1,4 @@
+colorAlias=false adapter=Intel(R) UHD Graphics 630 GPU workload 1080p 16 overlapping quads: p50=10.2240 ms p95=12.4010 ms wallP50=11.1295 ms wallP95=12.9837 ms
+colorAlias=true adapter=Intel(R) UHD Graphics 630 GPU workload 1080p 16 overlapping quads: p50=9.5967 ms p95=11.2787 ms wallP50=10.6575 ms wallP95=11.8187 ms
+colorAlias=true adapter=Intel(R) UHD Graphics 630 GPU workload 1080p 16 overlapping quads: p50=9.5805 ms p95=11.2128 ms wallP50=10.7684 ms wallP95=11.7685 ms
+colorAlias=false adapter=Intel(R) UHD Graphics 630 GPU workload 1080p 16 overlapping quads: p50=11.3297 ms p95=12.4608 ms wallP50=11.9903 ms wallP95=12.9993 ms

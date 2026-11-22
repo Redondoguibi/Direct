@@ -1,0 +1,129 @@
+Java_com_redondoguibi_direct_NativeDx12_renderInterop
+-------------------------------------------------------
+extern "C" JNIEXPORT jint JNICALL
+Java_com_redondoguibi_direct_NativeDx12_renderInterop(JNIEnv* env, jclass, jfloatArray matrix,
+        jdouble cameraX, jdouble cameraY, jdouble cameraZ, jfloat renderDistance,
+        jlong frameIndex, jfloat elapsedSeconds, jfloatArray passUniforms,
+        jboolean useGpuSynchronization, jboolean useExecuteIndirect) {
+    if (g_interopRenderer == nullptr) {
+        throwJava(env, "DX12/OpenGL interop is not initialized.");
+        return -1;
+    }
+    const jsize expectedUniforms = static_cast<jsize>(
+            g_interopRenderer->extensionPasses.size() * kPassUniformFloatCount);
+    if (matrix == nullptr || env->GetArrayLength(matrix) != 16 || frameIndex < 0
+            || (expectedUniforms > 0 && (passUniforms == nullptr
+                || env->GetArrayLength(passUniforms) != expectedUniforms))) {
+        throwJava(env, "DX12 terrain rendering received an invalid matrix or frame index.");
+        return -1;
+    }
+    jfloat values[16];
+    env->GetFloatArrayRegion(matrix, 0, 16, values);
+    if (env->ExceptionCheck()) {
+        return -1;
+    }
+    float uniformValues[kMaxExtensionPasses * kPassUniformFloatCount];
+    if (expectedUniforms > 0) {
+        env->GetFloatArrayRegion(passUniforms, 0, expectedUniforms, uniformValues);
+        if (env->ExceptionCheck()) {
+            return -1;
+        }
+    }
+    bool gpuUsed = false;
+    bool frameSkipped = false;
+    if (!renderInteropFrame(g_interopRenderer, values, cameraX, cameraY, cameraZ, renderDistance,
+            static_cast<UINT64>(frameIndex), elapsedSeconds,
+            expectedUniforms > 0 ? uniformValues : nullptr,
+            useGpuSynchronization == JNI_TRUE, useExecuteIndirect == JNI_TRUE,
+            env, &gpuUsed, &frameSkipped)) {
+        return -1;
+    }
+    if (frameSkipped) {
+        return 2;
+    }
+    return gpuUsed ? 1 : 0;
+}
+
+Java_com_redondoguibi_direct_NativeDx12_pollInteropFence
+--------------------------------------------------------
+// 1 means complete, 0 means pending, and -1 means device/fence failure.
+extern "C" JNIEXPORT jint JNICALL
+Java_com_redondoguibi_direct_NativeDx12_pollInteropFence(JNIEnv*, jclass, jlong value) {
+    InteropRenderer* renderer = g_interopRenderer;
+    if (renderer == nullptr || value < 0 || renderer->gpuSyncFault.load()) {
+        return -1;
+    }
+    const UINT64 completed = renderer->fence->GetCompletedValue();
+    if (completed == kFenceError) {
+        renderer->gpuSyncFault.store(true);
+        return -1;
+    }
+    return completed >= static_cast<UINT64>(value) ? 1 : 0;
+}
+
+Java_com_redondoguibi_direct_NativeDx12_signalInteropFence
+----------------------------------------------------------
+// CPU fallback for a frame that was skipped or whose GLsync has completed.
+extern "C" JNIEXPORT void JNICALL
+Java_com_redondoguibi_direct_NativeDx12_signalInteropFence(JNIEnv* env, jclass, jlong value) {
+    if (g_interopRenderer == nullptr || value < 0
+            || FAILED(g_interopRenderer->glDoneFence->Signal(static_cast<UINT64>(value)))) {
+        throwJava(env, "DX12/OpenGL interop could not CPU-signal the OpenGL completion fence.");
+    }
+}
+
+recordTerrainList
+-----------------
+bool recordTerrainList(InteropRenderer* renderer, ID3D12CommandAllocator* allocator,
+        ID3D12GraphicsCommandList* list, PassRole role) {
+    if (FAILED(allocator->Reset()) || FAILED(list->Reset(allocator, nullptr))) {
+        return false;
+    }
+    beginTerrainPass(renderer, list, role);
+    const UINT firstLayer = role == PassRole::Opaque ? 0 : 1;
+    const UINT lastLayer = role == PassRole::Opaque ? 1 : kLayerCount;
+    if (role != PassRole::ClearOnly) {
+        FrameSlot& slot = renderer->slots[renderer->slotIndex];
+        const UINT indirectCount = role == PassRole::Opaque
+                ? slot.opaqueIndirectCount : slot.cutoutIndirectCount;
+        const UINT64 indirectOffset = role == PassRole::Opaque
+                ? slot.opaqueIndirectOffset : slot.cutoutIndirectOffset;
+        if (slot.indirectReady && renderer->terrainCommandSignature != nullptr) {
+            if (indirectCount > 0) {
+                list->ExecuteIndirect(renderer->terrainCommandSignature, indirectCount,
+                        slot.uploadBuffer, indirectOffset, nullptr, 0);
+            }
+        } else {
+            const UINT atlasIndex = renderer->atlasIndex;
+            list->SetGraphicsRoot32BitConstants(1, 1, &atlasIndex, 4);
+            for (const VisibleSection& entry : renderer->visible) {
+                const TerrainSection* section = entry.section;
+                bool bound = false;
+                for (UINT layer = firstLayer; layer < lastLayer; ++layer) {
+                    if (section->layerIndexCounts[layer] == 0) {
+                        continue;
+                    }
+                    if (!bound) {
+                        list->IASetVertexBuffers(0, 1, &section->vertexView);
+                        list->IASetIndexBuffer(&section->indexView);
+                        list->SetGraphicsRoot32BitConstants(1, 3, entry.offset, 0);
+                        bound = true;
+                    }
+                    list->SetGraphicsRoot32BitConstants(1, 1, &kLayerAlphaCutoff[layer], 3);
+                    list->DrawIndexedInstanced(section->layerIndexCounts[layer], 1, section->layerStart[layer], 0, 0);
+                }
+            }
+        }
+    }
+    return SUCCEEDED(list->Close());
+}
+
+AcquireWrappedResources / CopyResource
+--------------------------------------
+bool copyToInteropTexture(InteropRenderer* renderer) {
+    renderer->d3d11On12->AcquireWrappedResources(&renderer->wrappedColor, 1);
+    renderer->d3d11Context->CopyResource(renderer->interopTexture, renderer->wrappedColor);
+    renderer->d3d11On12->ReleaseWrappedResources(&renderer->wrappedColor, 1);
+    renderer->d3d11Context->Flush();
+    return SUCCEEDED(renderer->d3d11Device->GetDeviceRemovedReason());
+}

@@ -38,3 +38,9 @@ run/
 **/src/generated/**/.cache/
 repo/
 !**/src/**/repo/
+
+### Google Drive sync temp files ###
+.tmp.driveupload/
+
+### Python ###
+__pycache__/

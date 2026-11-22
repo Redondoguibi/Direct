@@ -1,0 +1,22 @@
+{
+ "inputs": [
+  {
+   "name": "Position",
+   "location": 0,
+   "type": "vec3"
+  }
+ ],
+ "cbufferSize": 0,
+ "uniforms": [],
+ "samplers": [
+  "DiffuseSampler"
+ ],
+ "usedSamplers": [
+  "DiffuseSampler"
+ ],
+ "blend": null,
+ "name": "blit_screen",
+ "kind": "core",
+ "vertexSource": "blit_screen",
+ "fragmentSource": "blit_screen"
+}

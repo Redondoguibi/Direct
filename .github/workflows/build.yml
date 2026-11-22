@@ -1,30 +1,119 @@
-name: Build
+name: Build and release
 
-on: [push, pull_request]
+on:
+  push:
+    branches: ["**"]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
 
 jobs:
-  build:
+  java:
+    name: Java compile, tests, and Javadoc
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-          fetch-tags: true
-
-      - name: Setup JDK 21
+      - name: Set up JDK 21
         uses: actions/setup-java@v4
         with:
-          java-version: '21'
-          distribution: 'temurin'
-
-      - name: Setup Gradle
+          java-version: "21"
+          distribution: temurin
+      - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
+      - name: Compile and test Java API
+        run: bash gradlew compileJava test javadoc
 
-      # This is needed to be able to run ./gradlew below
-      # You can run `git update-index --chmod +x gradlew` then remove this step.
-      - name: Make Gradle wrapper executable
-        run: chmod +x ./gradlew
+  windows:
+    name: Windows native build and smoke test
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: "21"
+          distribution: temurin
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+      - name: Build mod and run native smoke test
+        run: .\gradlew.bat build test javadoc nativeSmokeTest
+      - name: Verify native DLL is packaged in the mod JAR
+        shell: pwsh
+        run: |
+          $jar = Get-ChildItem "build/libs/direct-*.jar" | Where-Object { $_.Name -notlike "*-javadoc.jar" } | Select-Object -First 1
+          if ($null -eq $jar) {
+            throw "The Windows build did not produce the Direct mod JAR."
+          }
+          $entries = & jar tf $jar.FullName
+          if ($LASTEXITCODE -ne 0) {
+            throw "Could not inspect the generated mod JAR."
+          }
+          $nativeEntry = "META-INF/native/windows-x86_64/direct_renderer.dll"
+          if ($entries -notcontains $nativeEntry) {
+            throw "The generated JAR is missing $nativeEntry."
+          }
+          Write-Host "Verified native renderer in $($jar.Name)."
+      - name: Upload mod and API documentation
+        uses: actions/upload-artifact@v4
+        with:
+          name: direct-jars
+          path: build/libs/direct-*.jar
+          if-no-files-found: error
+      - name: Upload generated Javadoc
+        uses: actions/upload-artifact@v4
+        with:
+          name: direct-javadoc
+          path: build/docs/javadoc/**
+          if-no-files-found: error
 
-      - name: Build with Gradle
-        run: ./gradlew build
+  release:
+    name: Sign JAR and publish release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [java, windows]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: "21"
+          distribution: temurin
+      - name: Download Windows artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: direct-jars
+          path: release-artifact
+      - name: Sign and verify mod JAR
+        shell: bash
+        env:
+          JAR_SIGNING_KEYSTORE_BASE64: ${{ secrets.JAR_SIGNING_KEYSTORE_BASE64 }}
+          JAR_SIGNING_STORE_PASSWORD: ${{ secrets.JAR_SIGNING_STORE_PASSWORD }}
+          JAR_SIGNING_KEY_PASSWORD: ${{ secrets.JAR_SIGNING_KEY_PASSWORD }}
+          JAR_SIGNING_ALIAS: ${{ secrets.JAR_SIGNING_ALIAS }}
+        run: |
+          set -euo pipefail
+          for name in JAR_SIGNING_KEYSTORE_BASE64 JAR_SIGNING_STORE_PASSWORD JAR_SIGNING_KEY_PASSWORD JAR_SIGNING_ALIAS; do
+            if [[ -z "${!name}" ]]; then
+              echo "Missing required GitHub Actions secret: $name" >&2
+              exit 1
+            fi
+          done
+          printf '%s' "$JAR_SIGNING_KEYSTORE_BASE64" | base64 --decode > "$RUNNER_TEMP/direct-signing.p12"
+          version="$(grep '^mod_version=' gradle.properties | cut -d= -f2)"
+          unsigned="release-artifact/direct-${version}.jar"
+          signed="release-artifact/direct-${version}-signed.jar"
+          test -f "$unsigned"
+          jarsigner -keystore "$RUNNER_TEMP/direct-signing.p12" -storetype PKCS12 \
+            -storepass "$JAR_SIGNING_STORE_PASSWORD" -keypass "$JAR_SIGNING_KEY_PASSWORD" \
+            -digestalg SHA-256 -sigalg SHA256withRSA -signedjar "$signed" "$unsigned" "$JAR_SIGNING_ALIAS"
+          jarsigner -verify -strict -certs "$signed"
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" "release-artifact/direct-$(grep '^mod_version=' gradle.properties | cut -d= -f2)-signed.jar" --generate-notes

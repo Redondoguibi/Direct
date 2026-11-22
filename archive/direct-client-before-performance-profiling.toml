@@ -1,0 +1,59 @@
+#Enable DirectX 12 terrain rendering (replacement is experimental).
+#If native initialization or OpenGL interop is unavailable, vanilla rendering stays active.
+enableDx12Preview = false
+#Compress the DX12 block atlas to BC7 on load (less GPU memory bandwidth).
+#Lossy: may slightly change pixel-art colors. Applied on the next resource reload.
+compressBlockAtlas = true
+#Show Direct's renderer state in the in-game HUD.
+showRendererStatus = true
+#Maximum number of compiled terrain sections uploaded to D3D12 per frame.
+# Default: 32
+# Range: 1 ~ 512
+maxMeshUploadsPerFrame = 32
+#Soft terrain upload budget per frame in MiB. One oversized section is still allowed.
+# Default: 16
+# Range: 1 ~ 512
+maxMeshUploadMiBPerFrame = 16
+#Direct terrain visibility distance as a percentage of Minecraft's configured render distance.
+# Default: 100
+# Range: 25 ~ 100
+terrainRenderDistancePercent = 100
+#Use shared GPU timeline semaphores for OpenGL/D3D12 synchronization when supported.
+#Disable to force the CPU synchronization fallback.
+useGpuSemaphoreSync = true
+#Maximum CPU threads used by the BC7 block-atlas encoder.
+#Lower values leave more CPU time for Minecraft; applied on resource reload.
+# Default: 2
+# Range: 1 ~ 16
+bc7EncoderThreads = 2
+#Record opaque and cutout terrain command lists in parallel on a worker thread.
+parallelSectionRecording = true
+#Submit terrain draw commands through D3D12 ExecuteIndirect when supported.
+useExecuteIndirect = true
+#Replace vanilla solid/cutout terrain with DX12 color AND depth when the current visible set is complete.
+#Experimental until in-game visual and performance validation; false enables the diagnostic overlay.
+replaceVanillaTerrain = true
+#Persistent per-frame D3D12 upload-ring capacity shared by terrain section updates.
+# Default: 32
+# Range: 16 ~ 512
+uploadRingBufferMiB = 32
+#Size of each lazily allocated GPU terrain arena page.
+# Default: 16
+# Range: 8 ~ 256
+terrainArenaPageMiB = 16
+#Maximum total GPU memory reserved for Direct terrain section buffers.
+# Default: 256
+# Range: 64 ~ 4096
+maxTerrainArenaMiB = 256
+#Soft backpressure limit for compiled terrain meshes waiting for GPU upload.
+# Default: 128
+# Range: 64 ~ 2048
+maxPendingMeshMiB = 128
+#Minimum interval between DX12 block-atlas refreshes caused by animated sprites.
+#Only changed sprite regions are read; BC7 compression runs off the render thread. Lower
+#values increase readback frequency. Animated blocks update at this rate.
+# Default: 250
+# Range: 50 ~ 2000
+animatedAtlasRefreshMillis = 250
+#Log optional CPU/GPU renderer costs and draw counts every 60 seconds; no FPS recording.
+profileRenderer = false

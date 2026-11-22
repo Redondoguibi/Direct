@@ -1,0 +1,45 @@
+{
+ "inputs": [
+  {
+   "name": "Position",
+   "location": 0,
+   "type": "vec3"
+  }
+ ],
+ "cbufferSize": 144,
+ "uniforms": [
+  {
+   "name": "ModelViewMat",
+   "offset": 0,
+   "type": "mat4"
+  },
+  {
+   "name": "ProjMat",
+   "offset": 64,
+   "type": "mat4"
+  },
+  {
+   "name": "GameTime",
+   "offset": 128,
+   "type": "float"
+  },
+  {
+   "name": "EndPortalLayers",
+   "offset": 132,
+   "type": "int"
+  }
+ ],
+ "samplers": [
+  "Sampler0",
+  "Sampler1"
+ ],
+ "usedSamplers": [
+  "Sampler0",
+  "Sampler1"
+ ],
+ "blend": null,
+ "name": "rendertype_end_gateway",
+ "kind": "core",
+ "vertexSource": "rendertype_end_portal",
+ "fragmentSource": "rendertype_end_portal"
+}

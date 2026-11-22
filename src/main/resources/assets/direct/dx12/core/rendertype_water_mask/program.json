@@ -1,0 +1,34 @@
+{
+ "inputs": [
+  {
+   "name": "Position",
+   "location": 0,
+   "type": "vec3"
+  }
+ ],
+ "cbufferSize": 144,
+ "uniforms": [
+  {
+   "name": "ModelViewMat",
+   "offset": 0,
+   "type": "mat4"
+  },
+  {
+   "name": "ProjMat",
+   "offset": 64,
+   "type": "mat4"
+  },
+  {
+   "name": "ColorModulator",
+   "offset": 128,
+   "type": "vec4"
+  }
+ ],
+ "samplers": [],
+ "usedSamplers": [],
+ "blend": null,
+ "name": "rendertype_water_mask",
+ "kind": "core",
+ "vertexSource": "rendertype_water_mask",
+ "fragmentSource": "rendertype_water_mask"
+}

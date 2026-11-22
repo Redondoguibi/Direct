@@ -1,0 +1,97 @@
+{
+ "inputs": [
+  {
+   "name": "Position",
+   "location": 0,
+   "type": "vec3"
+  },
+  {
+   "name": "Color",
+   "location": 1,
+   "type": "vec4"
+  },
+  {
+   "name": "UV0",
+   "location": 2,
+   "type": "vec2"
+  },
+  {
+   "name": "UV1",
+   "location": 3,
+   "type": "ivec2"
+  },
+  {
+   "name": "UV2",
+   "location": 4,
+   "type": "ivec2"
+  },
+  {
+   "name": "Normal",
+   "location": 5,
+   "type": "vec3"
+  }
+ ],
+ "cbufferSize": 224,
+ "uniforms": [
+  {
+   "name": "ModelViewMat",
+   "offset": 0,
+   "type": "mat4"
+  },
+  {
+   "name": "ProjMat",
+   "offset": 64,
+   "type": "mat4"
+  },
+  {
+   "name": "ColorModulator",
+   "offset": 128,
+   "type": "vec4"
+  },
+  {
+   "name": "Light0_Direction",
+   "offset": 144,
+   "type": "vec3"
+  },
+  {
+   "name": "Light1_Direction",
+   "offset": 160,
+   "type": "vec3"
+  },
+  {
+   "name": "FogStart",
+   "offset": 172,
+   "type": "float"
+  },
+  {
+   "name": "FogEnd",
+   "offset": 176,
+   "type": "float"
+  },
+  {
+   "name": "FogColor",
+   "offset": 192,
+   "type": "vec4"
+  },
+  {
+   "name": "FogShape",
+   "offset": 208,
+   "type": "int"
+  }
+ ],
+ "samplers": [
+  "Sampler0",
+  "Sampler1",
+  "Sampler2"
+ ],
+ "usedSamplers": [
+  "Sampler0",
+  "Sampler1",
+  "Sampler2"
+ ],
+ "blend": null,
+ "name": "rendertype_entity_smooth_cutout",
+ "kind": "core",
+ "vertexSource": "rendertype_entity_smooth_cutout",
+ "fragmentSource": "rendertype_entity_smooth_cutout"
+}

@@ -1,0 +1,53 @@
+{
+ "inputs": [
+  {
+   "name": "Position",
+   "location": 0,
+   "type": "vec3"
+  },
+  {
+   "name": "Color",
+   "location": 1,
+   "type": "vec4"
+  },
+  {
+   "name": "UV0",
+   "location": 2,
+   "type": "vec2"
+  },
+  {
+   "name": "UV1",
+   "location": 3,
+   "type": "vec2"
+  },
+  {
+   "name": "UV2",
+   "location": 4,
+   "type": "vec2"
+  }
+ ],
+ "cbufferSize": 128,
+ "uniforms": [
+  {
+   "name": "ModelViewMat",
+   "offset": 0,
+   "type": "mat4"
+  },
+  {
+   "name": "ProjMat",
+   "offset": 64,
+   "type": "mat4"
+  }
+ ],
+ "samplers": [
+  "Sampler0"
+ ],
+ "usedSamplers": [
+  "Sampler0"
+ ],
+ "blend": null,
+ "name": "rendertype_entity_alpha",
+ "kind": "core",
+ "vertexSource": "rendertype_entity_alpha",
+ "fragmentSource": "rendertype_entity_alpha"
+}

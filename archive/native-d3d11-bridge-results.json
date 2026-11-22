@@ -1,0 +1,41 @@
+{
+  "adapter": "Intel UHD Graphics 630",
+  "resolution": [
+    1920,
+    1080
+  ],
+  "workload": "16 overlapping quads; 30 warmup frames; 120 samples",
+  "nativeCopy": [
+    {
+      "gpuP50": 13.8936,
+      "gpuP95": 14.8029,
+      "wallP50": 15.0309,
+      "wallP95": 21.4485
+    },
+    {
+      "gpuP50": 12.334,
+      "gpuP95": 13.0962,
+      "wallP50": 12.8519,
+      "wallP95": 17.927
+    }
+  ],
+  "on12Alias": [
+    {
+      "gpuP50": 9.2473,
+      "gpuP95": 10.56,
+      "wallP50": 9.773,
+      "wallP95": 11.5657
+    },
+    {
+      "gpuP50": 7.3782,
+      "gpuP95": 10.056,
+      "wallP50": 7.765,
+      "wallP95": 10.535
+    }
+  ],
+  "functionalTestsPassed": 3,
+  "installed": false,
+  "minecraftLaunched": false,
+  "productionSourceRestored": true,
+  "note": "Other exploratory keyed-mutex runs were excluded from this comparison; the second reported nativeCopy run follows an explicit CMake rebuild of the original native copy prototype."
+}

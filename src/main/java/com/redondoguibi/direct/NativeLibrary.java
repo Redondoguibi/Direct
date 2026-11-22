@@ -8,6 +8,7 @@ import java.nio.file.StandardCopyOption;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.HexFormat;
+import java.util.Locale;
 
 import net.neoforged.fml.loading.FMLPaths;
 
@@ -25,6 +26,9 @@ public final class NativeLibrary {
     public static synchronized void load() throws IOException {
         if (loaded) {
             return;
+        }
+        if (!supportsPlatform(System.getProperty("os.name"), System.getProperty("os.arch"))) {
+            throw new IOException("The Direct native renderer requires Windows x86-64.");
         }
         byte[] bytes;
         try (InputStream input = NativeLibrary.class.getResourceAsStream(RESOURCE)) {
@@ -58,5 +62,11 @@ public final class NativeLibrary {
         }
         System.load(library.toAbsolutePath().toString());
         loaded = true;
+    }
+
+    static boolean supportsPlatform(String osName, String architecture) {
+        return osName != null && osName.toLowerCase(Locale.ROOT).startsWith("windows")
+                && architecture != null
+                && (architecture.equalsIgnoreCase("amd64") || architecture.equalsIgnoreCase("x86_64"));
     }
 }

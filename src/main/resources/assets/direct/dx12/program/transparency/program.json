@@ -1,0 +1,59 @@
+{
+ "inputs": [
+  {
+   "name": "Position",
+   "location": 0,
+   "type": "vec4"
+  }
+ ],
+ "cbufferSize": 80,
+ "uniforms": [
+  {
+   "name": "ProjMat",
+   "offset": 0,
+   "type": "mat4"
+  },
+  {
+   "name": "OutSize",
+   "offset": 64,
+   "type": "vec2"
+  }
+ ],
+ "samplers": [
+  "DiffuseSampler",
+  "DiffuseDepthSampler",
+  "TranslucentSampler",
+  "TranslucentDepthSampler",
+  "ItemEntitySampler",
+  "ItemEntityDepthSampler",
+  "ParticlesSampler",
+  "ParticlesDepthSampler",
+  "CloudsSampler",
+  "CloudsDepthSampler",
+  "WeatherSampler",
+  "WeatherDepthSampler"
+ ],
+ "usedSamplers": [
+  "CloudsDepthSampler",
+  "CloudsSampler",
+  "DiffuseDepthSampler",
+  "DiffuseSampler",
+  "ItemEntityDepthSampler",
+  "ItemEntitySampler",
+  "ParticlesDepthSampler",
+  "ParticlesSampler",
+  "TranslucentDepthSampler",
+  "TranslucentSampler",
+  "WeatherDepthSampler",
+  "WeatherSampler"
+ ],
+ "blend": {
+  "func": "add",
+  "srcrgb": "one",
+  "dstrgb": "zero"
+ },
+ "name": "transparency",
+ "kind": "program",
+ "vertexSource": "screenquad",
+ "fragmentSource": "transparency"
+}

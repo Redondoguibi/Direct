@@ -1,0 +1,31 @@
+Calculating task graph as no cached configuration is available for tasks: captureAllocationBenchmark
+> Task :processTestResources NO-SOURCE
+> Task :configureNativeRenderer UP-TO-DATE
+> Task :generateModMetadata UP-TO-DATE
+> Task :buildNativeRenderer UP-TO-DATE
+> Task :processResources UP-TO-DATE
+> Task :createMinecraftArtifacts UP-TO-DATE
+> Task :compileJava UP-TO-DATE
+> Task :classes UP-TO-DATE
+> Task :compileTestJava UP-TO-DATE
+> Task :testClasses UP-TO-DATE
+
+> Task :captureAllocationBenchmark
+CAPTURE old=true bytes=8848000 ms=60.543 checksum=1 oldClassifications=32000
+CAPTURE old=false bytes=0 ms=79.015 checksum=1 oldClassifications=0
+CAPTURE old=true bytes=8848000 ms=82.438 checksum=1 oldClassifications=32000
+CAPTURE old=false bytes=0 ms=64.211 checksum=1 oldClassifications=0
+CAPTURE old=true bytes=8848000 ms=57.609 checksum=1 oldClassifications=32000
+CAPTURE old=false bytes=0 ms=52.444 checksum=1 oldClassifications=0
+
+[Incubating] Problems report is available at: file:///C:/Criando%20Mods/mod/Direct/build/reports/problems/problems-report.html
+
+Deprecated Gradle features were used in this build, making it incompatible with Gradle 10.
+
+You can use '--warning-mode all' to show the individual deprecation warnings and determine if they come from your own scripts or plugins.
+
+For more on this, please refer to https://docs.gradle.org/9.2.1/userguide/command_line_interface.html#sec:command_line_warnings in the Gradle documentation.
+
+BUILD SUCCESSFUL in 2s
+8 actionable tasks: 1 executed, 7 up-to-date
+Configuration cache entry stored.

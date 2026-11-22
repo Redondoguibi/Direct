@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuite name="com.redondoguibi.direct.NativeMaterialsInteropTest" tests="1" skipped="0" failures="1" errors="0" timestamp="2026-11-03T23:21:16.521Z" hostname="DESKTOP-1EOIJJB" time="0.806">
+  <properties/>
+  <testcase name="acquiredWrappedColorProbe()" classname="com.redondoguibi.direct.NativeMaterialsInteropTest" time="0.806">
+    <failure message="org.opentest4j.AssertionFailedError: expected: &lt;0.25&gt; but was: &lt;0.0&gt;" type="org.opentest4j.AssertionFailedError">org.opentest4j.AssertionFailedError: expected: &lt;0.25&gt; but was: &lt;0.0&gt;
+	at app//org.junit.jupiter.api.AssertionFailureBuilder.build(AssertionFailureBuilder.java:151)
+	at app//org.junit.jupiter.api.AssertionFailureBuilder.buildAndThrow(AssertionFailureBuilder.java:132)
+	at app//org.junit.jupiter.api.AssertEquals.failNotEqual(AssertEquals.java:197)
+	at app//org.junit.jupiter.api.AssertEquals.assertEquals(AssertEquals.java:86)
+	at app//org.junit.jupiter.api.AssertEquals.assertEquals(AssertEquals.java:81)
+	at app//org.junit.jupiter.api.Assertions.assertEquals(Assertions.java:1014)
+	at app//com.redondoguibi.direct.NativeMaterialsInteropTest.acquiredWrappedColorProbe(NativeMaterialsInteropTest.java:39)
+	at java.base@21.0.12.1/java.lang.reflect.Method.invoke(Method.java:580)
+	at java.base@21.0.12.1/java.util.ArrayList.forEach(ArrayList.java:1596)
+	at java.base@21.0.12.1/java.util.ArrayList.forEach(ArrayList.java:1596)
+</failure>
+  </testcase>
+  <system-out><![CDATA[Acquired depth width/format=0/0x1908
+]]></system-out>
+  <system-err><![CDATA[]]></system-err>
+</testsuite>

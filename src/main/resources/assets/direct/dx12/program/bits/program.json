@@ -1,0 +1,57 @@
+{
+ "inputs": [
+  {
+   "name": "Position",
+   "location": 0,
+   "type": "vec4"
+  }
+ ],
+ "cbufferSize": 96,
+ "uniforms": [
+  {
+   "name": "ProjMat",
+   "offset": 0,
+   "type": "mat4"
+  },
+  {
+   "name": "InSize",
+   "offset": 64,
+   "type": "vec2"
+  },
+  {
+   "name": "OutSize",
+   "offset": 72,
+   "type": "vec2"
+  },
+  {
+   "name": "Resolution",
+   "offset": 80,
+   "type": "float"
+  },
+  {
+   "name": "Saturation",
+   "offset": 84,
+   "type": "float"
+  },
+  {
+   "name": "MosaicSize",
+   "offset": 88,
+   "type": "float"
+  }
+ ],
+ "samplers": [
+  "DiffuseSampler"
+ ],
+ "usedSamplers": [
+  "DiffuseSampler"
+ ],
+ "blend": {
+  "func": "add",
+  "srcrgb": "srcalpha",
+  "dstrgb": "1-srcalpha"
+ },
+ "name": "bits",
+ "kind": "program",
+ "vertexSource": "sobel",
+ "fragmentSource": "bits"
+}
