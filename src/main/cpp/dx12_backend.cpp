@@ -24,6 +24,8 @@
 #include <unordered_map>
 #include <vector>
 
+#include "direct_shared.h"
+
 namespace {
 using Microsoft::WRL::ComPtr;
 
@@ -183,6 +185,7 @@ public:
         check(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator)), "CreateCommandAllocator");
         check(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.Get(), nullptr, IID_PPV_ARGS(&list)), "CreateCommandList");
         check(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence)), "CreateFence");
+        list->SetName(L"Direct backend list");
         event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
         heap(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, kViewRing, true, &views);
         heap(D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, kSamplerRing, true, &samplers);
@@ -409,6 +412,88 @@ public:
         return ok;
     }
 
+    // ---- Direct terrain -------------------------------------------------------------------------------------
+    // The hybrid terrain renderer shares this device (direct_shared.h) and renders on its own queue. This records the
+    // same composite Dx12GlInterop draws in OpenGL: terrain color blended over the framebuffer and, for a replacement
+    // frame, its depth written. The next flush makes this queue wait for the terrain frame's fence first.
+    // copy (shadow mode): OpenGL also composites this image through WGL/D3D11On12, which moves it through its own
+    // states on the terrain queue. The backend then reads copies made on that queue right after the terrain frame,
+    // before the WGL lock is submitted, instead of the shared image.
+    bool compositeTerrain(int fbo, UINT64 readyValue, bool writeDepth, bool copy) {
+        DirectTerrainOutput terrain{};
+        if (!directTerrainOutput(&terrain)) return false;
+        if (info) { terrain.color->SetName(L"Direct terrain color"); terrain.depth->SetName(L"Direct terrain depth"); }
+        ComPtr<ID3D12Device> owner;
+        if (FAILED(terrain.color->GetDevice(IID_PPV_ARGS(&owner))) || owner.Get() != device.Get())
+            throw std::runtime_error("the terrain renderer runs on another D3D12 device");
+        auto target = framebuffers.find(fbo);
+        if (fbo == 0 || target == framebuffers.end()) return false;
+        Texture* color = colorTarget(target->second.color);
+        Texture* depth = writeDepth ? depthTarget(target->second.depth) : nullptr;
+        if (!color || (writeDepth && !depth)) return false;
+        D3D12_SAMPLER_DESC pointClamp[kMaxTextures];
+        for (auto& desc : pointClamp) desc = samplerDesc(nullptr);
+        UINT samplerBase = samplerTable(pointClamp);
+        reserve(512, kMaxTextures);
+        ID3D12PipelineState* pso = compositePipeline(color->format, depth ? depth->format : DXGI_FORMAT_UNKNOWN);
+        ID3D12Resource* sourceColor = terrain.color;
+        ID3D12Resource* sourceDepth = terrain.depth;
+        if (copy) {
+            copyTerrain(terrain, readyValue);
+            sourceColor = copyColor.Get();
+            sourceDepth = copyDepth.Get();
+        } else {
+            pendingWaits.push_back({terrain.fence, readyValue});
+        }
+
+        UINT viewBase = allocateViews(kMaxTextures);
+        D3D12_SHADER_RESOURCE_VIEW_DESC view{};
+        view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        view.Texture2D.MipLevels = 1;
+        view.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        device->CreateShaderResourceView(sourceColor, &view, gpuViewCpu(viewBase));
+        view.Format = DXGI_FORMAT_R32_FLOAT;
+        device->CreateShaderResourceView(sourceDepth, &view, gpuViewCpu(viewBase + 1));
+        for (UINT i = 2; i < kMaxTextures; ++i)
+            device->CopyDescriptorsSimple(1, gpuViewCpu(viewBase + i), cpuView(nullView), D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        UINT64 constants = allocate(256, 256);
+        const UINT height = terrain.height;
+        std::memcpy(ringData + constants, &height, sizeof(height));
+
+        transition(*color, D3D12_RESOURCE_STATE_RENDER_TARGET);
+        if (depth) transition(*depth, D3D12_RESOURCE_STATE_DEPTH_WRITE);
+        D3D12_RESOURCE_BARRIER barriers[2]{};
+        for (auto& barrier : barriers) barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        const D3D12_RESOURCE_STATES read = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+        barriers[0].Transition = {terrain.color, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_RENDER_TARGET, read};
+        barriers[1].Transition = {terrain.depth, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_DEPTH_WRITE, read};
+        if (!copy) list->ResourceBarrier(2, barriers);
+        D3D12_CPU_DESCRIPTOR_HANDLE rtvHandle = rtv(*color), dsvHandle{};
+        if (depth) dsvHandle = dsv(*depth);
+        list->OMSetRenderTargets(1, &rtvHandle, FALSE, depth ? &dsvHandle : nullptr);
+        list->SetPipelineState(pso);
+        list->SetGraphicsRootSignature(root.Get());
+        ID3D12DescriptorHeap* heaps[] = {views.Get(), samplers.Get()};
+        list->SetDescriptorHeaps(2, heaps);
+        list->SetGraphicsRootConstantBufferView(0, ring->GetGPUVirtualAddress() + constants);
+        list->SetGraphicsRootDescriptorTable(1, gpuView(viewBase));
+        list->SetGraphicsRootDescriptorTable(2, gpuSampler(samplerBase));
+        D3D12_VIEWPORT viewport{0, 0, static_cast<float>(terrain.width), static_cast<float>(terrain.height), 0, 1};
+        D3D12_RECT scissor{0, 0, static_cast<LONG>(color->width), static_cast<LONG>(color->height)};
+        list->RSSetViewports(1, &viewport);
+        list->RSSetScissorRects(1, &scissor);
+        list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        list->DrawInstanced(3, 1, 0, 0);
+        for (auto& barrier : barriers) std::swap(barrier.Transition.StateBefore, barrier.Transition.StateAfter);
+        if (!copy) list->ResourceBarrier(2, barriers);
+        ++terrainComposites;
+        return true;
+    }
+    UINT64 terrainCompositeCount() const { return terrainComposites; }
+
+    ID3D12Device* deviceRef() { device->AddRef(); return device.Get(); }
+
     // ---- Programs and draws ---------------------------------------------------------------------------------
     int createProgram(const std::string& name, const std::string& vertex, const std::string& fragment,
             UINT cbufferBytes, UINT textureCount, std::string& error) {
@@ -598,7 +683,8 @@ public:
         list->ResourceBarrier(1, &barrier);
         flush();
         check(swapChain->Present(vsync ? 1 : 0, !vsync && chainFlags ? DXGI_PRESENT_ALLOW_TEARING : 0), "Present");
-        if (!verify || texture.width != width || texture.height != height || texture.format != DXGI_FORMAT_R8G8B8A8_UNORM) return -1;
+        // A hidden window shows nothing to compare against.
+        if (!verify || !IsWindowVisible(window) || texture.width != width || texture.height != height || texture.format != DXGI_FORMAT_R8G8B8A8_UNORM) return -1;
         std::vector<uint8_t> pixels(static_cast<size_t>(width) * height * 4);
         readback(id, pixels.data(), pixels.size());
         DwmFlush();
@@ -652,6 +738,8 @@ public:
     // Executes everything recorded so far and waits; the shadow backend is synchronous by design.
     void flush() {
         check(list->Close(), "Close");
+        for (const auto& wait : pendingWaits) check(queue->Wait(wait.fence.Get(), wait.value), "queue Wait");
+        pendingWaits.clear();
         ID3D12CommandList* lists[] = {list.Get()};
         queue->ExecuteCommandLists(1, lists);
         check(queue->Signal(fence.Get(), ++fenceValue), "Signal");
@@ -702,6 +790,129 @@ private:
     std::vector<ComPtr<ID3D12Resource>> retired;
     UINT64 drawCount = 0;
     std::string pendingMessages;
+    struct QueueWait { ComPtr<ID3D12Fence> fence; UINT64 value; };
+    std::vector<QueueWait> pendingWaits;
+    UINT64 terrainComposites = 0;
+    // Shadow-mode terrain copies (compositeTerrain with copy), recorded for the terrain queue. Both stay in
+    // PIXEL_SHADER_RESOURCE outside the copy list.
+    ComPtr<ID3D12CommandAllocator> copyAllocator;
+    ComPtr<ID3D12GraphicsCommandList> copyList;
+    ComPtr<ID3D12Fence> copyFence;
+    UINT64 copyValue = 0;
+    ComPtr<ID3D12Resource> copyColor, copyDepth;
+
+    void copyTerrain(const DirectTerrainOutput& terrain, UINT64 readyValue) {
+        if (!copyFence) {
+            check(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&copyFence)), "copy fence");
+            check(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&copyAllocator)), "copy allocator");
+            check(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, copyAllocator.Get(), nullptr, IID_PPV_ARGS(&copyList)), "copy list");
+            copyList->SetName(L"Direct backend terrain copy");
+            check(copyList->Close(), "copy list Close");
+        }
+        auto colorDesc = terrain.color->GetDesc(), depthDesc = terrain.depth->GetDesc();
+        if (!copyColor || copyColor->GetDesc().Width != colorDesc.Width || copyColor->GetDesc().Height != colorDesc.Height) {
+            D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_DEFAULT};
+            colorDesc.Flags = depthDesc.Flags = D3D12_RESOURCE_FLAG_NONE;
+            const D3D12_RESOURCE_STATES read = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+            copyColor.Reset();
+            copyDepth.Reset();
+            check(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &colorDesc, read, nullptr, IID_PPV_ARGS(&copyColor)), "terrain color copy");
+            check(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &depthDesc, read, nullptr, IID_PPV_ARGS(&copyDepth)), "terrain depth copy");
+        }
+        // The previous copy list must have run before its allocator is reused.
+        if (copyFence->GetCompletedValue() < copyValue) {
+            check(copyFence->SetEventOnCompletion(copyValue, event), "copy fence event");
+            if (WaitForSingleObject(event, 10000) != WAIT_OBJECT_0) throw std::runtime_error("terrain copy timed out");
+        }
+        check(copyAllocator->Reset(), "copy allocator Reset");
+        check(copyList->Reset(copyAllocator.Get(), nullptr), "copy list Reset");
+        D3D12_RESOURCE_BARRIER barriers[4]{};
+        for (auto& barrier : barriers) barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        const D3D12_RESOURCE_STATES read = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+        barriers[0].Transition = {terrain.color, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE};
+        barriers[1].Transition = {terrain.depth, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_COPY_SOURCE};
+        barriers[2].Transition = {copyColor.Get(), D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, read, D3D12_RESOURCE_STATE_COPY_DEST};
+        barriers[3].Transition = {copyDepth.Get(), D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, read, D3D12_RESOURCE_STATE_COPY_DEST};
+        copyList->ResourceBarrier(4, barriers);
+        copyList->CopyResource(copyColor.Get(), terrain.color);
+        copyList->CopyResource(copyDepth.Get(), terrain.depth);
+        for (auto& barrier : barriers) std::swap(barrier.Transition.StateBefore, barrier.Transition.StateAfter);
+        copyList->ResourceBarrier(4, barriers);
+        check(copyList->Close(), "copy list Close");
+        // Terrain queue: after the terrain frame, before anything the CPU submits to it later (the WGL lock).
+        check(terrain.queue->Wait(terrain.fence, readyValue), "terrain queue Wait");
+        ID3D12CommandList* lists[] = {copyList.Get()};
+        terrain.queue->ExecuteCommandLists(1, lists);
+        check(terrain.queue->Signal(copyFence.Get(), ++copyValue), "terrain queue Signal");
+        pendingWaits.push_back({copyFence, copyValue});
+    }
+    std::unordered_map<int, ComPtr<ID3D12PipelineState>> compositePsos;
+
+    // Terrain composite (Dx12GlInterop.FRAGMENT_SHADER): the terrain image has top-down rows, this framebuffer
+    // OpenGL's bottom-up rows, so pixel row y reads terrain row height - 1 - y.
+    ID3D12PipelineState* compositePipeline(DXGI_FORMAT colorFormat, DXGI_FORMAT depthFormat) {
+        int key = static_cast<int>(colorFormat) * 1000 + static_cast<int>(depthFormat);
+        auto found = compositePsos.find(key);
+        if (found != compositePsos.end()) return found->second.Get();
+        static const char source[] = R"(
+Texture2D<float4> TerrainColor : register(t0);
+Texture2D<float> TerrainDepth : register(t1);
+cbuffer Frame : register(b0) { uint TerrainHeight; };
+struct V { float4 position : SV_Position; };
+V vs(uint id : SV_VertexID) {
+    V v;
+    float2 corner = float2((id << 1) & 2, id & 2);
+    v.position = float4(corner * 2 - 1, 0, 1);
+    return v;
+}
+int3 texel(float4 position) { return int3(int(position.x), int(TerrainHeight) - 1 - int(position.y), 0); }
+float4 colorOnly(V v) : SV_Target0 { return TerrainColor.Load(texel(v.position)); }
+float4 withDepth(V v, out float depth : SV_Depth) : SV_Target0 {
+    float4 color = TerrainColor.Load(texel(v.position));
+    depth = TerrainDepth.Load(texel(v.position));
+    if (depth >= 1.0 && color.a <= 0.0) discard;
+    return color;
+}
+)";
+        bool writeDepth = depthFormat != DXGI_FORMAT_UNKNOWN;
+        ComPtr<ID3DBlob> vs, ps, log;
+        if (FAILED(D3DCompile(source, sizeof(source) - 1, "terrain composite", nullptr, nullptr, "vs", "vs_5_1",
+                    D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &vs, &log))
+                || FAILED(D3DCompile(source, sizeof(source) - 1, "terrain composite", nullptr, nullptr,
+                    writeDepth ? "withDepth" : "colorOnly", "ps_5_1", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &ps, &log)))
+            throw std::runtime_error(std::string("terrain composite shader: ")
+                    + (log ? static_cast<const char*>(log->GetBufferPointer()) : "D3DCompile failed"));
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC desc{};
+        desc.pRootSignature = root.Get();
+        desc.VS = {vs->GetBufferPointer(), vs->GetBufferSize()};
+        desc.PS = {ps->GetBufferPointer(), ps->GetBufferSize()};
+        auto& blend = desc.BlendState.RenderTarget[0];
+        blend.BlendEnable = TRUE;
+        blend.SrcBlend = D3D12_BLEND_SRC_ALPHA;
+        blend.DestBlend = D3D12_BLEND_INV_SRC_ALPHA;
+        blend.BlendOp = D3D12_BLEND_OP_ADD;
+        blend.SrcBlendAlpha = D3D12_BLEND_ONE;
+        blend.DestBlendAlpha = D3D12_BLEND_INV_SRC_ALPHA;
+        blend.BlendOpAlpha = D3D12_BLEND_OP_ADD;
+        blend.LogicOp = D3D12_LOGIC_OP_NOOP;
+        blend.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+        desc.SampleMask = UINT_MAX;
+        desc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+        desc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+        desc.RasterizerState.DepthClipEnable = TRUE;
+        desc.DepthStencilState.DepthEnable = writeDepth ? TRUE : FALSE;
+        desc.DepthStencilState.DepthWriteMask = writeDepth ? D3D12_DEPTH_WRITE_MASK_ALL : D3D12_DEPTH_WRITE_MASK_ZERO;
+        desc.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+        desc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+        desc.NumRenderTargets = 1;
+        desc.RTVFormats[0] = colorFormat;
+        desc.DSVFormat = writeDepth ? depthViewFormat(depthFormat) : DXGI_FORMAT_UNKNOWN;
+        desc.SampleDesc.Count = 1;
+        ComPtr<ID3D12PipelineState> pso;
+        HRESULT result = device->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&pso));
+        if (FAILED(result)) throw std::runtime_error("terrain composite pipeline failed" + debugMessages());
+        return (compositePsos[key] = pso).Get();
+    }
     struct Page { ComPtr<ID3D12Resource> buffer; UINT64 bytes = 0; std::map<UINT64, UINT64> free;
                   D3D12_RESOURCE_STATES state = D3D12_RESOURCE_STATE_COMMON; };
     static constexpr D3D12_RESOURCE_STATES kMeshRead = D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER | D3D12_RESOURCE_STATE_INDEX_BUFFER;
@@ -997,6 +1208,7 @@ float4 ps(V v) : SV_Target0 { return float4(Source.SampleLevel(Point, v.uv, 0).r
         if (depth) clear.DepthStencil.Depth = 1.0f;
         check(device->CreateCommittedResource(&heapProps, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON,
                 &clear, IID_PPV_ARGS(&texture.resource)), "texture");
+        if (info) texture.resource->SetName((L"Direct backend texture " + std::to_wstring(width) + L"x" + std::to_wstring(height)).c_str());
         texture.state = D3D12_RESOURCE_STATE_COMMON;
         texture.format = format;
         texture.depth = depth;
@@ -1249,6 +1461,18 @@ BACKEND(meshDelete) void JNICALL JNI_NAME(meshDelete)(JNIEnv* env, jclass, jint 
     guarded(env, [&] { g_backend->meshDelete(id); });
 }
 BACKEND(meshBytes) jlong JNICALL JNI_NAME(meshBytes)(JNIEnv*, jclass) { return g_backend ? static_cast<jlong>(g_backend->meshBytes()) : 0; }
+BACKEND(compositeTerrain) jboolean JNICALL JNI_NAME(compositeTerrain)(JNIEnv* env, jclass, jint fbo, jlong readyValue,
+        jboolean writeDepth, jboolean copy) {
+    jboolean done = JNI_FALSE;
+    guarded(env, [&] {
+        done = g_backend->compositeTerrain(fbo, static_cast<UINT64>(readyValue), writeDepth == JNI_TRUE, copy == JNI_TRUE)
+                ? JNI_TRUE : JNI_FALSE;
+    });
+    return done;
+}
+BACKEND(terrainComposites) jlong JNICALL JNI_NAME(terrainComposites)(JNIEnv*, jclass) {
+    return g_backend ? static_cast<jlong>(g_backend->terrainCompositeCount()) : 0;
+}
 BACKEND(meshGpuRead) jint JNICALL JNI_NAME(meshGpuRead)(JNIEnv* env, jclass, jint id, jint which, jobject out) {
     jint bytes = 0;
     guarded(env, [&] {
@@ -1310,3 +1534,5 @@ BACKEND(readback) void JNICALL JNI_NAME(readback)(JNIEnv* env, jclass, jint text
                 static_cast<UINT64>(env->GetDirectBufferCapacity(out)));
     });
 }
+
+ID3D12Device* directBackendDevice() { return g_backend ? g_backend->deviceRef() : nullptr; }

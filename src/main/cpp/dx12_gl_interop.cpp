@@ -29,6 +29,8 @@
 #include <unordered_set>
 #include <vector>
 
+#include "direct_shared.h"
+
 #include "bc7_encoder.h"
 
 namespace {
@@ -2392,7 +2394,10 @@ bool initializeInteropRenderer(InteropRenderer* renderer, jint width, jint heigh
     renderer->visible.reserve(256);
     renderer->sectionList.reserve(256);
     renderer->sectionIndices.reserve(256);
-    if (FAILED(D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&renderer->device)))) {
+    // With the DX12 backend running, share its device: the backend then composites the terrain image directly.
+    renderer->device = directBackendDevice();
+    if (renderer->device == nullptr
+            && FAILED(D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&renderer->device)))) {
         throwJava(env, "DX12/OpenGL interop could not create a Direct3D 12 device.");
         return false;
     }
@@ -4996,3 +5001,15 @@ extern "C" JNIEXPORT jboolean JNICALL Java_com_redondoguibi_direct_NativeDx12_is
 }
 
 #include "phase0_frame.inl"
+
+bool directTerrainOutput(DirectTerrainOutput* out) {
+    InteropRenderer* r = g_interopRenderer;
+    if (r == nullptr || r->colorTarget == nullptr || r->depthTarget == nullptr || r->fence == nullptr) return false;
+    out->color = r->colorTarget;
+    out->depth = r->depthTarget;
+    out->fence = r->fence;
+    out->queue = r->queue;
+    out->width = r->width;
+    out->height = r->height;
+    return true;
+}

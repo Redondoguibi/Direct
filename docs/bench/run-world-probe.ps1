@@ -14,7 +14,9 @@ param(
     [switch] $Trace,
     [switch] $Present,
     [switch] $SkipGl,
-    [switch] $VerifyMeshes
+    [switch] $VerifyMeshes,
+    [switch] $DirectTerrain,
+    [switch] $Hidden
 )
 $ErrorActionPreference = "Stop"
 $project = Split-Path (Split-Path $PSScriptRoot -Parent) -Parent
@@ -33,6 +35,9 @@ Copy-Item -LiteralPath "$Source/saves/$World" -Destination "$case/saves/$World" 
 $options = Get-Content -LiteralPath "$Source/options.txt" | Where-Object { $_ -notmatch '^(fullscreen|pauseOnLostFocus|onboardAccessibility):' }
 ($options + @('fullscreen:false', 'pauseOnLostFocus:false', 'onboardAccessibility:false')) |
     Set-Content -LiteralPath "$case/options.txt" -Encoding ascii
+# -DirectTerrain: Direct's DX12 terrain replaces vanilla terrain (the hybrid mode); the backend composites it itself.
+New-Item -ItemType Directory -Path "$case/config" -Force | Out-Null
+"enableDx12Preview = $(if ($DirectTerrain) { 'true' } else { 'false' })" | Set-Content -LiteralPath "$case/config/direct-client.toml" -Encoding ascii
 $jvmArgs = @('-Xmx3G', '-Ddirect.phase1.shadow=true', '-Ddirect.phase1.probe=true', '-Ddirect.phase2.world=true', "@`"$clientcp`"",
     "@`"$moddev/clientRunVmArgs.txt`"", 'net.neoforged.devlaunch.Main', "@`"$moddev/clientRunProgramArgs.txt`"",
     '--quickPlaySingleplayer', $World, '--width', "$Width", '--height', "$Height", '--username', 'Dev')
@@ -53,8 +58,8 @@ public delegate bool Callback(IntPtr handle, IntPtr data);
 public static void Hide(uint pid) { EnumWindows((h, d) => { uint id; GetWindowThreadProcessId(h, out id); if (id == pid && IsWindowVisible(h)) ShowWindowAsync(h, 0); return true; }, IntPtr.Zero); }
 "@ -ErrorAction SilentlyContinue
 $end = (Get-Date).AddSeconds($TimeoutSeconds)
-# Present mode checks the desktop, so its window stays visible.
-while (!$client.HasExited -and (Get-Date) -lt $end) { if (!$Present) { [DirectBench.WorldWindow]::Hide($client.Id) }; Start-Sleep -Milliseconds 250 }
+# Present mode checks the desktop, so its window stays visible unless -Hidden (no desktop check then).
+while (!$client.HasExited -and (Get-Date) -lt $end) { if (!$Present -or $Hidden) { [DirectBench.WorldWindow]::Hide($client.Id) }; Start-Sleep -Milliseconds 250 }
 if (!$client.HasExited) { $client.Kill(); Write-Output "Timed out" }
 $log = "$case/logs/latest.log"
 Write-Output "Results in $case"

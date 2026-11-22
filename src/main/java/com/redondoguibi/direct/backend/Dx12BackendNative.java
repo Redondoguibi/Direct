@@ -40,6 +40,14 @@ final class Dx12BackendNative {
     /** glBlitFramebuffer of whole, equally sized attachments. rect = src x0,y0,x1,y1, dst x0,y0,x1,y1. @return false if unsupported */
     static native boolean blit(int readFramebuffer, int drawFramebuffer, int[] rect, int mask);
 
+    /**
+     * Records the Direct terrain composite (as Dx12GlInterop draws it in OpenGL) into a framebuffer; the next flush
+     * waits on the GPU for the terrain frame's fence to reach readyValue. copy: read copies made on the terrain queue
+     * (needed while OpenGL also composites the shared image). @return false without a terrain image
+     */
+    static native boolean compositeTerrain(int framebuffer, long readyValue, boolean writeDepth, boolean copy);
+    static native long terrainComposites();
+
     static native int createProgram(String name, byte[] vertexHlsl, byte[] fragmentHlsl, int cbufferBytes, int textures);
 
     /**

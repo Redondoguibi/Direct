@@ -43,7 +43,7 @@ final class Dx12ShadowProbe {
     /** A world scene: entered once, then the camera is held at (yaw, pitch) until {@code settleMillis} have passed. */
     private record Scene(String name, Runnable enter, float pitch, long settleMillis) {}
     private static final List<Scene> SCENES = new ArrayList<>();
-    private static long joined, entered;
+    private static long joined, entered, sceneFrames;
     private static float yaw;
     private static final List<Step> STEPS = new ArrayList<>();
     private static int step = -1, frames, samples;
@@ -110,7 +110,8 @@ final class Dx12ShadowProbe {
             if (mc.screen != null) return;
             if (joined == 0) joined = now;
             // Terrain first: every section compiled, at least 20 s in, or 120 s at most.
-            boolean loaded = mc.levelRenderer.hasRenderedAllSections() && now - joined > 20_000;
+            boolean loaded = mc.levelRenderer.hasRenderedAllSections() && now - joined > 20_000
+                    && (!com.redondoguibi.direct.ClientConfig.ENABLE_DX12.get() || com.redondoguibi.direct.Dx12GlInterop.terrainReplaced());
             if (!loaded && now - joined < 120_000) return;
             yaw = player.getYRot();
             var server = mc.getSingleplayerServer();
@@ -140,8 +141,9 @@ final class Dx12ShadowProbe {
                 mc.setScreen(new net.minecraft.client.gui.screens.inventory.InventoryScreen(player));
             }, 0, 2_000));
             SCENES.add(new Scene("world-pause", () -> mc.setScreen(new net.minecraft.client.gui.screens.PauseScreen(true)), 0, 2_000));
-            Direct.LOGGER.info("Direct phase2 world ready after {} ms, {} sections rendered", now - joined,
-                    mc.levelRenderer.countRenderedSections());
+            Direct.LOGGER.info("Direct phase2 world ready after {} ms, {} sections rendered, Direct terrain {}", now - joined,
+                    mc.levelRenderer.countRenderedSections(),
+                    com.redondoguibi.direct.ClientConfig.ENABLE_DX12.get() ? (com.redondoguibi.direct.Dx12GlInterop.terrainReplaced() ? "replacing vanilla" : "NOT active") : "off");
             step = 0;
             samples = 0;
             entered = now;
@@ -152,8 +154,12 @@ final class Dx12ShadowProbe {
         player.yRotO = yaw;
         player.setXRot(scene.pitch);
         player.xRotO = scene.pitch;
+        sceneFrames++;
         if (now - entered < scene.settleMillis) return;
         String name = scene.name + "-" + samples;
+        // Rough rate while the scene settled (window size, synchronous backend; not a benchmark).
+        if (samples == 0) Direct.LOGGER.info("Direct phase2 scene {} settled at {} FPS", scene.name,
+                String.format(Locale.ROOT, "%.1f", sceneFrames * 1000.0 / Math.max(1, now - entered)));
         if (Dx12Shadow.presenting()) { verifyNext = true; verifyName = name; }
         if (!Dx12Shadow.SKIP_GL) compare(mc, name);
         else if (name.endsWith("-0")) dx12Only(mc, name);
@@ -166,6 +172,7 @@ final class Dx12ShadowProbe {
         }
         samples = 0;
         entered = now;
+        sceneFrames = 0;
         SCENES.get(step).enter.run();
     }
 
@@ -216,16 +223,17 @@ final class Dx12ShadowProbe {
             long pixels = (long) width * height;
             boolean[] mask = new boolean[width * height];
             long unexplained = unexplained(gl, dx, width, height, mask);
+            int blocks = solidBlocks(mask, width, height);
             int cluster = largestCluster(mask, width, height);
             // Menus: fewer than 0.1% of pixels more than 2/255 apart. World: differences a one-pixel shift cannot explain
-            // (sample points exactly on triangle or texel borders, and the crack sparkles between cloud quads, land on
-            // different pixels in each API) stay isolated: at most 4 connected pixels, under 0.1% of the image. A missing
-            // or misplaced object leaves a larger cluster.
-            boolean pass = WORLD ? cluster <= 4 && unexplained * 1000 < pixels : over2 * 1000 < pixels;
+            // (sample points exactly on triangle or texel borders, and the crack sparkles along cloud quad seams, land on
+            // different pixels in each API) are dots and one-pixel lines: no 2x2 block of them, no group over 16 pixels,
+            // under 0.1% of the image. A missing or misplaced object leaves an area.
+            boolean pass = WORLD ? blocks == 0 && cluster <= 16 && unexplained * 1000 < pixels : over2 * 1000 < pixels;
             failed |= !pass;
-            String line = String.format(Locale.ROOT, " %s(max=%d, differing=%.3f%%, over2=%.3f%%, over8=%.3f%%, unexplained=%d, cluster=%d, calls=%d/%d/%d)",
-                    name, max, 100.0 * differing / pixels, 100.0 * over2 / pixels, 100.0 * over8 / pixels, unexplained, cluster,
-                    Dx12Shadow.lastCalls, Dx12Shadow.lastDraws, Dx12Shadow.lastNative);
+            String line = String.format(Locale.ROOT, " %s(max=%d, differing=%.3f%%, over2=%.3f%%, over8=%.3f%%, unexplained=%d, blocks=%d, cluster=%d, calls=%d/%d/%d, terrain=%d)",
+                    name, max, 100.0 * differing / pixels, 100.0 * over2 / pixels, 100.0 * over8 / pixels, unexplained, blocks, cluster,
+                    Dx12Shadow.lastCalls, Dx12Shadow.lastDraws, Dx12Shadow.lastNative, Dx12Shadow.lastTerrain);
             summary.append(line);
             Direct.LOGGER.info("Direct phase1 shadow check {}x{}{} {}", width, height, line, pass ? "PASS" : "FAIL");
             if (name.endsWith("-0")) write(mc, name, width, height, gl, dx);
@@ -254,6 +262,16 @@ final class Dx12ShadowProbe {
             }
         }
         return count;
+    }
+
+    /** 2x2 blocks whose four pixels are all marked: area, not a one-pixel line. */
+    private static int solidBlocks(boolean[] mask, int width, int height) {
+        int blocks = 0;
+        for (int y = 0; y + 1 < height; y++) for (int x = 0; x + 1 < width; x++) {
+            int i = y * width + x;
+            if (mask[i] && mask[i + 1] && mask[i + width] && mask[i + width + 1]) blocks++;
+        }
+        return blocks;
     }
 
     /** Largest 8-connected group of marked pixels. */

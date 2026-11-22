@@ -75,7 +75,7 @@ public final class Dx12Shadow {
     // ---- Statistics --------------------------------------------------------------------------------------------
     static long draws, skippedDraws, errors;
     /** Per frame: VertexBuffer.draw calls, draws handed to native, and the native count at frame start. */
-    static int frameCalls, frameDraws, lastCalls, lastDraws;
+    static int frameCalls, frameDraws, lastCalls, lastDraws, frameTerrain, lastTerrain;
     static long nativeAtFrameStart, lastNative;
     // ---- Trace (-Ddirect.phase1.trace=true): every clear and draw of the current frame ----------------------------
     static final boolean TRACE = Boolean.getBoolean("direct.phase1.trace");
@@ -384,6 +384,25 @@ public final class Dx12Shadow {
         mesh.id = 0;
     }
 
+    /**
+     * Dx12GlInterop.resolvePendingFrame: the Direct terrain frame {@code readyValue} is composited into the bound
+     * framebuffer, as the OpenGL composite does. The terrain renderer shares this backend's device.
+     * @return true when recorded
+     */
+    public static boolean compositeTerrain(long readyValue, boolean writeDepth) {
+        if (!live()) return false;
+        try {
+            if (TRACE) trace.append(String.format("terrain fbo=%d ready=%d writeDepth=%s%n", drawFramebuffer, readyValue, writeDepth));
+            // OpenGL also composites the shared image unless DX12 renders alone.
+            boolean done = Dx12BackendNative.compositeTerrain(drawFramebuffer, readyValue, writeDepth, !(SKIP_GL && presenting()));
+            if (done) frameTerrain++;
+            return done;
+        } catch (RuntimeException ex) {
+            fail("compositeTerrain", ex);
+            return false;
+        }
+    }
+
     /** GlStateManager._glBlitFrameBuffer (RenderTarget.copyDepthFrom). */
     public static void blitFramebuffer(int sx0, int sy0, int sx1, int sy1, int dx0, int dy0, int dx1, int dy1, int mask) {
         if (!live()) return;
@@ -608,6 +627,8 @@ public final class Dx12Shadow {
         frameIndex++;
         lastCalls = frameCalls;
         lastDraws = frameDraws;
+        lastTerrain = frameTerrain;
+        frameTerrain = 0;
         long nativeNow = Dx12BackendNative.draws();
         lastNative = nativeNow - nativeAtFrameStart;
         nativeAtFrameStart = nativeNow;

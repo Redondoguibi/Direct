@@ -76,7 +76,11 @@ A fase 0 passou nos três portões (22/11/2026): apresentação DXGI estável na
 
 A fase 1 passou (22/11/2026). O título e cinco menus foram renderizados pelo backend DX12 com pixels iguais aos do OpenGL (diferença máxima de 1/255 nos menus; no título, só nas bordas do texto girado). Com os desenhos do OpenGL cancelados e a apresentação pelo DXGI, a tela mostrou a imagem do DX12 em 18 de 18 verificações. Detalhes em [fase1-dx12-total.md](fase1-dx12-total.md).
 
-A fase 2 está em andamento (22/11/2026); detalhes em [fase2-dx12-total.md](fase2-dx12-total.md).
+A fase 2 passou (22/11/2026). O mundo inteiro passa pelo backend DX12 sobre o terreno DX12 do Direct:
+- o renderizador de terreno usa o dispositivo do backend;
+- uma fence sincroniza as duas filas;
+- o composite é feito em DX12.
 
-- **Pronto e aprovado no portão:** o mundo vanilla inteiro passa pelo backend DX12, com pixels equivalentes aos do OpenGL em 11 cenas fixas: terreno, céu, nuvens, entidades, mão, contorno, quebra de blocos, partículas, HUD, inventário e pausa.
-- **Falta:** pôr o terreno DX12 do Direct sob esses desenhos. Isso pede o mesmo dispositivo D3D12 para o terreno e o backend, uma fence entre as filas e um composite em DX12 no lugar do composite OpenGL.
+Em 11 cenas fixas, os pixels ficaram equivalentes aos do vanilla (terreno vanilla) e aos do modo híbrido (terreno do Direct). No modo só DX12, nada da cena passa pelo OpenGL. Detalhes em [fase2-dx12-total.md](fase2-dx12-total.md).
+
+Próximo: fase 3. O grafo de mundo, a transparência e as sombras dos packs (Lus/Solaris) passam a ler a cena direto do backend, e o FPS é medido contra o Sodium + Iris + Mellow.

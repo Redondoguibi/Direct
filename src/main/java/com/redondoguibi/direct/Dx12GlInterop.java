@@ -966,7 +966,17 @@ public final class Dx12GlInterop {
             NativeDx12.signalInteropFence(readyValue);
             return;
         }
-        drawImportedTexture(useGpuSemaphore, frame);
+        // DX12 backend (-Ddirect.phase1.shadow): the same composite, recorded in DX12 from the shared device.
+        boolean backendComposite = com.redondoguibi.direct.backend.Dx12Shadow.ENABLED
+                && com.redondoguibi.direct.backend.Dx12Shadow.compositeTerrain(readyValue, replacementFrame && shouldCompositeBeforeVanilla());
+        if (backendComposite && com.redondoguibi.direct.backend.Dx12Shadow.SKIP_GL
+                && com.redondoguibi.direct.backend.Dx12Shadow.presenting()) {
+            // DX12 alone renders: no WGL lock and no OpenGL draw. The backend executes its composite at the end of
+            // this frame, before the next terrain frame is submitted, so the image may be released now.
+            NativeDx12.signalInteropFence(readyValue);
+        } else {
+            drawImportedTexture(useGpuSemaphore, frame);
+        }
         lastFrameSucceeded = true;
         if (replacementFrame) reportActivation();
         // A successful submit is not proof of recovery: count only imported frames.
@@ -988,6 +998,11 @@ public final class Dx12GlInterop {
      * Allows the LevelRenderer mixin to skip only the three base chunk layers Direct can reproduce.
      * Vanilla remains active until the capture queue has drained and a successful DX12 frame exists.
      */
+    /** For the backend world probe: Direct draws the whole visible terrain (no section left on vanilla). */
+    public static boolean terrainReplaced() {
+        return initialized && !disabled && lastFrameSucceeded && replacementFrame && fallbackSections == 0;
+    }
+
     public static boolean shouldSkipVanillaLayer(net.minecraft.client.renderer.RenderType layer) {
         if (!ClientConfig.REPLACE_VANILLA_TERRAIN.get() || !initialized || disabled
                 || ClientConfig.TERRAIN_RENDER_DISTANCE_PERCENT.get() < 100
