@@ -207,6 +207,7 @@ public final class TerrainMeshStore {
         }
         if (NativeLibrary.isLoaded()) {
             NativeDx12.clearTerrain();
+            if (Phase0Capture.ENABLED) Phase0Capture.clear();
         }
     }
 
@@ -317,6 +318,8 @@ public final class TerrainMeshStore {
                 rejectedMeshBytes.remove(update.key());
                 OWNERSHIP.nativeUploaded(update.key(),update.receipt());
             }
+            if (Phase0Capture.ENABLED) Phase0Capture.section(update.key(), update.sectionX(), update.sectionY(),
+                    update.sectionZ(), update.vertices(), update.indices(), update.layerIndexCounts());
             uploaded++;
             uploadedBytes += update.byteSize();
         }

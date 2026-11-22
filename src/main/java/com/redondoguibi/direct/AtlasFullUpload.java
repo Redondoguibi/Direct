@@ -150,7 +150,9 @@ final class AtlasFullUpload {
         encoding = null;
         if (encodingGeneration != generation) return false;
         long started = System.nanoTime();
-        NativeDx12.updateTerrainAtlas(done.join(), baseWidth, baseHeight, compress, threads, compress);
+        ByteBuffer[] levels = done.join();
+        NativeDx12.updateTerrainAtlas(levels, baseWidth, baseHeight, compress, threads, compress);
+        if (Phase0Capture.ENABLED) Phase0Capture.atlas(levels, baseWidth, baseHeight, compress);
         renderThreadNanos += System.nanoTime() - started;
         return true;
     }

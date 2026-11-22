@@ -50,7 +50,9 @@ final class AtlasRegionUpdates {
                 NativeDx12.encodeAtlasRegion(pixels, encoded, width, height, threads);
             }
             @Override public boolean upload(ByteBuffer data, int level, int x, int y, int width, int height) {
-                return NativeDx12.updateAtlasRegion(data, level, x, y, width, height);
+                boolean uploaded = NativeDx12.updateAtlasRegion(data, level, x, y, width, height);
+                if (Phase0Capture.ENABLED && uploaded) Phase0Capture.patch(data, level, x, y, width, height);
+                return uploaded;
             }
         };
     }

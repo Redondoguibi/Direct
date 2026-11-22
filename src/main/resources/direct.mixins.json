@@ -12,7 +12,8 @@
     "SpriteContentsMixin",
     "NativeImageAccessor",
     "LightTextureMixin",
-    "WindowMixin"
+    "WindowMixin",
+    "PhaseZeroWindowMixin"
   ],
   "injectors": {
     "defaultRequire": 1

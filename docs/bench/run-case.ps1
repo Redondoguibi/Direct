@@ -6,7 +6,8 @@ param(
     [Parameter(Mandatory)] [string] $Label,
     [string] $World = "bench",
     [int] $Windows = 3,
-    [int] $TimeoutMinutes = 7
+    [int] $TimeoutMinutes = 7,
+    [switch] $CapturePhase0
 )
 $ErrorActionPreference = "Stop"
 $direct = Split-Path (Split-Path $PSScriptRoot -Parent) -Parent
@@ -17,6 +18,8 @@ $classpath = Join-Path $Root "clientcp"
 $arguments = @('-Xmx3G', "@$classpath", "@`"$moddev\clientRunVmArgs.txt`"", 'net.neoforged.devlaunch.Main',
     "@`"$moddev\clientRunProgramArgs.txt`"", '--quickPlaySingleplayer', $World, '--width', '1920', '--height', '1080',
     '--username', 'Dev')
+if ($CapturePhase0) { $arguments = @('-Ddirect.phase0.capture=true') + $arguments }
+if (Test-Path (Join-Path $case 'logs\bench-fps.csv')) { throw "Use a fresh benchmark case ($Label already has samples)" }
 $game = Start-Process java -WindowStyle Hidden -ArgumentList $arguments -WorkingDirectory $case `
     -RedirectStandardOutput "$case.out" -RedirectStandardError "$case.err" -PassThru
 

@@ -589,6 +589,11 @@ struct RecordWorker {
 struct InteropRenderer {
     UINT width;
     UINT height;
+    // An isolated D3D12-only replay never creates a D3D11On12 device or shares a surface.
+    bool phase0Replay;
+    ID3D12PipelineState* phase0Gui;
+    ID3D12QueryHeap* phase0Queries;
+    ID3D12Resource* phase0Times;
     UINT64 lastSignaledValue;
     UINT64 lastQueuedGlDoneValue;
     ID3D12Device* device;
@@ -1267,7 +1272,7 @@ void releaseSizeResources(InteropRenderer* renderer) {
     release(renderer->interopTexture);
 }
 
-bool createSizeResources(InteropRenderer* renderer, JNIEnv* env) {
+bool createInteropTextures(InteropRenderer* renderer, JNIEnv* env) {
     D3D11_TEXTURE2D_DESC color = {};
     color.Width = renderer->width;
     color.Height = renderer->height;
@@ -1287,6 +1292,41 @@ bool createSizeResources(InteropRenderer* renderer, JNIEnv* env) {
         throwJava(env, "Could not create the shared terrain depth image.");
         return false;
     }
+    return true;
+}
+
+bool wrapInteropTargets(InteropRenderer* renderer, const D3D12_HEAP_PROPERTIES& heap, const D3D12_RESOURCE_DESC& texture, JNIEnv* env) {
+    D3D11_RESOURCE_FLAGS flags = {};
+    flags.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+    if (FAILED(renderer->d3d11On12->CreateWrappedResource(renderer->colorTarget, &flags,
+            D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_RENDER_TARGET,
+            IID_PPV_ARGS(&renderer->wrappedColor)))) {
+        throwJava(env, "DX12 terrain target could not be wrapped for the OpenGL bridge.");
+        return false;
+    }
+    flags.BindFlags = D3D11_BIND_DEPTH_STENCIL;
+    if (FAILED(renderer->d3d11On12->CreateWrappedResource(renderer->depthTarget, &flags,
+            D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_DEPTH_WRITE,
+            IID_PPV_ARGS(&renderer->wrappedDepth)))) {
+        throwJava(env, "Could not wrap the terrain depth image.");
+        return false;
+    }
+    // Optional: a failed bridge only keeps the copied depth path.
+    D3D12_RESOURCE_DESC bridge = texture;
+    bridge.Format = DXGI_FORMAT_R32_FLOAT;
+    if (SUCCEEDED(renderer->device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &bridge,
+                D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&renderer->depthBridge)))) {
+        flags.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+        if (FAILED(renderer->d3d11On12->CreateWrappedResource(renderer->depthBridge, &flags,
+                D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COMMON, IID_PPV_ARGS(&renderer->wrappedDepthBridge)))) {
+            release(renderer->depthBridge);
+        }
+    }
+    return true;
+}
+
+bool createSizeResources(InteropRenderer* renderer, JNIEnv* env) {
+    if (!renderer->phase0Replay && !createInteropTextures(renderer, env)) return false;
     D3D12_HEAP_PROPERTIES heap = {};
     heap.Type = D3D12_HEAP_TYPE_DEFAULT;
     D3D12_RESOURCE_DESC texture = {};
@@ -1328,32 +1368,7 @@ bool createSizeResources(InteropRenderer* renderer, JNIEnv* env) {
         return false;
     }
 
-    D3D11_RESOURCE_FLAGS flags = {};
-    flags.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
-    if (FAILED(renderer->d3d11On12->CreateWrappedResource(renderer->colorTarget, &flags,
-            D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_RENDER_TARGET,
-            IID_PPV_ARGS(&renderer->wrappedColor)))) {
-        throwJava(env, "DX12 terrain target could not be wrapped for the OpenGL bridge.");
-        return false;
-    }
-    flags.BindFlags = D3D11_BIND_DEPTH_STENCIL;
-    if (FAILED(renderer->d3d11On12->CreateWrappedResource(renderer->depthTarget, &flags,
-            D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_DEPTH_WRITE,
-            IID_PPV_ARGS(&renderer->wrappedDepth)))) {
-        throwJava(env, "Could not wrap the terrain depth image.");
-        return false;
-    }
-    // Optional: a failed bridge only keeps the copied depth path.
-    D3D12_RESOURCE_DESC bridge = texture;
-    bridge.Format = DXGI_FORMAT_R32_FLOAT;
-    if (SUCCEEDED(renderer->device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &bridge,
-                D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&renderer->depthBridge)))) {
-        flags.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
-        if (FAILED(renderer->d3d11On12->CreateWrappedResource(renderer->depthBridge, &flags,
-                D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COMMON, IID_PPV_ARGS(&renderer->wrappedDepthBridge)))) {
-            release(renderer->depthBridge);
-        }
-    }
+    if (!renderer->phase0Replay && !wrapInteropTargets(renderer, heap, texture, env)) return false;
     if (!createExtensionResources(renderer, env)) return false;
     std::string graphError;
     if (!allocateGraphBuffers(renderer, graphError)) {
@@ -1415,6 +1430,9 @@ void destroyInteropRenderer(InteropRenderer* renderer) {
     release(renderer->finishList);
     release(renderer->timestampHeap);
     release(renderer->timestampReadback);
+    release(renderer->phase0Gui);
+    release(renderer->phase0Queries);
+    release(renderer->phase0Times);
     release(renderer->worldTimestampHeap);
     release(renderer->worldTimestampReadback);
     release(renderer->cutoutList);
@@ -2340,6 +2358,19 @@ void startRecordWorker(InteropRenderer* renderer) {
     }
 }
 
+bool createInteropDevice(InteropRenderer* renderer, JNIEnv* env) {
+    IUnknown* queues[] = {renderer->queue};
+    D3D_FEATURE_LEVEL featureLevels[] = {D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0};
+    if (FAILED(D3D11On12CreateDevice(renderer->device, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+            featureLevels, ARRAYSIZE(featureLevels), queues, ARRAYSIZE(queues), 0,
+            &renderer->d3d11Device, &renderer->d3d11Context, nullptr))
+            || FAILED(renderer->d3d11Device->QueryInterface(IID_PPV_ARGS(&renderer->d3d11On12)))) {
+        throwJava(env, "DX12/OpenGL interop could not create a D3D11On12 device.");
+        return false;
+    }
+    return true;
+}
+
 bool initializeInteropRenderer(InteropRenderer* renderer, jint width, jint height,
         bool parallelSectionRecording, jint uploadRingBufferMiB, jint terrainArenaPageMiB,
         jint maxTerrainArenaMiB, JNIEnv* env) {
@@ -2377,15 +2408,7 @@ bool initializeInteropRenderer(InteropRenderer* renderer, jint width, jint heigh
         throwJava(env, "DX12/OpenGL interop could not create a Direct3D 12 command queue.");
         return false;
     }
-    IUnknown* queues[] = {renderer->queue};
-    D3D_FEATURE_LEVEL featureLevels[] = {D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0};
-    if (FAILED(D3D11On12CreateDevice(renderer->device, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
-            featureLevels, ARRAYSIZE(featureLevels), queues, ARRAYSIZE(queues), 0,
-            &renderer->d3d11Device, &renderer->d3d11Context, nullptr))
-            || FAILED(renderer->d3d11Device->QueryInterface(IID_PPV_ARGS(&renderer->d3d11On12)))) {
-        throwJava(env, "DX12/OpenGL interop could not create a D3D11On12 device.");
-        return false;
-    }
+    if (!renderer->phase0Replay && !createInteropDevice(renderer, env)) return false;
     if (!createDescriptorHeaps(renderer) || !createCommandObjects(renderer)
             || !createUploadRingBuffers(renderer, uploadRingBytes, env)) {
         if (!env->ExceptionCheck()) {
@@ -2400,6 +2423,15 @@ bool initializeInteropRenderer(InteropRenderer* renderer, jint width, jint heigh
     createTerrainCommandSignature(renderer); // optional optimization; direct draws remain the fallback
     if (!createSizeResources(renderer, env)) {
         return false;
+    }
+    if (renderer->phase0Replay) {
+        renderer->fenceEvent = CreateEvent(nullptr, FALSE, FALSE, nullptr);
+        if (!renderer->fenceEvent || FAILED(renderer->device->CreateFence(0, D3D12_FENCE_FLAG_NONE,
+                IID_PPV_ARGS(&renderer->fence)))) {
+            throwJava(env, "D3D12 replay fence initialization failed.");
+            return false;
+        }
+        return true;
     }
     bool sharedFenceAvailable = false;
     bool sharedGlDoneFenceAvailable = false;
@@ -2596,7 +2628,7 @@ void beginTerrainPass(InteropRenderer* renderer, ID3D12GraphicsCommandList* list
     const bool clear = role != PassRole::Cutout;
     list->OMSetRenderTargets(1, &rtv, TRUE, &dsv);
     if (clear) {
-        list->ClearRenderTargetView(rtv, kClearColor, 0, nullptr);
+        list->ClearRenderTargetView(rtv, renderer->phase0Replay ? renderer->viewProjection + 16 : kClearColor, 0, nullptr);
         list->ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
     }
     if (role == PassRole::ClearOnly) {
@@ -4962,3 +4994,5 @@ extern "C" JNIEXPORT jboolean JNICALL Java_com_redondoguibi_direct_NativeDx12_is
     if(!currentFrameSlotReady(r,env,&ready))return JNI_FALSE;
     return ready?JNI_TRUE:JNI_FALSE;
 }
+
+#include "phase0_frame.inl"

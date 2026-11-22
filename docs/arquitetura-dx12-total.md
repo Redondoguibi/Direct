@@ -72,4 +72,4 @@ Um backend DX12 na fronteira do `blaze3d`, a mesma técnica do VulkanMod com Vul
 
 ## Próximo passo
 
-Fase 0, começando pelo risco 1 (DXGI no HWND do NeoForge) e pela tradução automática dos 56 shaders, que são os dois pontos que podem invalidar o caminho cedo.
+A fase 0 passou nos três portões (22/11/2026): apresentação DXGI estável na janela do NeoForge, 56/56 shaders traduzidos e compilados, e 6,0–6,2 ms de GPU para terreno + Lus + GUI simples sem OpenGL. Detalhes em [fase0-dx12-total.md](fase0-dx12-total.md). Próximo: fase 1 (GUI e menus).

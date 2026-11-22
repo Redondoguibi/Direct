@@ -282,6 +282,12 @@ public final class Dx12GlInterop {
                 RendererMetrics.worldRenderNanos += rendered - captured;
                 RendererMetrics.worldPresentNanos += System.nanoTime() - rendered;
             }
+            if (Phase0Capture.ENABLED && packGeometryActive && !packTranslucent && !packSceneInputs && !packShadows
+                    && replacementFrame && configuredPasses.isEmpty() && mc.screen == null && mc.getOverlay() == null) {
+                Phase0Capture.frame(width, height, visibleKeys, visibleCount, fallbackSections, LIGHT_PIXELS,
+                        MATRIX, cameraX, cameraY, cameraZ, mc.options.getEffectiveRenderDistance() * 16.0f,
+                        configuredPackGeometry, packGeometryOptions, geometryScratch, materialScratch, sources, uniforms);
+            }
             worldFailure="";
             return true;
         }catch(IllegalArgumentException exception){worldFailure=exception.getMessage();rejectedWorldSources=sources.clone();Direct.LOGGER.error("Rejected world shader",exception);return false;}
