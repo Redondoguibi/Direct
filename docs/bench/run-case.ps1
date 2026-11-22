@@ -7,7 +7,9 @@ param(
     [string] $World = "bench",
     [int] $Windows = 3,
     [int] $TimeoutMinutes = 7,
-    [switch] $CapturePhase0
+    [switch] $CapturePhase0,
+    # Extra JVM options, e.g. the DX12-only mode: -Ddirect.phase1.shadow=true -Ddirect.phase1.present=true -Ddirect.phase1.skipGl=true
+    [string[]] $JvmArgs = @()
 )
 $ErrorActionPreference = "Stop"
 $direct = Split-Path (Split-Path $PSScriptRoot -Parent) -Parent
@@ -19,6 +21,7 @@ $arguments = @('-Xmx3G', "@$classpath", "@`"$moddev\clientRunVmArgs.txt`"", 'net
     "@`"$moddev\clientRunProgramArgs.txt`"", '--quickPlaySingleplayer', $World, '--width', '1920', '--height', '1080',
     '--username', 'Dev')
 if ($CapturePhase0) { $arguments = @('-Ddirect.phase0.capture=true') + $arguments }
+if ($JvmArgs.Count -gt 0) { $arguments = $JvmArgs + $arguments }
 if (Test-Path (Join-Path $case 'logs\bench-fps.csv')) { throw "Use a fresh benchmark case ($Label already has samples)" }
 $game = Start-Process java -WindowStyle Hidden -ArgumentList $arguments -WorkingDirectory $case `
     -RedirectStandardOutput "$case.out" -RedirectStandardError "$case.err" -PassThru

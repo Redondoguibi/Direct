@@ -13,7 +13,20 @@ struct DirectTerrainOutput {
     ID3D12Resource* depth;   // R32_TYPELESS (D32_FLOAT), OpenGL window depth, DEPTH_WRITE at rest
     ID3D12Fence* fence;      // reaches the frame's ready value when its terrain is rendered
     ID3D12CommandQueue* queue;
+    ID3D12Resource* depthBridge; // R32_FLOAT scene depth read by the pack passes, COMMON at rest; null without the bridge
     UINT width, height;
 };
 bool directTerrainOutput(DirectTerrainOutput* out);
+
+/**
+ * Before another queue writes the shared images (shadow mode): returns them from D3D11On12, which holds them after an
+ * OpenGL lock, and signals fence to value on the terrain queue after that release.
+ */
+bool directTerrainHandOff(ID3D12Fence* fence, UINT64 value);
+
+/**
+ * DX12 alone renders (no OpenGL consumer): the renderer stops exporting its depth into the bridge after each frame and
+ * stops handing its images to D3D11On12. The backend reads the renderer's color and depth targets directly.
+ */
+void directTerrainBackendOnly(bool enabled);
 

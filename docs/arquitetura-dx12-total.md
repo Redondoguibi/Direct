@@ -83,4 +83,6 @@ A fase 2 passou (22/11/2026). O mundo inteiro passa pelo backend DX12 sobre o te
 
 Em 11 cenas fixas, os pixels ficaram equivalentes aos do vanilla (terreno vanilla) e aos do modo híbrido (terreno do Direct). No modo só DX12, nada da cena passa pelo OpenGL. Detalhes em [fase2-dx12-total.md](fase2-dx12-total.md).
 
-Próximo: fase 3. O grafo de mundo, a transparência e as sombras dos packs (Lus/Solaris) passam a ler a cena direto do backend, e o FPS é medido contra o Sodium + Iris + Mellow.
+A fase 3 passou (22/11/2026). Os passes de mundo e a transparência dos packs leem a cena direto do backend; o Lus e o Solaris saem com a mesma imagem do modo híbrido. No modo só DX12, quadros em paralelo levaram o Direct + Raydiance + Lus a 69,0 FPS no harness, contra 67,6 do Sodium + Iris + Mellow e 29,4 do modo híbrido. O p95 caiu para 18 ms, contra 31 ms do Sodium. Detalhes em [fase3-dx12-total.md](fase3-dx12-total.md).
+
+Próximo: fase 4 (opção no painel, detecção de mods que usam OpenGL direto, fallback, validação na instância real) e os ganhos de GPU listados na fase 3.

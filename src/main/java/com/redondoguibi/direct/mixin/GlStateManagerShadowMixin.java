@@ -42,7 +42,11 @@ abstract class GlStateManagerShadowMixin {
     @Inject(method = "_clearColor", at = @At("HEAD"))
     private static void direct$clearColor(float r, float g, float b, float a, CallbackInfo ci) { Dx12Shadow.clearColor(r, g, b, a); }
     @Inject(method = "_clearDepth", at = @At("HEAD")) private static void direct$clearDepth(double depth, CallbackInfo ci) { Dx12Shadow.clearDepth(depth); }
-    @Inject(method = "_clear", at = @At("HEAD")) private static void direct$clear(int mask, boolean check, CallbackInfo ci) { Dx12Shadow.clear(mask); }
+    @Inject(method = "_clear", at = @At("HEAD"), cancellable = true)
+    private static void direct$clear(int mask, boolean check, CallbackInfo ci) {
+        Dx12Shadow.clear(mask);
+        if (Dx12Shadow.SKIP_GL && Dx12Shadow.presenting()) ci.cancel(); // DX12 alone renders: OpenGL's images are unused
+    }
     @Inject(method = "_activeTexture", at = @At("HEAD")) private static void direct$activeTexture(int unit, CallbackInfo ci) { Dx12Shadow.activeTexture(unit); }
     @Inject(method = "_bindTexture", at = @At("HEAD")) private static void direct$bindTexture(int texture, CallbackInfo ci) { Dx12Shadow.bindTexture(texture); }
     @Inject(method = "_texParameter(IIF)V", at = @At("HEAD"))
@@ -70,10 +74,11 @@ abstract class GlStateManagerShadowMixin {
     private static void direct$framebufferTexture(int target, int attachment, int textureTarget, int texture, int level, CallbackInfo ci) {
         Dx12Shadow.framebufferTexture(target, attachment, textureTarget, texture);
     }
-    @Inject(method = "_glBlitFrameBuffer", at = @At("HEAD"))
+    @Inject(method = "_glBlitFrameBuffer", at = @At("HEAD"), cancellable = true)
     private static void direct$blitFramebuffer(int sx0, int sy0, int sx1, int sy1, int dx0, int dy0, int dx1, int dy1, int mask,
             int filter, CallbackInfo ci) {
         Dx12Shadow.blitFramebuffer(sx0, sy0, sx1, sy1, dx0, dy0, dx1, dy1, mask);
+        if (Dx12Shadow.SKIP_GL && Dx12Shadow.presenting()) ci.cancel();
     }
     @Inject(method = "_glDeleteFramebuffers", at = @At("HEAD"))
     private static void direct$deleteFramebuffer(int framebuffer, CallbackInfo ci) { Dx12Shadow.deleteFramebuffer(framebuffer); }

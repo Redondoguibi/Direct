@@ -246,8 +246,15 @@ public final class Dx12GlInterop {
         var mc=Minecraft.getInstance();var target=mc.getMainRenderTarget();
         if(Minecraft.useShaderTransparency()||target.width!=width||target.height!=height||GL11.glGetInteger(GL30.GL_DRAW_FRAMEBUFFER_BINDING)!=target.frameBufferId)return false;
         try(MemoryStack stack=MemoryStack.stackPush()){
-            if(!lastSubmittedFrameReady("world post")||!NativeDx12.isWorldFrameReady())return false;
-            if(!java.util.Arrays.equals(worldSources,sources)){NativeDx12.configureWorldPasses(sources);worldSources=sources.clone();}
+            // DX12 alone: an earlier stage of this frame may still run on the GPU; the renderer's queue orders them.
+            if(!backendOnly()&&!lastSubmittedFrameReady("world post"))return false;
+            if(!NativeDx12.isWorldFrameReady())return false;
+            if(!java.util.Arrays.equals(worldSources,sources)){
+                if(backendOnly()&&frameIndex>0&&!NativeDx12.waitInteropFrame(frameIndex))throw new IllegalStateException("World reconfiguration wait failed");
+                NativeDx12.configureWorldPasses(sources);worldSources=sources.clone();
+            }
+            // DX12 backend alone: the passes read the backend's scene; nothing goes through OpenGL.
+            if(backendOnly())return backendWorld(target.frameBufferId,uniforms);
             var objects=stack.pointers(interopObject,depthInteropObject);
             boolean profile = RendererMetrics.recording;
             long start = profile ? System.nanoTime() : 0;
@@ -289,6 +296,8 @@ public final class Dx12GlInterop {
                         configuredPackGeometry, packGeometryOptions, geometryScratch, materialScratch, sources, uniforms);
             }
             worldFailure="";
+            // Shadow mode: the same passes again on the DX12 backend's own scene, for the comparison.
+            if(com.redondoguibi.direct.backend.Dx12Shadow.ENABLED)backendWorld(target.frameBufferId,uniforms);
             return true;
         }catch(IllegalArgumentException exception){worldFailure=exception.getMessage();rejectedWorldSources=sources.clone();Direct.LOGGER.error("Rejected world shader",exception);return false;}
         catch(RuntimeException|UnsatisfiedLinkError exception){worldFailure=exception.getMessage();rendererFailed("world post",exception);return false;}
@@ -336,6 +345,8 @@ public final class Dx12GlInterop {
                 DirectStatusOverlay.setStatus("translucency_budget");return false;
             }
             if(readiness!=NativeDx12.FRAME_RENDERED_CPU_SYNC)throw new IllegalStateException("Translucent preflight failed");
+            // DX12 backend alone: the translucent terrain is drawn over the backend's scene; nothing goes through OpenGL.
+            if(backendOnly())return backendTranslucent(target.frameBufferId);
             long captureStart=System.nanoTime();
             var objects=stack.pointers(interopObject,depthInteropObject);
             lockSceneForCapture(objects);
@@ -370,11 +381,72 @@ public final class Dx12GlInterop {
             }
             queueCpuGlSync(value);
             if(RendererMetrics.recording){RendererMetrics.translucentPresentNanos+=System.nanoTime()-presentStart;RendererMetrics.translucentFrames++;}
+            // Shadow mode: the same translucent terrain again over the DX12 backend's own scene, for the comparison.
+            if(com.redondoguibi.direct.backend.Dx12Shadow.ENABLED)backendTranslucent(target.frameBufferId);
             return true;
         }catch(RuntimeException|UnsatisfiedLinkError ex){
             rendererFailed("translucency", ex);
             return false;
         }
+    }
+
+    // ---- Shader-pack stages on the DX12 backend's scene (-Ddirect.phase1.shadow) ------------------------------------
+    // The backend shares this renderer's device. Instead of the OpenGL capture and presentation, it writes its scene
+    // into the pack's input images (exportScene), the native stage runs unchanged, and its output replaces the backend's
+    // scene (importScene). The stage is still awaited on the CPU, like the OpenGL path, so the frame slots stay free.
+
+    /** -Ddirect.phase1.skipGl with present: the DX12 backend alone renders and shows the frame. */
+    private static boolean backendOnly() {
+        return com.redondoguibi.direct.backend.Dx12Shadow.SKIP_GL && com.redondoguibi.direct.backend.Dx12Shadow.presenting();
+    }
+
+    private static boolean backendTranslucent(int framebuffer) {
+        if (NativeDx12.translucentFrameStatus() != NativeDx12.FRAME_RENDERED_CPU_SYNC) return false;
+        releaseHeldSceneLock(); // the backend writes the shared images: OpenGL must not hold them
+        // Shadow mode: OpenGL's pending consumption signal goes first, so the timeline never moves backwards.
+        finishGlWork();
+        if (!com.redondoguibi.direct.backend.Dx12Shadow.exportScene(framebuffer)) return false;
+        int result = NativeDx12.renderTranslucentInterop(MATRIX, cameraX, cameraY, cameraZ, frameIndex);
+        if (result == NativeDx12.FRAME_SKIPPED_BUSY || result == NativeDx12.FRAME_SKIPPED_BUDGET) return false;
+        if (result != NativeDx12.FRAME_RENDERED_CPU_SYNC) throw new IllegalStateException("Translucent submission failed");
+        long value = ++frameIndex;
+        long waitStart = System.nanoTime();
+        // Shadow mode keeps OpenGL's ordering; DX12 alone: the import waits for the frame on the GPU.
+        if (!backendOnly() && !NativeDx12.waitInteropFrame(value)) throw new IllegalStateException("Translucent frame incomplete");
+        com.redondoguibi.direct.backend.Dx12Shadow.stageWait(System.nanoTime() - waitStart);
+        boolean imported = com.redondoguibi.direct.backend.Dx12Shadow.importScene(framebuffer, value, true);
+        consumedByBackend(value);
+        return imported;
+    }
+
+    private static boolean backendWorld(int framebuffer, float[] uniforms) {
+        if ((!backendOnly() && !lastSubmittedFrameReady("world post")) || !NativeDx12.isWorldFrameReady()) return false;
+        releaseHeldSceneLock();
+        finishGlWork();
+        if (!com.redondoguibi.direct.backend.Dx12Shadow.exportScene(framebuffer)) return false;
+        int result = NativeDx12.renderWorldInterop(uniforms, frameIndex);
+        if (result == NativeDx12.FRAME_SKIPPED_BUSY) return false;
+        if (result != 0) throw new IllegalStateException("World render failed: " + result);
+        long value = ++frameIndex;
+        long waitStart = System.nanoTime();
+        if (!backendOnly() && !NativeDx12.waitInteropFrame(value)) throw new IllegalStateException("World output incomplete");
+        com.redondoguibi.direct.backend.Dx12Shadow.stageWait(System.nanoTime() - waitStart);
+        if (RendererMetrics.recording) {
+            double[] gpu = NativeDx12.worldFrameMetrics();
+            if (gpu != null && gpu[0] >= 0 && gpu[1] >= 0) com.redondoguibi.direct.backend.Dx12Shadow.packGpu(gpu[0], gpu[1]);
+        }
+        boolean imported = com.redondoguibi.direct.backend.Dx12Shadow.importScene(framebuffer, value, false);
+        consumedByBackend(value);
+        if (imported) worldFailure = "";
+        return imported;
+    }
+
+    /**
+     * The next terrain frame waits until every submitted frame value was consumed (glDoneFence). The backend executes
+     * its import before that frame is submitted (its end-of-frame flush waits), so the value is released now.
+     */
+    private static void consumedByBackend(long value) {
+        NativeDx12.signalInteropFence(value);
     }
 
     public static void captureVisibleSections(List<SectionRenderDispatcher.RenderSection> sections) {
@@ -499,8 +571,10 @@ public final class Dx12GlInterop {
                 return;
             }
             long waitStart=System.nanoTime();
-            boolean completed=NativeDx12.waitInteropFrame(pendingReadyValue);
+            // DX12 alone: the backend waits for the terrain frame on the GPU.
+            boolean completed=backendOnly()||NativeDx12.waitInteropFrame(pendingReadyValue);
             if(RendererMetrics.recording)RendererMetrics.dxWaitNanos+=System.nanoTime()-waitStart;
+            if(backendOnly())com.redondoguibi.direct.backend.Dx12Shadow.stageWait(System.nanoTime()-waitStart);
             if(!completed)
                 throw new IllegalStateException("D3D12 did not complete the current terrain frame.");
             if (ClientConfig.PROFILE_RENDERER.get()) {
@@ -644,6 +718,13 @@ public final class Dx12GlInterop {
             }
             if (!captured) {
                 return;
+            }
+            // DX12 alone: stages are not awaited on the CPU, so the renderer's previous frame may still run. Its
+            // resources are replaced below; wait for it here instead of falling back to vanilla terrain.
+            if (backendOnly() && frameIndex > 0) {
+                long waitStart = System.nanoTime();
+                if (!NativeDx12.waitInteropFrame(frameIndex)) throw new IllegalStateException("Previous DX12 frame did not complete.");
+                com.redondoguibi.direct.backend.Dx12Shadow.stageWait(System.nanoTime() - waitStart);
             }
 
             if (!NativeDx12.isCurrentFrameSlotReady()) {
@@ -959,7 +1040,7 @@ public final class Dx12GlInterop {
         pendingReadyValue = 0;
         pendingFrameIndex = 0;
         pendingFrameUsesGpuSemaphore = false;
-        if (state == 0 || !captured
+        if ((state == 0 && !backendOnly()) || !captured
                 || !PENDING_VIEW.matches(CAPTURED_VIEW, CAPTURED_PROJECTION, cameraX, cameraY, cameraZ)) {
             // No GL sampling occurred. Release the producer even for an incomplete/stale
             // image; this signals GL consumption, not D3D12 rendering completion.

@@ -127,6 +127,37 @@ final class Dx12ShadowProbe {
                     mc.levelRenderer.destroyBlockProgress(-1, hit.getBlockPos(), 6);
             }, 70, 2_000));
             SCENES.add(new Scene("world-third-person", () -> mc.options.setCameraType(net.minecraft.client.CameraType.THIRD_PERSON_BACK), 15, 2_000));
+            // Entity outline post chain: the player glows (Glowing effect from the integrated server), third person.
+            SCENES.add(new Scene("world-glowing", () -> serverRun(server, () -> {
+                var serverPlayer = server.getPlayerList().getPlayer(player.getUUID());
+                if (serverPlayer != null) serverPlayer.addEffect(new net.minecraft.world.effect.MobEffectInstance(
+                        net.minecraft.world.effect.MobEffects.GLOWING, 20 * 60, 0, false, false));
+            }), 15, 3_000));
+            // Enchantment glint: an enchanted golden apple (always foil) in the main hand, first person.
+            SCENES.add(new Scene("world-glint", () -> {
+                mc.options.setCameraType(net.minecraft.client.CameraType.FIRST_PERSON);
+                serverRun(server, () -> {
+                    var serverPlayer = server.getPlayerList().getPlayer(player.getUUID());
+                    if (serverPlayer == null) return;
+                    serverPlayer.removeEffect(net.minecraft.world.effect.MobEffects.GLOWING);
+                    serverPlayer.setItemInHand(net.minecraft.world.InteractionHand.MAIN_HAND,
+                            new net.minecraft.world.item.ItemStack(net.minecraft.world.item.Items.ENCHANTED_GOLDEN_APPLE));
+                });
+            }, 10, 3_000));
+            // Translucent terrain: a pool and a stained-glass column in front of the player (the save is a copy).
+            SCENES.add(new Scene("world-water", () -> {
+                mc.options.setCameraType(net.minecraft.client.CameraType.FIRST_PERSON);
+                var facing = net.minecraft.core.Direction.fromYRot(yaw);
+                var center = player.blockPosition().relative(facing, 5).below();
+                serverRun(server, () -> {
+                    var level = server.overworld();
+                    for (int dx = -2; dx <= 2; dx++) for (int dz = -2; dz <= 2; dz++)
+                        level.setBlockAndUpdate(center.offset(dx, 0, dz), net.minecraft.world.level.block.Blocks.WATER.defaultBlockState());
+                    for (int up = 1; up <= 2; up++)
+                        level.setBlockAndUpdate(center.relative(facing, 3).above(up),
+                                net.minecraft.world.level.block.Blocks.LIGHT_BLUE_STAINED_GLASS.defaultBlockState());
+                });
+            }, 30, 4_000));
             SCENES.add(new Scene("world-night", () -> {
                 mc.options.setCameraType(net.minecraft.client.CameraType.FIRST_PERSON);
                 serverRun(server, () -> server.overworld().setDayTime(18_000));
@@ -141,6 +172,12 @@ final class Dx12ShadowProbe {
                 mc.setScreen(new net.minecraft.client.gui.screens.inventory.InventoryScreen(player));
             }, 0, 2_000));
             SCENES.add(new Scene("world-pause", () -> mc.setScreen(new net.minecraft.client.gui.screens.PauseScreen(true)), 0, 2_000));
+            // Fabulous graphics: vanilla's transparency post chain (last: every section is rebuilt).
+            SCENES.add(new Scene("world-fabulous", () -> {
+                mc.setScreen(null);
+                mc.options.graphicsMode().set(net.minecraft.client.GraphicsStatus.FABULOUS);
+                mc.levelRenderer.allChanged(); // what the options screen does after the change
+            }, 20, 12_000));
             Direct.LOGGER.info("Direct phase2 world ready after {} ms, {} sections rendered, Direct terrain {}", now - joined,
                     mc.levelRenderer.countRenderedSections(),
                     com.redondoguibi.direct.ClientConfig.ENABLE_DX12.get() ? (com.redondoguibi.direct.Dx12GlInterop.terrainReplaced() ? "replacing vanilla" : "NOT active") : "off");
@@ -198,8 +235,20 @@ final class Dx12ShadowProbe {
         }
     }
 
+    /** Pixels covered by the entity outline in either API (glowing scene), excluded from the main comparison. */
+    private static boolean[] outlineCover;
+
     private static void compare(Minecraft mc, String name) {
-        var target = mc.getMainRenderTarget();
+        outlineCover = null;
+        // Entity outlines: vanilla's outline post chain blurs the silhouette, so a one-pixel edge tie in the silhouette
+        // becomes a small area of different values. Its own target is compared first, alpha included: at most 0.01% of
+        // its pixels may differ in alpha. The main image is then compared outside the outline.
+        if (name.startsWith("world-glowing") && mc.levelRenderer.entityTarget() != null)
+            compare(mc, name + "-outline", mc.levelRenderer.entityTarget());
+        compare(mc, name, mc.getMainRenderTarget());
+    }
+
+    private static void compare(Minecraft mc, String name, com.mojang.blaze3d.pipeline.RenderTarget target) {
         int texture = target.getColorTextureId(), width = target.width, height = target.height;
         int bytes = width * height * 4;
         ByteBuffer gl = MemoryUtil.memAlloc(bytes), dx = MemoryUtil.memAlloc(bytes);
@@ -210,19 +259,34 @@ final class Dx12ShadowProbe {
             GL11.glGetTexImage(GL11.GL_TEXTURE_2D, 0, GL11.GL_RGBA, GL11.GL_UNSIGNED_BYTE, gl);
             GlStateManager._bindTexture(previous);
             Dx12Shadow.readback(texture, dx);
-            int max = 0;
+            int max = 0, alpha = 0;
             long differing = 0, over2 = 0, over8 = 0;
             for (int i = 0; i < bytes; i += 4) {
                 int pixel = 0;
                 for (int c = 0; c < 3; c++) pixel = Math.max(pixel, Math.abs((gl.get(i + c) & 255) - (dx.get(i + c) & 255)));
+                alpha = Math.max(alpha, Math.abs((gl.get(i + 3) & 255) - (dx.get(i + 3) & 255)));
                 max = Math.max(max, pixel);
                 if (pixel > 0) differing++;
                 if (pixel > 2) over2++;
                 if (pixel > 8) over8++;
             }
             long pixels = (long) width * height;
+            boolean outline = name.endsWith("-outline");
+            long alphaDiffering = 0;
+            if (outline) {
+                outlineCover = new boolean[width * height];
+                for (int i = 0, p = 0; i < bytes; i += 4, p++) {
+                    int ga = gl.get(i + 3) & 255, da = dx.get(i + 3) & 255;
+                    outlineCover[p] = ga > 0 || da > 0;
+                    if (Math.abs(ga - da) > 8) alphaDiffering++;
+                }
+            }
             boolean[] mask = new boolean[width * height];
             long unexplained = unexplained(gl, dx, width, height, mask);
+            long excluded = 0;
+            if (!outline && outlineCover != null && outlineCover.length == mask.length) {
+                for (int p = 0; p < mask.length; p++) if (mask[p] && outlineCover[p]) { mask[p] = false; unexplained--; excluded++; }
+            }
             int blocks = solidBlocks(mask, width, height);
             int cluster = largestCluster(mask, width, height);
             // Menus: fewer than 0.1% of pixels more than 2/255 apart. World: differences a one-pixel shift cannot explain
@@ -230,13 +294,16 @@ final class Dx12ShadowProbe {
             // different pixels in each API) are dots and one-pixel lines: no 2x2 block of them, no group over 16 pixels,
             // under 0.1% of the image. A missing or misplaced object leaves an area.
             boolean pass = WORLD ? blocks == 0 && cluster <= 16 && unexplained * 1000 < pixels : over2 * 1000 < pixels;
+            // The outline target is blurred by design: its alpha within 0.01% of the pixels, its color within 0.1%.
+            if (outline) pass = alphaDiffering * 10000 < pixels && unexplained * 1000 < pixels;
             failed |= !pass;
-            String line = String.format(Locale.ROOT, " %s(max=%d, differing=%.3f%%, over2=%.3f%%, over8=%.3f%%, unexplained=%d, blocks=%d, cluster=%d, calls=%d/%d/%d, terrain=%d)",
-                    name, max, 100.0 * differing / pixels, 100.0 * over2 / pixels, 100.0 * over8 / pixels, unexplained, blocks, cluster,
-                    Dx12Shadow.lastCalls, Dx12Shadow.lastDraws, Dx12Shadow.lastNative, Dx12Shadow.lastTerrain);
+            String line = String.format(Locale.ROOT, " %s(max=%d, differing=%.3f%%, over2=%.3f%%, over8=%.3f%%, unexplained=%d, blocks=%d, cluster=%d, alphaMax=%d, alphaDiffering=%d, outlineExcluded=%d, calls=%d/%d/%d, terrain=%d, pack=%d)",
+                    name, max, 100.0 * differing / pixels, 100.0 * over2 / pixels, 100.0 * over8 / pixels, unexplained, blocks, cluster, alpha, alphaDiffering, excluded,
+                    Dx12Shadow.lastCalls, Dx12Shadow.lastDraws, Dx12Shadow.lastNative, Dx12Shadow.lastTerrain, Dx12Shadow.lastPack);
             summary.append(line);
             Direct.LOGGER.info("Direct phase1 shadow check {}x{}{} {}", width, height, line, pass ? "PASS" : "FAIL");
-            if (name.endsWith("-0")) write(mc, name, width, height, gl, dx);
+            if (name.endsWith("-0") || name.endsWith("-0-outline")) write(mc, name, width, height, gl, dx);
+            if (name.endsWith("-0-outline")) writeAlpha(mc, name, width, height, gl, dx);
         } catch (RuntimeException ex) {
             failed = true;
             summary.append(' ').append(name).append("(error: ").append(ex.getMessage()).append(')');
@@ -311,6 +378,27 @@ final class Dx12ShadowProbe {
         int d = 0;
         for (int c = 0; c < 3; c++) d = Math.max(d, Math.abs((a.get(i + c) & 255) - (b.get(j + c) & 255)));
         return d;
+    }
+
+    /** The alpha channels of both images as grayscale (the color images are saved opaque). */
+    private static void writeAlpha(Minecraft mc, String name, int width, int height, ByteBuffer gl, ByteBuffer dx) {
+        ByteBuffer a = MemoryUtil.memAlloc(width * height * 4), b = MemoryUtil.memAlloc(width * height * 4);
+        try {
+            for (int i = 0; i < width * height * 4; i += 4) {
+                byte ga = gl.get(i + 3), da = dx.get(i + 3);
+                for (int c = 0; c < 3; c++) { a.put(i + c, ga); b.put(i + c, da); }
+                a.put(i + 3, (byte) 255);
+                b.put(i + 3, (byte) 255);
+            }
+            Path directory = mc.gameDirectory.toPath().resolve(DIRECTORY);
+            save(directory.resolve(name + "-gl-alpha.png"), width, height, a);
+            save(directory.resolve(name + "-dx12-alpha.png"), width, height, b);
+        } catch (IOException ex) {
+            Direct.LOGGER.warn("Direct probe could not write alpha images for {}", name, ex);
+        } finally {
+            MemoryUtil.memFree(a);
+            MemoryUtil.memFree(b);
+        }
     }
 
     /** OpenGL, DX12 and an 8x amplified difference image, flipped to the usual top-down orientation. */

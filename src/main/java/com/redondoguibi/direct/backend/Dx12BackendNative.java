@@ -12,6 +12,10 @@ final class Dx12BackendNative {
     /** Executes everything recorded so far and waits for the GPU. */
     static native void flush();
     static native long draws();
+    /** GPU milliseconds of the backend's own command lists completed since the last call. */
+    static native double takeGpuMs();
+    /** GPU ms since the last call by operation: composite, export, import, present, copy, clear, upload. */
+    static native void takeCategoryMs(double[] out);
     /** With the debug layer: validation messages collected at fence waits since the last call ("" otherwise). */
     static native String messages();
 
@@ -48,6 +52,15 @@ final class Dx12BackendNative {
     static native boolean compositeTerrain(int framebuffer, long readyValue, boolean writeDepth, boolean copy);
     static native long terrainComposites();
 
+    /**
+     * The scene of a framebuffer becomes the shader pack's input (as InteropSceneCapture.capture writes it): the
+     * recorded work is submitted and the terrain queue waits for it. handOff: D3D11On12 releases the shared images first.
+     * @return false when the terrain renderer has no depth bridge or the sizes differ
+     */
+    static native boolean exportScene(int framebuffer, boolean handOff);
+    /** After pack frame readyValue: its output replaces the framebuffer's color (and depth). */
+    static native boolean importScene(int framebuffer, long readyValue, boolean withDepth);
+
     static native int createProgram(String name, byte[] vertexHlsl, byte[] fragmentHlsl, int cbufferBytes, int textures);
 
     /**
@@ -62,7 +75,7 @@ final class Dx12BackendNative {
 
     /** Runs the recorded frame and shows a texture on the window through a DXGI swap chain (V flipped). */
     /** @return with verify, how many of 64 desktop pixels in the window match the texture afterwards; else -1 */
-    static native int present(long hwnd, int texture, int width, int height, boolean vsync, boolean verify);
+    static native int present(long hwnd, int texture, int width, int height, boolean vsync, boolean verify, boolean pipelined);
 
     /** Level 0 of a texture, tightly packed, OpenGL row order (row 0 is the bottom row). */
     static native void readback(int texture, ByteBuffer out);

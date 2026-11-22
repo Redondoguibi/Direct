@@ -51,6 +51,10 @@ struct Texture {
     int glInternal = 0;
     UINT width = 0, height = 0, levels = 0;
     bool depth = false;
+    // Color textures become render targets only when something draws into them (ensureRenderTarget): textures that
+    // are only sampled (atlases, fonts) are then not created with ALLOW_RENDER_TARGET, which on Intel makes them
+    // compressed and their uploads expensive.
+    bool renderTarget = false;
     int cpuView = -1, rtv = -1, dsv = -1;
     // OpenGL defaults: NEAREST_MIPMAP_LINEAR / LINEAR / REPEAT, max level 1000.
     int minFilter = 9986, magFilter = 9729, wrapS = 10497, wrapT = 10497, maxLevel = 1000;
@@ -186,6 +190,16 @@ public:
         check(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.Get(), nullptr, IID_PPV_ARGS(&list)), "CreateCommandList");
         check(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence)), "CreateFence");
         list->SetName(L"Direct backend list");
+        // GPU time of every list this backend executes (timestamps at its start and end).
+        D3D12_QUERY_HEAP_DESC queries{D3D12_QUERY_HEAP_TYPE_TIMESTAMP, kQueries, 0};
+        if (SUCCEEDED(device->CreateQueryHeap(&queries, IID_PPV_ARGS(&queryHeap)))) {
+            D3D12_HEAP_PROPERTIES readbackHeap{D3D12_HEAP_TYPE_READBACK};
+            auto rb = bufferDesc(kQueries * sizeof(UINT64));
+            if (FAILED(device->CreateCommittedResource(&readbackHeap, D3D12_HEAP_FLAG_NONE, &rb, D3D12_RESOURCE_STATE_COPY_DEST,
+                    nullptr, IID_PPV_ARGS(&queryReadback))) || FAILED(queue->GetTimestampFrequency(&timestampFrequency)))
+                queryHeap.Reset();
+        }
+        listStarted();
         event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
         heap(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, kViewRing, true, &views);
         heap(D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, kSamplerRing, true, &samplers);
@@ -276,7 +290,9 @@ public:
         D3D12_TEXTURE_COPY_LOCATION source{ring.Get(), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT};
         source.PlacedFootprint.Offset = offset;
         source.PlacedFootprint.Footprint = {texture.format, w, h, 1, pitch};
+        gpuBegin();
         list->CopyTextureRegion(&dest, static_cast<UINT>(x), static_cast<UINT>(y), 0, &source, nullptr);
+        gpuEnd(kUpload);
     }
 
     void textureParams(int id, int minFilter, int magFilter, int wrapS, int wrapT, int maxLevel, float lodBias,
@@ -325,14 +341,18 @@ public:
             auto* texture = colorTarget(found->second.color);
             if (texture) {
                 transition(*texture, D3D12_RESOURCE_STATE_RENDER_TARGET);
+                gpuBegin();
                 list->ClearRenderTargetView(rtv(*texture), color, count, rects);
+                gpuEnd(kClear);
             }
         }
         if (mask & 0x100) {
             auto* texture = depthTarget(found->second.depth);
             if (texture) {
                 transition(*texture, D3D12_RESOURCE_STATE_DEPTH_WRITE);
+                gpuBegin();
                 list->ClearDepthStencilView(dsv(*texture), D3D12_CLEAR_FLAG_DEPTH, depth, 0, count, rects);
+                gpuEnd(kClear);
             }
         }
     }
@@ -405,7 +425,9 @@ public:
             D3D12_TEXTURE_COPY_LOCATION src{from->resource.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
             D3D12_TEXTURE_COPY_LOCATION dst{to->resource.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
             src.SubresourceIndex = dst.SubresourceIndex = 0;
+            gpuBegin();
             list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+            gpuEnd(kCopy);
         };
         if (mask & 0x4000) copy(colorTarget(source->second.color), colorTarget(dest->second.color));
         if (mask & 0x100) copy(depthTarget(source->second.depth), depthTarget(dest->second.depth));
@@ -484,13 +506,121 @@ public:
         list->RSSetViewports(1, &viewport);
         list->RSSetScissorRects(1, &scissor);
         list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        gpuBegin();
         list->DrawInstanced(3, 1, 0, 0);
+        gpuEnd(kComposite);
         for (auto& barrier : barriers) std::swap(barrier.Transition.StateBefore, barrier.Transition.StateAfter);
         if (!copy) list->ResourceBarrier(2, barriers);
         ++terrainComposites;
         return true;
     }
     UINT64 terrainCompositeCount() const { return terrainComposites; }
+
+    // ---- Shader-pack passes on the backend's scene ------------------------------------------------------------
+    // exportScene: the scene of framebuffer fbo becomes the pack's input (the terrain renderer's color target and its
+    // R32F depth bridge, as InteropSceneCapture.capture writes them), then everything recorded so far is submitted and
+    // the terrain queue waits for it. handOff (shadow mode): D3D11On12 releases the images first.
+    // importScene: after the pack frame readyValue, its output replaces the scene (color, and depth when withDepth).
+    bool exportScene(int fbo, bool handOff) {
+        DirectTerrainOutput t{};
+        if (!directTerrainOutput(&t) || !t.depthBridge) return false;
+        auto target = framebuffers.find(fbo);
+        if (fbo == 0 || target == framebuffers.end()) return false;
+        Texture* color = colorTarget(target->second.color);
+        Texture* depth = depthTarget(target->second.depth);
+        if (!color || !depth || color->width != t.width || color->height != t.height) return false;
+        if (handOff) {
+            if (!handOffFence) check(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&handOffFence)), "hand-off fence");
+            if (!directTerrainHandOff(handOffFence.Get(), ++handOffValue)) throw std::runtime_error("terrain hand-off failed");
+            pendingWaits.push_back({handOffFence, handOffValue});
+        }
+        ID3D12PipelineState* pso = transferPipeline(Transfer::Export, DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_UNKNOWN);
+        for (int& slot : terrainRtv) if (slot < 0) slot = take(freeRtvs, rtvNext, 4096);
+        D3D12_CPU_DESCRIPTOR_HANDLE targets[2];
+        for (UINT i = 0; i < 2; ++i) {
+            targets[i] = rtvs->GetCPUDescriptorHandleForHeapStart();
+            targets[i].ptr += static_cast<SIZE_T>(terrainRtv[i]) * rtvSize;
+        }
+        D3D12_RENDER_TARGET_VIEW_DESC rtvDesc{};
+        rtvDesc.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
+        rtvDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        device->CreateRenderTargetView(t.color, &rtvDesc, targets[0]);
+        rtvDesc.Format = DXGI_FORMAT_R32_FLOAT;
+        device->CreateRenderTargetView(t.depthBridge, &rtvDesc, targets[1]);
+        transition(*color, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        transition(*depth, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        barrier(t.depthBridge, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_RENDER_TARGET);
+        gpuBegin();
+        recordTransfer(pso, color->resource.Get(), color->format, depth->resource.Get(), targets, 2, nullptr,
+                color->height, t.width, t.height);
+        gpuEnd(kExport);
+        barrier(t.depthBridge, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COMMON);
+        submit();
+        check(t.queue->Wait(fence.Get(), fenceValue), "terrain queue Wait");
+        ++sceneExports;
+        return true;
+    }
+
+    bool importScene(int fbo, UINT64 readyValue, bool withDepth) {
+        DirectTerrainOutput t{};
+        if (!directTerrainOutput(&t) || !t.depthBridge) return false;
+        auto target = framebuffers.find(fbo);
+        if (fbo == 0 || target == framebuffers.end()) return false;
+        Texture* color = colorTarget(target->second.color);
+        Texture* depth = withDepth ? depthTarget(target->second.depth) : nullptr;
+        if (!color || (withDepth && !depth)) return false;
+        pendingWaits.push_back({t.fence, readyValue});
+        ID3D12PipelineState* pso = transferPipeline(withDepth ? Transfer::ImportDepth : Transfer::Import, color->format,
+                DXGI_FORMAT_UNKNOWN, withDepth ? depth->format : DXGI_FORMAT_UNKNOWN);
+        transition(*color, D3D12_RESOURCE_STATE_RENDER_TARGET);
+        if (depth) transition(*depth, D3D12_RESOURCE_STATE_DEPTH_WRITE);
+        const D3D12_RESOURCE_STATES read = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+        // Depth: the renderer's depth target, which a translucent frame updated (the bridge is only exported for OpenGL).
+        barrier(t.color, D3D12_RESOURCE_STATE_RENDER_TARGET, read);
+        barrier(t.depth, D3D12_RESOURCE_STATE_DEPTH_WRITE, read);
+        D3D12_CPU_DESCRIPTOR_HANDLE rtvHandle = rtv(*color), dsvHandle{};
+        if (depth) dsvHandle = dsv(*depth);
+        gpuBegin();
+        recordTransfer(pso, t.color, DXGI_FORMAT_R8G8B8A8_UNORM, t.depth, &rtvHandle, 1, depth ? &dsvHandle : nullptr,
+                t.height, t.width, t.height);
+        gpuEnd(kImport);
+        barrier(t.color, read, D3D12_RESOURCE_STATE_RENDER_TARGET);
+        barrier(t.depth, read, D3D12_RESOURCE_STATE_DEPTH_WRITE);
+        ++sceneImports;
+        return true;
+    }
+    UINT64 sceneTransfers() const { return sceneExports * 1000000 + sceneImports; }
+
+    // Executes everything recorded so far without waiting; recording continues on another allocator. The upload
+    // ring and descriptor rings are not reset: the GPU may still read them until the next flush.
+    void submit() {
+        listEnded();
+        check(list->Close(), "Close");
+        for (const auto& wait : pendingWaits) check(queue->Wait(wait.fence.Get(), wait.value), "queue Wait");
+        pendingWaits.clear();
+        ID3D12CommandList* lists[] = {list.Get()};
+        queue->ExecuteCommandLists(1, lists);
+        check(queue->Signal(fence.Get(), ++fenceValue), "Signal");
+        for (auto& page : pages) page.state = D3D12_RESOURCE_STATE_COMMON; // buffers decay after execution
+        busyAllocators.push_back({fenceValue, allocator});
+        UINT64 completed = fence->GetCompletedValue();
+        auto keep = busyAllocators.begin();
+        for (auto it = busyAllocators.begin(); it != busyAllocators.end(); ++it) {
+            if (it->first <= completed) spareAllocators.push_back(it->second);
+            else *keep++ = *it;
+        }
+        busyAllocators.erase(keep, busyAllocators.end());
+        if (spareAllocators.empty()) {
+            ComPtr<ID3D12CommandAllocator> fresh;
+            check(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&fresh)), "CreateCommandAllocator");
+            spareAllocators.push_back(fresh);
+        }
+        allocator = spareAllocators.back();
+        spareAllocators.pop_back();
+        check(allocator->Reset(), "allocator Reset");
+        check(list->Reset(allocator.Get(), nullptr), "list Reset");
+        listStarted();
+    }
 
     ID3D12Device* deviceRef() { device->AddRef(); return device.Get(); }
 
@@ -635,7 +765,27 @@ public:
     // Presents a texture on the game window through a DXGI flip-model swap chain. The texture keeps GL's bottom-up
     // rows, so the full-screen copy flips V. Runs everything recorded for the frame first.
     // verify: after presenting, compares 64 desktop pixels of the window with the texture; returns how many match.
-    int present(HWND window, int id, UINT width, UINT height, bool vsync, bool verify) {
+    void nextFrameSlot() {
+        slotFence[frameSlot] = fenceValue;
+        UINT ended = frameSlot;
+        frameSlot ^= 1;
+        if (oversize) {
+            flush();
+        } else if (fence->GetCompletedValue() < slotFence[frameSlot]) {
+            check(fence->SetEventOnCompletion(slotFence[frameSlot], event), "SetEventOnCompletion");
+            if (WaitForSingleObject(event, 10000) != WAIT_OBJECT_0) throw std::runtime_error("DX12 backend frame fence timed out");
+        }
+        check(device->GetDeviceRemovedReason(), "device");
+        ringOffset = ringBase();
+        viewOffset = viewBase();
+        releaseCompleted(fence->GetCompletedValue());
+        collectTimestamps(frameSlot); // the frame that used this slot before has completed
+        listStarted();                // the open list's start timestamp, now in this slot's query range
+        (void) ended;
+        if (info && pendingMessages.size() < 16384) pendingMessages += debugMessages();
+    }
+
+    int present(HWND window, int id, UINT width, UINT height, bool vsync, bool verify, bool pipelined) {
         auto found = textures.find(id);
         if (found == textures.end() || !found->second.resource || width == 0 || height == 0) { flush(); return -1; }
         if (!swapChain) createSwapChain(window, width, height);
@@ -678,11 +828,26 @@ public:
         list->RSSetViewports(1, &viewport);
         list->RSSetScissorRects(1, &scissor);
         list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        gpuBegin();
         list->DrawInstanced(3, 1, 0, 0);
+        gpuEnd(kPresent);
         std::swap(barrier.Transition.StateBefore, barrier.Transition.StateAfter);
         list->ResourceBarrier(1, &barrier);
-        flush();
-        check(swapChain->Present(vsync ? 1 : 0, !vsync && chainFlags ? DXGI_PRESENT_ALLOW_TEARING : 0), "Present");
+        if (!pipelined || verify) {
+            flush();
+            check(swapChain->Present(vsync ? 1 : 0, !vsync && chainFlags ? DXGI_PRESENT_ALLOW_TEARING : 0), "Present");
+        } else {
+            // DX12 alone renders: the frame is submitted without waiting, so the CPU records the next one while the
+            // GPU finishes this one. The slot of the frame before must be done before its half of the rings is reused.
+            directTerrainBackendOnly(true);
+            submit();
+            check(swapChain->Present(vsync ? 1 : 0, !vsync && chainFlags ? DXGI_PRESENT_ALLOW_TEARING : 0), "Present");
+            DirectTerrainOutput t{};
+            // The terrain renderer's next frame overwrites images this frame's composite and imports read.
+            if (directTerrainOutput(&t)) check(t.queue->Wait(fence.Get(), fenceValue), "terrain queue Wait");
+            nextFrameSlot();
+            return -1;
+        }
         // A hidden window shows nothing to compare against.
         if (!verify || !IsWindowVisible(window) || texture.width != width || texture.height != height || texture.format != DXGI_FORMAT_R8G8B8A8_UNORM) return -1;
         std::vector<uint8_t> pixels(static_cast<size_t>(width) * height * 4);
@@ -737,6 +902,7 @@ public:
 
     // Executes everything recorded so far and waits; the shadow backend is synchronous by design.
     void flush() {
+        listEnded();
         check(list->Close(), "Close");
         for (const auto& wait : pendingWaits) check(queue->Wait(wait.fence.Get(), wait.value), "queue Wait");
         pendingWaits.clear();
@@ -749,15 +915,21 @@ public:
         if (info && pendingMessages.size() < 16384) pendingMessages += debugMessages();
         check(allocator->Reset(), "allocator Reset");
         check(list->Reset(allocator.Get(), nullptr), "list Reset");
-        ringOffset = persistentRing;
-        viewOffset = 0;
-        retired.clear();
-        for (const auto& range : pendingFree) give(range);
+        for (auto& used : busyAllocators) spareAllocators.push_back(used.second); // everything submitted has completed
+        busyAllocators.clear();
+        collectTimestamps();
+        listStarted();
+        oversize = false;
+        ringOffset = ringBase();
+        viewOffset = viewBase();
+        releaseCompleted(fenceValue);
         for (auto& page : pages) page.state = D3D12_RESOURCE_STATE_COMMON; // buffers decay after execution
-        pendingFree.clear();
     }
 
     UINT64 draws() const { return drawCount; }
+    // Sum of the GPU durations of the lists completed since the last call, in milliseconds.
+    double takeGpuMs() { double out = gpuMs; gpuMs = 0; return out; }
+    void takeCategoryMs(double* out) { for (int i = 0; i < kCategories; ++i) { out[i] = categoryMs[i]; categoryMs[i] = 0; } }
     // Debug layer messages collected at fence waits since the last call.
     std::string takeMessages() { std::string out; out.swap(pendingMessages); return out; }
 
@@ -787,12 +959,79 @@ private:
     std::unordered_map<int, Framebuffer> framebuffers;
     std::vector<Program> programs;
     std::unordered_map<PsoKey, ComPtr<ID3D12PipelineState>, PsoHash> psos;
-    std::vector<ComPtr<ID3D12Resource>> retired;
+    std::vector<std::pair<UINT64, ComPtr<ID3D12Resource>>> retired;
+    UINT frameSlot = 0;
+    UINT64 slotFence[2] = {0, 0};
+    bool oversize = false;
     UINT64 drawCount = 0;
     std::string pendingMessages;
+    static constexpr UINT kQueries = 4096, kSlotQueries = kQueries / 2;
+    ComPtr<ID3D12QueryHeap> queryHeap;
+    ComPtr<ID3D12Resource> queryReadback;
+    UINT64 timestampFrequency = 0;
+    UINT queryNext = 0, queryStart = 0;
+    UINT queryLimit() const { return (frameSlot + 1) * kSlotQueries; }
+    double gpuMs = 0;
+
+    // Per-operation GPU time: pairs of timestamps around an operation, tagged with a category.
+    enum GpuCategory { kComposite, kExport, kImport, kPresent, kCopy, kClear, kUpload, kCategories };
+    std::vector<std::pair<UINT, int>> categoryPairs[2];  // per frame slot: first query index, category
+    double categoryMs[kCategories] = {};
+    UINT categoryOpen = UINT_MAX;
+    void gpuBegin() {
+        if (!queryHeap || queryNext + 4 > queryLimit()) { categoryOpen = UINT_MAX; return; }
+        categoryOpen = queryNext;
+        list->EndQuery(queryHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, queryNext++);
+    }
+    void gpuEnd(int category) {
+        if (categoryOpen == UINT_MAX || queryNext + 3 > queryLimit()) return;
+        list->EndQuery(queryHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, queryNext++);
+        categoryPairs[frameSlot].push_back({categoryOpen, category});
+        categoryOpen = UINT_MAX;
+    }
+
+    void listStarted() {
+        if (!queryHeap || queryNext + 2 > queryLimit()) return;
+        queryStart = queryNext;
+        list->EndQuery(queryHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, queryNext++);
+    }
+    void listEnded() {
+        if (!queryHeap || queryNext == queryStart || queryNext + 1 > queryLimit()) return;
+        list->EndQuery(queryHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, queryNext++);
+        list->ResolveQueryData(queryHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, queryStart, queryNext - queryStart, queryReadback.Get(),
+                queryStart * sizeof(UINT64));
+        listBounds[frameSlot].push_back({queryStart, queryNext - 1});
+        queryStart = queryNext;
+    }
+    std::vector<std::pair<UINT, UINT>> listBounds[2];
+    // A slot's queries are final once its frame's fence passed. Afterwards the slot's query range starts over.
+    void collectTimestamps(UINT slot) {
+        if (queryHeap) {
+            UINT64* times = nullptr;
+            D3D12_RANGE range{slot * kSlotQueries * sizeof(UINT64), (slot + 1) * kSlotQueries * sizeof(UINT64)};
+            if ((!listBounds[slot].empty() || !categoryPairs[slot].empty())
+                    && SUCCEEDED(queryReadback->Map(0, &range, reinterpret_cast<void**>(&times)))) {
+                for (const auto& bounds : listBounds[slot])
+                    if (times[bounds.second] > times[bounds.first])
+                        gpuMs += static_cast<double>(times[bounds.second] - times[bounds.first]) * 1000.0 / timestampFrequency;
+                for (const auto& pair : categoryPairs[slot])
+                    if (times[pair.first + 1] > times[pair.first])
+                        categoryMs[pair.second] += static_cast<double>(times[pair.first + 1] - times[pair.first]) * 1000.0 / timestampFrequency;
+                D3D12_RANGE none{0, 0};
+                queryReadback->Unmap(0, &none);
+            }
+        }
+        listBounds[slot].clear();
+        categoryPairs[slot].clear();
+        if (slot == frameSlot) queryNext = queryStart = slot * kSlotQueries;
+    }
+    void collectTimestamps() { collectTimestamps(frameSlot ^ 1); collectTimestamps(frameSlot); }
+
     struct QueueWait { ComPtr<ID3D12Fence> fence; UINT64 value; };
     std::vector<QueueWait> pendingWaits;
-    UINT64 terrainComposites = 0;
+    UINT64 terrainComposites = 0, sceneExports = 0, sceneImports = 0;
+    std::vector<std::pair<UINT64, ComPtr<ID3D12CommandAllocator>>> busyAllocators;
+    std::vector<ComPtr<ID3D12CommandAllocator>> spareAllocators;
     // Shadow-mode terrain copies (compositeTerrain with copy), recorded for the terrain queue. Both stay in
     // PIXEL_SHADER_RESOURCE outside the copy list.
     ComPtr<ID3D12CommandAllocator> copyAllocator;
@@ -846,18 +1085,20 @@ private:
         check(terrain.queue->Signal(copyFence.Get(), ++copyValue), "terrain queue Signal");
         pendingWaits.push_back({copyFence, copyValue});
     }
-    std::unordered_map<int, ComPtr<ID3D12PipelineState>> compositePsos;
+    // ---- Transfers between this framebuffer (OpenGL's bottom-up rows) and the terrain renderer's images (top-down) --
+    // Pixel row y of the output reads row height - 1 - y of the input. t0 = color, t1 = depth.
+    enum class Transfer { Composite, CompositeDepth, Export, Import, ImportDepth };
+    std::unordered_map<UINT64, ComPtr<ID3D12PipelineState>> transferPsos;
 
-    // Terrain composite (Dx12GlInterop.FRAGMENT_SHADER): the terrain image has top-down rows, this framebuffer
-    // OpenGL's bottom-up rows, so pixel row y reads terrain row height - 1 - y.
-    ID3D12PipelineState* compositePipeline(DXGI_FORMAT colorFormat, DXGI_FORMAT depthFormat) {
-        int key = static_cast<int>(colorFormat) * 1000 + static_cast<int>(depthFormat);
-        auto found = compositePsos.find(key);
-        if (found != compositePsos.end()) return found->second.Get();
+    ID3D12PipelineState* transferPipeline(Transfer kind, DXGI_FORMAT color0, DXGI_FORMAT color1, DXGI_FORMAT depthFormat) {
+        UINT64 key = (static_cast<UINT64>(kind) << 48) | (static_cast<UINT64>(color0) << 32) | (static_cast<UINT64>(color1) << 16)
+                | static_cast<UINT64>(depthFormat);
+        auto found = transferPsos.find(key);
+        if (found != transferPsos.end()) return found->second.Get();
         static const char source[] = R"(
-Texture2D<float4> TerrainColor : register(t0);
-Texture2D<float> TerrainDepth : register(t1);
-cbuffer Frame : register(b0) { uint TerrainHeight; };
+Texture2D<float4> SourceColor : register(t0);
+Texture2D<float> SourceDepth : register(t1);
+cbuffer Frame : register(b0) { uint SourceHeight; };
 struct V { float4 position : SV_Position; };
 V vs(uint id : SV_VertexID) {
     V v;
@@ -865,37 +1106,57 @@ V vs(uint id : SV_VertexID) {
     v.position = float4(corner * 2 - 1, 0, 1);
     return v;
 }
-int3 texel(float4 position) { return int3(int(position.x), int(TerrainHeight) - 1 - int(position.y), 0); }
-float4 colorOnly(V v) : SV_Target0 { return TerrainColor.Load(texel(v.position)); }
-float4 withDepth(V v, out float depth : SV_Depth) : SV_Target0 {
-    float4 color = TerrainColor.Load(texel(v.position));
-    depth = TerrainDepth.Load(texel(v.position));
+int3 texel(float4 position) { return int3(int(position.x), int(SourceHeight) - 1 - int(position.y), 0); }
+// Dx12GlInterop.FRAGMENT_SHADER: terrain blended over the scene; a replacement frame also writes its depth.
+float4 composite(V v) : SV_Target0 { return SourceColor.Load(texel(v.position)); }
+float4 compositeDepth(V v, out float depth : SV_Depth) : SV_Target0 {
+    float4 color = SourceColor.Load(texel(v.position));
+    depth = SourceDepth.Load(texel(v.position));
     if (depth >= 1.0 && color.a <= 0.0) discard;
     return color;
 }
+// InteropSceneCapture.capture: the scene color and its depth into the pack's input images.
+struct Exported { float4 color : SV_Target0; float depth : SV_Target1; };
+Exported exportScene(V v) {
+    Exported o;
+    o.color = SourceColor.Load(texel(v.position));
+    o.depth = SourceDepth.Load(texel(v.position));
+    return o;
+}
+// InteropSceneCapture.present / presentColor: the pack's output back into the scene.
+float4 importColor(V v) : SV_Target0 { return SourceColor.Load(texel(v.position)); }
+float4 importDepth(V v, out float depth : SV_Depth) : SV_Target0 {
+    depth = SourceDepth.Load(texel(v.position));
+    return SourceColor.Load(texel(v.position));
+}
 )";
-        bool writeDepth = depthFormat != DXGI_FORMAT_UNKNOWN;
+        static const char* entries[] = {"composite", "compositeDepth", "exportScene", "importColor", "importDepth"};
         ComPtr<ID3DBlob> vs, ps, log;
-        if (FAILED(D3DCompile(source, sizeof(source) - 1, "terrain composite", nullptr, nullptr, "vs", "vs_5_1",
+        if (FAILED(D3DCompile(source, sizeof(source) - 1, "backend transfer", nullptr, nullptr, "vs", "vs_5_1",
                     D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &vs, &log))
-                || FAILED(D3DCompile(source, sizeof(source) - 1, "terrain composite", nullptr, nullptr,
-                    writeDepth ? "withDepth" : "colorOnly", "ps_5_1", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &ps, &log)))
-            throw std::runtime_error(std::string("terrain composite shader: ")
+                || FAILED(D3DCompile(source, sizeof(source) - 1, "backend transfer", nullptr, nullptr,
+                    entries[static_cast<int>(kind)], "ps_5_1", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &ps, &log)))
+            throw std::runtime_error(std::string("backend transfer shader: ")
                     + (log ? static_cast<const char*>(log->GetBufferPointer()) : "D3DCompile failed"));
+        bool blended = kind == Transfer::Composite || kind == Transfer::CompositeDepth;
+        bool writeDepth = depthFormat != DXGI_FORMAT_UNKNOWN;
         D3D12_GRAPHICS_PIPELINE_STATE_DESC desc{};
         desc.pRootSignature = root.Get();
         desc.VS = {vs->GetBufferPointer(), vs->GetBufferSize()};
         desc.PS = {ps->GetBufferPointer(), ps->GetBufferSize()};
-        auto& blend = desc.BlendState.RenderTarget[0];
-        blend.BlendEnable = TRUE;
-        blend.SrcBlend = D3D12_BLEND_SRC_ALPHA;
-        blend.DestBlend = D3D12_BLEND_INV_SRC_ALPHA;
-        blend.BlendOp = D3D12_BLEND_OP_ADD;
-        blend.SrcBlendAlpha = D3D12_BLEND_ONE;
-        blend.DestBlendAlpha = D3D12_BLEND_INV_SRC_ALPHA;
-        blend.BlendOpAlpha = D3D12_BLEND_OP_ADD;
-        blend.LogicOp = D3D12_LOGIC_OP_NOOP;
-        blend.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+        for (UINT i = 0; i < 2; ++i) {
+            auto& blend = desc.BlendState.RenderTarget[i];
+            blend.BlendEnable = blended && i == 0 ? TRUE : FALSE;
+            blend.SrcBlend = D3D12_BLEND_SRC_ALPHA;
+            blend.DestBlend = D3D12_BLEND_INV_SRC_ALPHA;
+            blend.BlendOp = D3D12_BLEND_OP_ADD;
+            blend.SrcBlendAlpha = D3D12_BLEND_ONE;
+            blend.DestBlendAlpha = D3D12_BLEND_INV_SRC_ALPHA;
+            blend.BlendOpAlpha = D3D12_BLEND_OP_ADD;
+            blend.LogicOp = D3D12_LOGIC_OP_NOOP;
+            blend.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+        }
+        desc.BlendState.IndependentBlendEnable = TRUE;
         desc.SampleMask = UINT_MAX;
         desc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
         desc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
@@ -904,22 +1165,77 @@ float4 withDepth(V v, out float depth : SV_Depth) : SV_Target0 {
         desc.DepthStencilState.DepthWriteMask = writeDepth ? D3D12_DEPTH_WRITE_MASK_ALL : D3D12_DEPTH_WRITE_MASK_ZERO;
         desc.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_ALWAYS;
         desc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
-        desc.NumRenderTargets = 1;
-        desc.RTVFormats[0] = colorFormat;
+        desc.NumRenderTargets = color1 != DXGI_FORMAT_UNKNOWN ? 2 : 1;
+        desc.RTVFormats[0] = color0;
+        desc.RTVFormats[1] = color1;
         desc.DSVFormat = writeDepth ? depthViewFormat(depthFormat) : DXGI_FORMAT_UNKNOWN;
         desc.SampleDesc.Count = 1;
         ComPtr<ID3D12PipelineState> pso;
-        HRESULT result = device->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&pso));
-        if (FAILED(result)) throw std::runtime_error("terrain composite pipeline failed" + debugMessages());
-        return (compositePsos[key] = pso).Get();
+        if (FAILED(device->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&pso))))
+            throw std::runtime_error("backend transfer pipeline failed" + debugMessages());
+        return (transferPsos[key] = pso).Get();
     }
+    ID3D12PipelineState* compositePipeline(DXGI_FORMAT colorFormat, DXGI_FORMAT depthFormat) {
+        return transferPipeline(depthFormat != DXGI_FORMAT_UNKNOWN ? Transfer::CompositeDepth : Transfer::Composite,
+                colorFormat, DXGI_FORMAT_UNKNOWN, depthFormat);
+    }
+
+    // Records one full-screen transfer. views: t0, t1 (null for none). targets: up to two RTVs; dsv optional.
+    void recordTransfer(ID3D12PipelineState* pso, ID3D12Resource* source0, DXGI_FORMAT format0, ID3D12Resource* source1,
+            const D3D12_CPU_DESCRIPTOR_HANDLE* targets, UINT targetCount, const D3D12_CPU_DESCRIPTOR_HANDLE* depthView,
+            UINT sourceHeight, UINT width, UINT height) {
+        D3D12_SAMPLER_DESC pointClamp[kMaxTextures];
+        for (auto& desc : pointClamp) desc = samplerDesc(nullptr);
+        UINT samplerBase = samplerTable(pointClamp);
+        reserve(512, kMaxTextures);
+        UINT viewBase = allocateViews(kMaxTextures);
+        D3D12_SHADER_RESOURCE_VIEW_DESC view{};
+        view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        view.Texture2D.MipLevels = 1;
+        view.Format = format0;
+        device->CreateShaderResourceView(source0, &view, gpuViewCpu(viewBase));
+        view.Format = DXGI_FORMAT_R32_FLOAT;
+        if (source1) device->CreateShaderResourceView(source1, &view, gpuViewCpu(viewBase + 1));
+        for (UINT i = source1 ? 2 : 1; i < kMaxTextures; ++i)
+            device->CopyDescriptorsSimple(1, gpuViewCpu(viewBase + i), cpuView(nullView), D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        UINT64 constants = allocate(256, 256);
+        std::memcpy(ringData + constants, &sourceHeight, sizeof(sourceHeight));
+        list->OMSetRenderTargets(targetCount, targets, FALSE, depthView);
+        list->SetPipelineState(pso);
+        list->SetGraphicsRootSignature(root.Get());
+        ID3D12DescriptorHeap* heaps[] = {views.Get(), samplers.Get()};
+        list->SetDescriptorHeaps(2, heaps);
+        list->SetGraphicsRootConstantBufferView(0, ring->GetGPUVirtualAddress() + constants);
+        list->SetGraphicsRootDescriptorTable(1, gpuView(viewBase));
+        list->SetGraphicsRootDescriptorTable(2, gpuSampler(samplerBase));
+        D3D12_VIEWPORT viewport{0, 0, static_cast<float>(width), static_cast<float>(height), 0, 1};
+        D3D12_RECT scissor{0, 0, static_cast<LONG>(width), static_cast<LONG>(height)};
+        list->RSSetViewports(1, &viewport);
+        list->RSSetScissorRects(1, &scissor);
+        list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        list->DrawInstanced(3, 1, 0, 0);
+    }
+
+    void barrier(ID3D12Resource* resource, D3D12_RESOURCE_STATES before, D3D12_RESOURCE_STATES after) {
+        D3D12_RESOURCE_BARRIER b{};
+        b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        b.Transition = {resource, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, before, after};
+        list->ResourceBarrier(1, &b);
+    }
+
+    // RTVs for the terrain renderer's images, recreated on every export (they change on resize).
+    int terrainRtv[2] = {-1, -1};
+    ComPtr<ID3D12Fence> handOffFence;
+    UINT64 handOffValue = 0;
+
     struct Page { ComPtr<ID3D12Resource> buffer; UINT64 bytes = 0; std::map<UINT64, UINT64> free;
                   D3D12_RESOURCE_STATES state = D3D12_RESOURCE_STATE_COMMON; };
     static constexpr D3D12_RESOURCE_STATES kMeshRead = D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER | D3D12_RESOURCE_STATE_INDEX_BUFFER;
     static constexpr UINT64 kPageBytes = 32ull << 20;
     std::vector<Page> pages;
     std::unordered_map<int, MeshBuffers> meshes;
-    std::vector<Range> pendingFree;
+    std::vector<std::pair<UINT64, Range>> pendingFree;
     int nextMesh = 1;
     UINT64 meshBytesInUse = 0;
 
@@ -974,7 +1290,7 @@ float4 withDepth(V v, out float depth : SV_Depth) : SV_Target0 {
     }
     // A range may still be read by recorded commands; it is reused only after the next fence wait.
     void release(Range& range) {
-        if (range.bytes) pendingFree.push_back(range);
+        if (range.bytes) pendingFree.push_back({fenceValue + 1, range});
         range = {};
     }
     void give(const Range& range) {
@@ -1103,18 +1419,29 @@ float4 ps(V v) : SV_Target0 { return float4(Source.SampleLevel(Point, v.uv, 0).r
         return false;
     }
 
+    // Two frames in flight (present mode): each frame slot owns half of the upload ring and of the view ring.
+    UINT64 ringHalf() const { return (kRingBytes - persistentRing) / 2; }
+    UINT64 ringBase() const { return persistentRing + frameSlot * ringHalf(); }
+    UINT64 ringEnd() const { return ringBase() + ringHalf(); }
+    UINT viewBase() const { return frameSlot * (kViewRing / 2); }
+    UINT viewEnd() const { return viewBase() + kViewRing / 2; }
+
     UINT64 allocate(UINT64 bytes, UINT64 alignment) {
         UINT64 offset = alignUp(ringOffset, alignment);
-        if (offset + bytes > kRingBytes) {
+        if (offset + bytes > (oversize ? kRingBytes : ringEnd())) {
             if (bytes + persistentRing > kRingBytes) throw std::runtime_error("upload larger than the DX12 backend ring");
-            flush();
+            flush(); // everything idle: both halves are free
             offset = alignUp(ringOffset, alignment);
+            if (offset + bytes > ringEnd()) { // larger than a frame's half: use the whole ring until the next flush
+                offset = alignUp(persistentRing, alignment);
+                oversize = true;
+            }
         }
         ringOffset = offset + bytes;
         return offset;
     }
     UINT allocateViews(UINT count) {
-        if (viewOffset + count > kViewRing) flush();
+        if (viewOffset + count > viewEnd()) flush();
         UINT base = viewOffset;
         viewOffset += count;
         return base;
@@ -1123,7 +1450,8 @@ float4 ps(V v) : SV_Target0 { return float4(Source.SampleLevel(Point, v.uv, 0).r
     // draw's data is written. Allocations made after this never flush.
     void reserve(UINT64 ringBytes, UINT views) {
         if (ringBytes + persistentRing + 256 > kRingBytes) throw std::runtime_error("draw larger than the DX12 backend ring");
-        if (alignUp(ringOffset, 256) + ringBytes > kRingBytes || viewOffset + views > kViewRing) flush();
+        if (ringBytes > ringHalf()) throw std::runtime_error("draw larger than a frame of the DX12 backend ring");
+        if (alignUp(ringOffset, 256) + ringBytes > (oversize ? kRingBytes : ringEnd()) || viewOffset + views > viewEnd()) flush();
     }
     UINT samplerTable(const D3D12_SAMPLER_DESC (&descs)[kMaxTextures]) {
         std::string key(reinterpret_cast<const char*>(descs), sizeof(descs));
@@ -1186,9 +1514,20 @@ float4 ps(V v) : SV_Target0 { return float4(Source.SampleLevel(Point, v.uv, 0).r
         return static_cast<int>(next++);
     }
 
+    // Resources and mesh ranges released while recorded or in-flight commands may use them: freed once the fence
+    // passes the value that covers everything recorded so far.
     void retire(ComPtr<ID3D12Resource>& resource) {
-        if (resource) retired.push_back(resource);
+        if (resource) retired.push_back({fenceValue + 1, resource});
         resource.Reset();
+    }
+    void releaseCompleted(UINT64 completed) {
+        retired.erase(std::remove_if(retired.begin(), retired.end(), [&](const auto& r) { return r.first <= completed; }), retired.end());
+        auto keep = pendingFree.begin();
+        for (auto it = pendingFree.begin(); it != pendingFree.end(); ++it) {
+            if (it->first <= completed) give(it->second);
+            else *keep++ = *it;
+        }
+        pendingFree.erase(keep, pendingFree.end());
     }
 
     void create(Texture& texture, DXGI_FORMAT format, bool depth, int internal, UINT width, UINT height, UINT levels) {
@@ -1201,13 +1540,15 @@ float4 ps(V v) : SV_Target0 { return float4(Source.SampleLevel(Point, v.uv, 0).r
         desc.MipLevels = static_cast<UINT16>(levels);
         desc.Format = format;
         desc.SampleDesc.Count = 1;
-        desc.Flags = depth ? D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL : D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+        bool target = depth || texture.renderTarget;
+        desc.Flags = depth ? D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL
+                : texture.renderTarget ? D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET : D3D12_RESOURCE_FLAG_NONE;
         D3D12_HEAP_PROPERTIES heapProps{D3D12_HEAP_TYPE_DEFAULT};
         D3D12_CLEAR_VALUE clear{};
         clear.Format = depth ? depthViewFormat(format) : format;
         if (depth) clear.DepthStencil.Depth = 1.0f;
         check(device->CreateCommittedResource(&heapProps, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON,
-                &clear, IID_PPV_ARGS(&texture.resource)), "texture");
+                target ? &clear : nullptr, IID_PPV_ARGS(&texture.resource)), "texture");
         if (info) texture.resource->SetName((L"Direct backend texture " + std::to_wstring(width) + L"x" + std::to_wstring(height)).c_str());
         texture.state = D3D12_RESOURCE_STATE_COMMON;
         texture.format = format;
@@ -1229,7 +1570,7 @@ float4 ps(V v) : SV_Target0 { return float4(Source.SampleLevel(Point, v.uv, 0).r
             view.Format = depthViewFormat(format);
             view.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D;
             device->CreateDepthStencilView(texture.resource.Get(), &view, dsv(texture));
-        } else {
+        } else if (texture.renderTarget) {
             if (texture.rtv < 0) texture.rtv = take(freeRtvs, rtvNext, 4096);
             D3D12_RENDER_TARGET_VIEW_DESC view{};
             view.Format = format;
@@ -1238,9 +1579,29 @@ float4 ps(V v) : SV_Target0 { return float4(Source.SampleLevel(Point, v.uv, 0).r
         }
     }
 
+    // First draw or clear into a color texture: recreate it as a render target, keeping its contents.
+    void ensureRenderTarget(Texture& texture) {
+        if (texture.depth || texture.renderTarget) return;
+        ComPtr<ID3D12Resource> old = texture.resource;
+        D3D12_RESOURCE_STATES oldState = texture.state;
+        texture.renderTarget = true;
+        create(texture, texture.format, false, texture.glInternal, texture.width, texture.height, texture.levels);
+        if (!old) return;
+        D3D12_RESOURCE_BARRIER barriers[2]{};
+        for (auto& b : barriers) b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        barriers[0].Transition = {old.Get(), D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, oldState, D3D12_RESOURCE_STATE_COPY_SOURCE};
+        barriers[1].Transition = {texture.resource.Get(), D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_COMMON,
+                                  D3D12_RESOURCE_STATE_COPY_DEST};
+        list->ResourceBarrier(oldState == D3D12_RESOURCE_STATE_COPY_SOURCE ? 1 : 2, oldState == D3D12_RESOURCE_STATE_COPY_SOURCE ? barriers + 1 : barriers);
+        list->CopyResource(texture.resource.Get(), old.Get());
+        texture.state = D3D12_RESOURCE_STATE_COPY_DEST;
+    }
+
     Texture* colorTarget(int id) {
         auto it = textures.find(id);
-        return id > 0 && it != textures.end() && it->second.resource && !it->second.depth ? &it->second : nullptr;
+        if (id <= 0 || it == textures.end() || !it->second.resource || it->second.depth) return nullptr;
+        ensureRenderTarget(it->second);
+        return &it->second;
     }
     Texture* depthTarget(int id) {
         auto it = textures.find(id);
@@ -1399,6 +1760,12 @@ BACKEND(messages) jstring JNICALL JNI_NAME(messages)(JNIEnv* env, jclass) {
     std::string text = g_backend ? g_backend->takeMessages() : std::string();
     return env->NewStringUTF(text.c_str());
 }
+BACKEND(takeGpuMs) jdouble JNICALL JNI_NAME(takeGpuMs)(JNIEnv*, jclass) { return g_backend ? g_backend->takeGpuMs() : 0; }
+BACKEND(takeCategoryMs) void JNICALL JNI_NAME(takeCategoryMs)(JNIEnv* env, jclass, jdoubleArray out) {
+    double values[16] = {};
+    if (g_backend) g_backend->takeCategoryMs(values);
+    env->SetDoubleArrayRegion(out, 0, (std::min)(env->GetArrayLength(out), 7), values);
+}
 BACKEND(draws) jlong JNICALL JNI_NAME(draws)(JNIEnv*, jclass) { return g_backend ? static_cast<jlong>(g_backend->draws()) : 0; }
 
 BACKEND(textureImage) void JNICALL JNI_NAME(textureImage)(JNIEnv* env, jclass, jint id, jint level, jint internal, jint w, jint h) {
@@ -1470,6 +1837,16 @@ BACKEND(compositeTerrain) jboolean JNICALL JNI_NAME(compositeTerrain)(JNIEnv* en
     });
     return done;
 }
+BACKEND(exportScene) jboolean JNICALL JNI_NAME(exportScene)(JNIEnv* env, jclass, jint fbo, jboolean handOff) {
+    jboolean done = JNI_FALSE;
+    guarded(env, [&] { done = g_backend->exportScene(fbo, handOff == JNI_TRUE) ? JNI_TRUE : JNI_FALSE; });
+    return done;
+}
+BACKEND(importScene) jboolean JNICALL JNI_NAME(importScene)(JNIEnv* env, jclass, jint fbo, jlong readyValue, jboolean withDepth) {
+    jboolean done = JNI_FALSE;
+    guarded(env, [&] { done = g_backend->importScene(fbo, static_cast<UINT64>(readyValue), withDepth == JNI_TRUE) ? JNI_TRUE : JNI_FALSE; });
+    return done;
+}
 BACKEND(terrainComposites) jlong JNICALL JNI_NAME(terrainComposites)(JNIEnv*, jclass) {
     return g_backend ? static_cast<jlong>(g_backend->terrainCompositeCount()) : 0;
 }
@@ -1520,11 +1897,11 @@ BACKEND(draw) void JNICALL JNI_NAME(draw)(JNIEnv* env, jclass, jint program, jin
     });
 }
 BACKEND(present) jint JNICALL JNI_NAME(present)(JNIEnv* env, jclass, jlong hwnd, jint texture, jint width, jint height,
-        jboolean vsync, jboolean verify) {
+        jboolean vsync, jboolean verify, jboolean pipelined) {
     jint matches = -1;
     guarded(env, [&] {
         matches = g_backend->present(reinterpret_cast<HWND>(hwnd), texture, static_cast<UINT>(width), static_cast<UINT>(height),
-                vsync == JNI_TRUE, verify == JNI_TRUE);
+                vsync == JNI_TRUE, verify == JNI_TRUE, pipelined == JNI_TRUE);
     });
     return matches;
 }

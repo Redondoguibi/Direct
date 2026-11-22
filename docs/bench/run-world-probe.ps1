@@ -16,6 +16,9 @@ param(
     [switch] $SkipGl,
     [switch] $VerifyMeshes,
     [switch] $DirectTerrain,
+    [switch] $Pack,
+    [string] $PackName = "",
+    [switch] $Dx12Translucency,
     [switch] $Hidden
 )
 $ErrorActionPreference = "Stop"
@@ -26,7 +29,8 @@ $version = ((Get-Content -LiteralPath "$project/gradle.properties" | Select-Stri
 $jar = Get-Item -LiteralPath "$project/build/libs/direct-$version.jar"
 $case = Join-Path $project ("build/phase2-world/" + [guid]::NewGuid().ToString("N"))
 $mods = New-Item -ItemType Directory -Path "$case/mods" -Force
-Get-ChildItem -LiteralPath "$Source/mods" -Filter *.jar | Where-Object { $_.Name -notlike 'direct-*' -and $_.Name -notlike 'raydiance*' } |
+# -Pack: Raydiance and its configuration (shader pack and options) from the source case too.
+Get-ChildItem -LiteralPath "$Source/mods" -Filter *.jar | Where-Object { $_.Name -notlike 'direct-*' -and ($Pack -or $_.Name -notlike 'raydiance*') } |
     ForEach-Object { Copy-Item -LiteralPath $_.FullName -Destination $mods.FullName }
 Copy-Item -LiteralPath $jar.FullName -Destination $mods.FullName
 New-Item -ItemType Directory -Path "$case/saves" -Force | Out-Null
@@ -37,7 +41,17 @@ $options = Get-Content -LiteralPath "$Source/options.txt" | Where-Object { $_ -n
     Set-Content -LiteralPath "$case/options.txt" -Encoding ascii
 # -DirectTerrain: Direct's DX12 terrain replaces vanilla terrain (the hybrid mode); the backend composites it itself.
 New-Item -ItemType Directory -Path "$case/config" -Force | Out-Null
-"enableDx12Preview = $(if ($DirectTerrain) { 'true' } else { 'false' })" | Set-Content -LiteralPath "$case/config/direct-client.toml" -Encoding ascii
+if ($Pack) {
+    Copy-Item -LiteralPath "$Source/config/raydiance-client.toml" -Destination "$case/config/"
+    Copy-Item -LiteralPath "$Source/config/raydiance" -Destination "$case/config/raydiance" -Recurse
+    if ($PackName) {
+        # Without a byte order mark: the TOML parser rejects one, and the file would be recreated with defaults.
+        $lines = (Get-Content -LiteralPath "$case/config/raydiance-client.toml") -replace '^openglPack = .*$', "openglPack = `"$PackName`""
+        [System.IO.File]::WriteAllLines("$case/config/raydiance-client.toml", $lines, (New-Object System.Text.UTF8Encoding($false)))
+    }
+}
+@("enableDx12Preview = $(if ($DirectTerrain) { 'true' } else { 'false' })",
+  "dx12Translucency = $(if ($Dx12Translucency) { 'true' } else { 'false' })") | Set-Content -LiteralPath "$case/config/direct-client.toml" -Encoding ascii
 $jvmArgs = @('-Xmx3G', '-Ddirect.phase1.shadow=true', '-Ddirect.phase1.probe=true', '-Ddirect.phase2.world=true', "@`"$clientcp`"",
     "@`"$moddev/clientRunVmArgs.txt`"", 'net.neoforged.devlaunch.Main', "@`"$moddev/clientRunProgramArgs.txt`"",
     '--quickPlaySingleplayer', $World, '--width', "$Width", '--height', "$Height", '--username', 'Dev')

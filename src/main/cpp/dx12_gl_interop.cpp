@@ -2927,8 +2927,11 @@ bool bridgeBegin(InteropRenderer* r, FrameSlot& slot, bool importDepth, bool sam
 
 // Epilogue: optionally exports the native depth into the bridge (a D3D12 copy instead of a D3D11
 // one), returns the bridge to COMMON and hands both images to D3D11On12 for the next WGL lock.
+bool g_backendOnly = false; // directTerrainBackendOnly
+
 bool bridgeEnd(InteropRenderer* r, FrameSlot& slot, bool exportDepth) {
     if (!r->directBridge) return true;
+    if (g_backendOnly) exportDepth = false; // nobody samples the bridge after this frame
     if (r->bridgeSampling || exportDepth) {
         auto* list = r->bridgeEndList;
         if (FAILED(slot.bridgeEnd->Reset()) || FAILED(list->Reset(slot.bridgeEnd, nullptr))) return false;
@@ -2954,7 +2957,7 @@ bool bridgeEnd(InteropRenderer* r, FrameSlot& slot, bool exportDepth) {
         r->queue->ExecuteCommandLists(1, lists);
         r->bridgeSampling = false;
     }
-    return acquireBridgeInterop(r);
+    return g_backendOnly ? true : acquireBridgeInterop(r);
 }
 
 bool recordExtensionPasses(InteropRenderer* renderer, FrameSlot& slot, UINT64 frameIndex,
@@ -5009,7 +5012,17 @@ bool directTerrainOutput(DirectTerrainOutput* out) {
     out->depth = r->depthTarget;
     out->fence = r->fence;
     out->queue = r->queue;
+    out->depthBridge = r->directBridge ? r->depthBridge : nullptr;
     out->width = r->width;
     out->height = r->height;
     return true;
 }
+
+bool directTerrainHandOff(ID3D12Fence* fence, UINT64 value) {
+    InteropRenderer* r = g_interopRenderer;
+    if (r == nullptr) return false;
+    releaseBridgeInterop(r);
+    return SUCCEEDED(r->queue->Signal(fence, value));
+}
+
+void directTerrainBackendOnly(bool enabled) { g_backendOnly = enabled; }

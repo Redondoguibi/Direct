@@ -75,7 +75,7 @@ public final class Dx12Shadow {
     // ---- Statistics --------------------------------------------------------------------------------------------
     static long draws, skippedDraws, errors;
     /** Per frame: VertexBuffer.draw calls, draws handed to native, and the native count at frame start. */
-    static int frameCalls, frameDraws, lastCalls, lastDraws, frameTerrain, lastTerrain;
+    static int frameCalls, frameDraws, lastCalls, lastDraws, frameTerrain, lastTerrain, framePack, lastPack;
     static long nativeAtFrameStart, lastNative;
     // ---- Trace (-Ddirect.phase1.trace=true): every clear and draw of the current frame ----------------------------
     static final boolean TRACE = Boolean.getBoolean("direct.phase1.trace");
@@ -112,8 +112,28 @@ public final class Dx12Shadow {
 
     // ---- State hooks (GlStateManager HEAD) ---------------------------------------------------------------------
     public static void blend(boolean enabled) { blend = enabled; }
-    public static void blendFunc(int src, int dst) { srcRgb = srcAlpha = src; dstRgb = dstAlpha = dst; }
-    public static void blendFuncSeparate(int src, int dst, int srcA, int dstA) { srcRgb = src; dstRgb = dst; srcAlpha = srcA; dstAlpha = dstA; }
+    // GlStateManager.BLEND caches only what it last sent: _blendFunc compares and records the RGB pair alone, so when
+    // that pair is unchanged OpenGL keeps the previous alpha factors. The mirror follows the same cache, so the
+    // effective factors below are what OpenGL really uses (the entity outline chain depends on it).
+    private static int cacheSrcRgb = 1, cacheDstRgb = 0, cacheSrcAlpha = 1, cacheDstAlpha = 0;
+    public static void blendFunc(int src, int dst) {
+        if (src == cacheSrcRgb && dst == cacheDstRgb) return;
+        cacheSrcRgb = src;
+        cacheDstRgb = dst;
+        srcRgb = srcAlpha = src; // glBlendFunc sets both
+        dstRgb = dstAlpha = dst;
+    }
+    public static void blendFuncSeparate(int src, int dst, int srcA, int dstA) {
+        if (src == cacheSrcRgb && dst == cacheDstRgb && srcA == cacheSrcAlpha && dstA == cacheDstAlpha) return;
+        cacheSrcRgb = src;
+        cacheDstRgb = dst;
+        cacheSrcAlpha = srcA;
+        cacheDstAlpha = dstA;
+        srcRgb = src;
+        dstRgb = dst;
+        srcAlpha = srcA;
+        dstAlpha = dstA;
+    }
     public static void blendEquation(int mode) { equation = mode; }
     public static void depthTest(boolean enabled) { depthTest = enabled; }
     public static void depthFunc(int func) { depthFunc = func; }
@@ -208,10 +228,20 @@ public final class Dx12Shadow {
         }
     }
 
+    private static final Map<String, long[]> uploadStats = new HashMap<>();
+    private static void countUpload(int texture, int level, int width, int height) {
+        if (timingStart == 0) return;
+        String key = "tex" + texture + "/L" + level;
+        long[] v = uploadStats.computeIfAbsent(key, k -> new long[2]);
+        v[0]++;
+        v[1] += (long) width * height;
+    }
+
     public static void texSubImage2D(int target, int level, int x, int y, int width, int height, int format, int type, long pixels) {
         if (target != GL_TEXTURE_2D || type != 5121 || pixels == 0 || !live()) return;
         int texture = boundTexture();
         if (texture == 0) return;
+        countUpload(texture, level, width, height);
         try {
             Dx12BackendNative.textureSubImage(texture, level, x, y, width, height, format, pixels,
                     unpackRowLength, unpackSkipPixels, unpackSkipRows, unpackAlignment);
@@ -225,6 +255,7 @@ public final class Dx12Shadow {
         if (pixels == null || !live()) return;
         int texture = boundTexture();
         if (texture == 0) return;
+        countUpload(texture, level, width, height);
         try {
             Dx12BackendNative.textureSubImage(texture, level, x, y, width, height, glFormat, MemoryUtil.memAddress(pixels),
                     width, 0, 0, components);
@@ -399,6 +430,38 @@ public final class Dx12Shadow {
             return done;
         } catch (RuntimeException ex) {
             fail("compositeTerrain", ex);
+            return false;
+        }
+    }
+
+    /**
+     * Dx12GlInterop (translucency and world passes of a shader pack): the backend's scene in framebuffer {@code fbo}
+     * becomes the pack's input. The caller then runs the native pack frame and calls {@link #importScene}.
+     */
+    public static boolean exportScene(int fbo) {
+        if (!live()) return false;
+        try {
+            if (TRACE) trace.append(String.format("export fbo=%d%n", fbo));
+            boolean done = Dx12BackendNative.exportScene(fbo, true);
+            if (done) framePack++;
+            return done;
+        } catch (RuntimeException ex) {
+            fail("exportScene", ex);
+            return false;
+        }
+    }
+
+    /** The pack frame {@code readyValue} replaces the color (and depth) of framebuffer {@code fbo}. */
+    public static boolean importScene(int fbo, long readyValue, boolean withDepth) {
+        if (!live()) return false;
+        try {
+            if (TRACE) trace.append(String.format("import fbo=%d ready=%d depth=%s%n", fbo, readyValue, withDepth));
+            boolean done = Dx12BackendNative.importScene(fbo, readyValue, withDepth);
+            // Shadow mode: OpenGL's own pack stages write the same shared images next; the import must have run.
+            if (done && !(SKIP_GL && presenting())) Dx12BackendNative.flush();
+            return done;
+        } catch (RuntimeException ex) {
+            fail("importScene", ex);
             return false;
         }
     }
@@ -622,6 +685,48 @@ public final class Dx12Shadow {
 
     // ---- Frame -------------------------------------------------------------------------------------------------
     /** Window.updateDisplay: everything of the frame is recorded; run it so the next frame starts empty. */
+    // ---- Timing (present mode): where the frame waits, logged every 600 frames ---------------------------------
+    private static long timingStart, timingPresentNanos, timingStageNanos, timingFrames;
+    private static double timingBackendGpu, timingPackGpu, timingPackImportGpu;
+    private static final double[] timingCategories = new double[7], categoryScratch = new double[7];
+
+    /** Dx12GlInterop: GPU time of a pack stage (scene import inside the renderer, passes) in milliseconds. */
+    public static void packGpu(double importMs, double passesMs) { timingPackImportGpu += importMs; timingPackGpu += passesMs; }
+
+    /** Dx12GlInterop: CPU time spent waiting for a terrain or pack stage on the GPU. */
+    public static void stageWait(long nanos) { timingStageNanos += nanos; }
+
+    private static void timing(long presentNanos) {
+        long now = System.nanoTime();
+        if (timingStart == 0) { timingStart = now; return; }
+        timingPresentNanos += presentNanos;
+        timingBackendGpu += Dx12BackendNative.takeGpuMs();
+        Dx12BackendNative.takeCategoryMs(categoryScratch);
+        for (int i = 0; i < 7; i++) timingCategories[i] += categoryScratch[i];
+        if (++timingFrames < 600) return;
+        double frames = timingFrames, total = (now - timingStart) / 1e6 / frames;
+        double present = timingPresentNanos / 1e6 / frames, stages = timingStageNanos / 1e6 / frames;
+        Direct.LOGGER.info(String.format(java.util.Locale.ROOT,
+                "Direct DX12 backend timing: %.2f ms/frame (%.1f FPS), present+GPU wait %.2f ms, stage waits %.2f ms, rest of CPU %.2f ms;"
+                        + " GPU: backend lists %.2f ms, pack passes %.2f ms (+%.2f inside the renderer before them)",
+                total, 1000 / total, present, stages, total - present - stages, timingBackendGpu / frames,
+                timingPackGpu / frames, timingPackImportGpu / frames));
+        Direct.LOGGER.info(String.format(java.util.Locale.ROOT,
+                "Direct DX12 backend GPU by operation (ms/frame): composite %.2f, export %.2f, import %.2f, present %.2f, copy %.2f, clear %.2f, upload %.2f",
+                timingCategories[0] / frames, timingCategories[1] / frames, timingCategories[2] / frames, timingCategories[3] / frames,
+                timingCategories[4] / frames, timingCategories[5] / frames, timingCategories[6] / frames));
+        java.util.Arrays.fill(timingCategories, 0);
+        StringBuilder uploads = new StringBuilder();
+        uploadStats.entrySet().stream().sorted((a, b) -> Long.compare(b.getValue()[0], a.getValue()[0])).limit(8)
+                .forEach(e -> uploads.append(String.format(java.util.Locale.ROOT, " %s: %.1f/frame %.0f px/frame;", e.getKey(),
+                        e.getValue()[0] / frames, e.getValue()[1] / frames)));
+        Direct.LOGGER.info("Direct DX12 backend uploads:{}", uploads);
+        uploadStats.clear();
+        timingStart = now;
+        timingPresentNanos = timingStageNanos = timingFrames = 0;
+        timingBackendGpu = timingPackGpu = timingPackImportGpu = 0;
+    }
+
     public static void endFrame() {
         if (!ready) return;
         frameIndex++;
@@ -629,6 +734,8 @@ public final class Dx12Shadow {
         lastDraws = frameDraws;
         lastTerrain = frameTerrain;
         frameTerrain = 0;
+        lastPack = framePack;
+        framePack = 0;
         long nativeNow = Dx12BackendNative.draws();
         lastNative = nativeNow - nativeAtFrameStart;
         nativeAtFrameStart = nativeNow;
@@ -638,9 +745,11 @@ public final class Dx12Shadow {
             if (presenting()) {
                 var mc = net.minecraft.client.Minecraft.getInstance();
                 var window = mc.getWindow();
+                long presentStart = System.nanoTime();
                 int matches = Dx12BackendNative.present(org.lwjgl.glfw.GLFWNativeWin32.glfwGetWin32Window(window.getWindow()),
                         mc.getMainRenderTarget().getColorTextureId(), window.getWidth(), window.getHeight(),
-                        mc.options.enableVsync().get(), Dx12ShadowProbe.verifyDesktop());
+                        mc.options.enableVsync().get(), Dx12ShadowProbe.verifyDesktop(), SKIP_GL);
+                timing(System.nanoTime() - presentStart);
                 if (matches >= 0) Dx12ShadowProbe.desktop(matches);
             } else {
                 Dx12BackendNative.flush();
