@@ -7,7 +7,7 @@ final class Dx12BackendNative {
     private Dx12BackendNative() {}
 
     /** @param debug enable the D3D12 debug layer; validation messages are appended to pipeline errors */
-    static native void create(boolean debug);
+    static native void create(boolean debug, boolean profileUploads);
     static native void destroy();
     /** Executes everything recorded so far and waits for the GPU. */
     static native void flush();

@@ -10,6 +10,7 @@ import java.nio.IntBuffer;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.IdentityHashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -44,6 +45,7 @@ public final class Dx12Shadow {
     /** -Ddirect.phase1.skipGl=true (with present): OpenGL draws are cancelled; only DX12 renders. */
     public static final boolean SKIP_GL = PRESENT && Boolean.getBoolean("direct.phase1.skipGl");
     private static final int GL_TEXTURE_2D = 3553;
+    private static final boolean PROFILE_UPLOADS = Boolean.getBoolean("direct.phase1.profileUploads");
 
     private static boolean ready, broken;
     // ---- Mirrored OpenGL state ---------------------------------------------------------------------------------
@@ -68,7 +70,8 @@ public final class Dx12Shadow {
     private static final Map<Integer, float[]> params = new HashMap<>();
     // ---- Programs ----------------------------------------------------------------------------------------------
     private record ProgramInfo(int id, int cbufferBytes, String[] inputNames, int[] inputLocations,
-                               String[] uniformNames, int[] uniformOffsets, String[] uniformTypes, String[] samplers) {}
+                               String[] uniformNames, int[] uniformOffsets, String[] uniformTypes, String[] samplers,
+                               Map<VertexFormat, int[]> layouts, int[] textureUnits) {}
     private static final Map<String, ProgramInfo> programs = new HashMap<>();
     private static final Map<String, String> unsupported = new LinkedHashMap<>();
     private static final ByteBuffer cbuffer = ByteBuffer.allocateDirect(4096).order(ByteOrder.LITTLE_ENDIAN);
@@ -90,7 +93,7 @@ public final class Dx12Shadow {
         if (ready) return true;
         try {
             NativeLibrary.load();
-            Dx12BackendNative.create(Boolean.getBoolean("direct.phase1.debug"));
+            Dx12BackendNative.create(Boolean.getBoolean("direct.phase1.debug"), PROFILE_UPLOADS);
             ready = true;
             Direct.LOGGER.info("Direct phase1 shadow backend created");
         } catch (IOException | RuntimeException | LinkageError ex) {
@@ -204,7 +207,7 @@ public final class Dx12Shadow {
             case 34049 -> 5; case 33082 -> 6; case 33083 -> 7;
             default -> -1;
         };
-        if (index < 0) return;
+        if (index < 0 || Float.floatToIntBits(p[index]) == Float.floatToIntBits(value)) return;
         p[index] = value;
         try {
             Dx12BackendNative.textureParams(texture, (int) p[0], (int) p[1], (int) p[2], (int) p[3], (int) p[4], p[5], p[6], p[7]);
@@ -230,7 +233,7 @@ public final class Dx12Shadow {
 
     private static final Map<String, long[]> uploadStats = new HashMap<>();
     private static void countUpload(int texture, int level, int width, int height) {
-        if (timingStart == 0) return;
+        if (!PROFILE_UPLOADS || timingStart == 0) return;
         String key = "tex" + texture + "/L" + level;
         long[] v = uploadStats.computeIfAbsent(key, k -> new long[2]);
         v[0]++;
@@ -313,7 +316,8 @@ public final class Dx12Shadow {
                 for (int i = 0; i < samplers.length; i++) samplers[i] = samplerArray.get(i).getAsString();
                 int cbufferBytes = json.get("cbufferSize").getAsInt();
                 int id = Dx12BackendNative.createProgram(key, vertex, fragment, cbufferBytes, samplers.length);
-                info = new ProgramInfo(id, cbufferBytes, inputNames, inputLocations, uniformNames, uniformOffsets, uniformTypes, samplers);
+                info = new ProgramInfo(id, cbufferBytes, inputNames, inputLocations, uniformNames, uniformOffsets,
+                        uniformTypes, samplers, new IdentityHashMap<>(), new int[samplers.length]);
             }
         } catch (IOException | RuntimeException ex) {
             unsupported.putIfAbsent(key, String.valueOf(ex.getMessage()));
@@ -571,23 +575,16 @@ public final class Dx12Shadow {
         ProgramInfo info = program(kind, name);
         if (info == null) { skippedDraws++; if (TRACE) trace.append("skip ").append(kind).append('/').append(name).append(System.lineSeparator()); return; }
         try {
-            // Vertex layout: format elements matched to the program's inputs by attribute name.
-            List<Integer> layout = new ArrayList<>();
             VertexFormat format = mesh.format;
-            for (VertexFormatElement element : format.getElements()) {
-                String attribute = format.getElementName(element);
-                for (int i = 0; i < info.inputNames.length; i++) {
-                    if (!info.inputNames[i].equals(attribute)) continue;
-                    int dxgi = dxgiFormat(element);
-                    if (dxgi == 0) throw new IllegalStateException("unsupported vertex element " + element + " for " + attribute);
-                    layout.add(info.inputLocations[i]);
-                    layout.add(dxgi);
-                    layout.add(format.getOffset(element));
-                }
+            int[] layoutArray = info.layouts.get(format);
+            if (layoutArray == null) {
+                layoutArray = buildLayout(info, format);
+                // Bound the per-program cache for mods that create transient VertexFormat instances.
+                if (info.layouts.size() >= 16) info.layouts.clear();
+                info.layouts.put(format, layoutArray);
             }
-            int[] layoutArray = layout.stream().mapToInt(Integer::intValue).toArray();
             packUniforms(current, info);
-            int[] textures = new int[info.samplers.length];
+            int[] textures = info.textureUnits;
             for (int i = 0; i < textures.length; i++) textures[i] = sampler(current, info.samplers[i]);
             int[] state = {
                     blend ? 1 : 0, srcRgb, dstRgb, srcAlpha, dstAlpha, equation, equation,
@@ -617,6 +614,23 @@ public final class Dx12Shadow {
         StringBuilder out = new StringBuilder("[");
         for (int i = 0; i < Math.min(bytes, 160); i += 4) out.append(i == 0 ? "" : ",").append(String.format("%.3g", cbuffer.getFloat(i)));
         return out.append(bytes > 160 ? ",...]" : "]").toString();
+    }
+
+    private static int[] buildLayout(ProgramInfo info, VertexFormat format) {
+        // Match the immutable vertex format to the program's declared inputs.
+        List<Integer> layout = new ArrayList<>();
+        for (VertexFormatElement element : format.getElements()) {
+            String attribute = format.getElementName(element);
+            for (int i = 0; i < info.inputNames.length; i++) {
+                if (!info.inputNames[i].equals(attribute)) continue;
+                int dxgi = dxgiFormat(element);
+                if (dxgi == 0) throw new IllegalStateException("unsupported vertex element " + element + " for " + attribute);
+                layout.add(info.inputLocations[i]);
+                layout.add(dxgi);
+                layout.add(format.getOffset(element));
+            }
+        }
+        return layout.stream().mapToInt(Integer::intValue).toArray();
     }
 
     private static int dxgiFormat(VertexFormatElement element) {
@@ -716,12 +730,14 @@ public final class Dx12Shadow {
                 timingCategories[0] / frames, timingCategories[1] / frames, timingCategories[2] / frames, timingCategories[3] / frames,
                 timingCategories[4] / frames, timingCategories[5] / frames, timingCategories[6] / frames));
         java.util.Arrays.fill(timingCategories, 0);
-        StringBuilder uploads = new StringBuilder();
-        uploadStats.entrySet().stream().sorted((a, b) -> Long.compare(b.getValue()[0], a.getValue()[0])).limit(8)
-                .forEach(e -> uploads.append(String.format(java.util.Locale.ROOT, " %s: %.1f/frame %.0f px/frame;", e.getKey(),
-                        e.getValue()[0] / frames, e.getValue()[1] / frames)));
-        Direct.LOGGER.info("Direct DX12 backend uploads:{}", uploads);
-        uploadStats.clear();
+        if (PROFILE_UPLOADS) {
+            StringBuilder uploads = new StringBuilder();
+            uploadStats.entrySet().stream().sorted((a, b) -> Long.compare(b.getValue()[0], a.getValue()[0])).limit(8)
+                    .forEach(e -> uploads.append(String.format(java.util.Locale.ROOT, " %s: %.1f/frame %.0f px/frame;", e.getKey(),
+                            e.getValue()[0] / frames, e.getValue()[1] / frames)));
+            Direct.LOGGER.info("Direct DX12 backend uploads:{}", uploads);
+            uploadStats.clear();
+        }
         timingStart = now;
         timingPresentNanos = timingStageNanos = timingFrames = 0;
         timingBackendGpu = timingPackGpu = timingPackImportGpu = 0;

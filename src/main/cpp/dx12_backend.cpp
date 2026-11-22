@@ -168,7 +168,7 @@ D3D12_TEXTURE_ADDRESS_MODE address(int gl) {
 
 class Backend {
 public:
-    explicit Backend(bool debug) {
+    explicit Backend(bool debug, bool profileUploads) : profileUploads(profileUploads) {
         if (debug) {
             ComPtr<ID3D12Debug> layer;
             if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&layer)))) layer->EnableDebugLayer();
@@ -290,9 +290,9 @@ public:
         D3D12_TEXTURE_COPY_LOCATION source{ring.Get(), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT};
         source.PlacedFootprint.Offset = offset;
         source.PlacedFootprint.Footprint = {texture.format, w, h, 1, pitch};
-        gpuBegin();
+        if (profileUploads) gpuBegin();
         list->CopyTextureRegion(&dest, static_cast<UINT>(x), static_cast<UINT>(y), 0, &source, nullptr);
-        gpuEnd(kUpload);
+        if (profileUploads) gpuEnd(kUpload);
     }
 
     void textureParams(int id, int minFilter, int magFilter, int wrapS, int wrapT, int maxLevel, float lodBias,
@@ -576,16 +576,20 @@ public:
         if (depth) transition(*depth, D3D12_RESOURCE_STATE_DEPTH_WRITE);
         const D3D12_RESOURCE_STATES read = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
         // Depth: the renderer's depth target, which a translucent frame updated (the bridge is only exported for OpenGL).
-        barrier(t.color, D3D12_RESOURCE_STATE_RENDER_TARGET, read);
-        barrier(t.depth, D3D12_RESOURCE_STATE_DEPTH_WRITE, read);
+        ID3D12Resource* worldColor = withDepth ? nullptr : directWorldColor(readyValue);
+        if (!worldColor) barrier(t.color, D3D12_RESOURCE_STATE_RENDER_TARGET, read);
+        if (depth) barrier(t.depth, D3D12_RESOURCE_STATE_DEPTH_WRITE, read);
         D3D12_CPU_DESCRIPTOR_HANDLE rtvHandle = rtv(*color), dsvHandle{};
         if (depth) dsvHandle = dsv(*depth);
         gpuBegin();
-        recordTransfer(pso, t.color, DXGI_FORMAT_R8G8B8A8_UNORM, t.depth, &rtvHandle, 1, depth ? &dsvHandle : nullptr,
-                t.height, t.width, t.height);
+        recordTransfer(pso, worldColor ? worldColor : t.color, DXGI_FORMAT_R8G8B8A8_UNORM, depth ? t.depth : nullptr,
+                &rtvHandle, 1, depth ? &dsvHandle : nullptr, t.height, t.width, t.height);
         gpuEnd(kImport);
-        barrier(t.color, read, D3D12_RESOURCE_STATE_RENDER_TARGET);
-        barrier(t.depth, read, D3D12_RESOURCE_STATE_DEPTH_WRITE);
+        // The next terrain submission is ordered after this backend frame. Hold the resource
+        // through the consuming submission as well, even if a pack reload replaces its targets.
+        if (worldColor) retired.emplace_back(fenceValue + 1, worldColor);
+        else barrier(t.color, read, D3D12_RESOURCE_STATE_RENDER_TARGET);
+        if (depth) barrier(t.depth, read, D3D12_RESOURCE_STATE_DEPTH_WRITE);
         ++sceneImports;
         return true;
     }
@@ -978,6 +982,7 @@ private:
     std::vector<std::pair<UINT, int>> categoryPairs[2];  // per frame slot: first query index, category
     double categoryMs[kCategories] = {};
     UINT categoryOpen = UINT_MAX;
+    const bool profileUploads;
     void gpuBegin() {
         if (!queryHeap || queryNext + 4 > queryLimit()) { categoryOpen = UINT_MAX; return; }
         categoryOpen = queryNext;
@@ -1750,11 +1755,14 @@ std::string bytes(JNIEnv* env, jbyteArray array) {
 #define BACKEND(name) extern "C" JNIEXPORT
 #define JNI_NAME(name) Java_com_redondoguibi_direct_backend_Dx12BackendNative_##name
 
-BACKEND(create) void JNICALL JNI_NAME(create)(JNIEnv* env, jclass, jboolean debug) {
-    try { g_backend = std::make_unique<Backend>(debug == JNI_TRUE); }
+BACKEND(create) void JNICALL JNI_NAME(create)(JNIEnv* env, jclass, jboolean debug, jboolean profileUploads) {
+    try { g_backend = std::make_unique<Backend>(debug == JNI_TRUE, profileUploads == JNI_TRUE); }
     catch (const std::exception& error) { throwJava(env, error.what()); }
 }
-BACKEND(destroy) void JNICALL JNI_NAME(destroy)(JNIEnv*, jclass) { g_backend.reset(); }
+BACKEND(destroy) void JNICALL JNI_NAME(destroy)(JNIEnv*, jclass) {
+    g_backend.reset();
+    directTerrainBackendOnly(false);
+}
 BACKEND(flush) void JNICALL JNI_NAME(flush)(JNIEnv* env, jclass) { guarded(env, [&] { g_backend->flush(); }); }
 BACKEND(messages) jstring JNICALL JNI_NAME(messages)(JNIEnv* env, jclass) {
     std::string text = g_backend ? g_backend->takeMessages() : std::string();

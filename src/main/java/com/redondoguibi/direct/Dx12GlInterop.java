@@ -92,6 +92,9 @@ public final class Dx12GlInterop {
     private static boolean lightmapDirty = true;
     private static boolean lightmapUploaded;
     private static long[] visibleKeys = new long[256];
+    private static long[] submittedVisibleKeys = new long[256];
+    private static int submittedVisibleCount = -1;
+    private static boolean submittedExactCoverage;
     private static int[] visibleSectionIndices = new int[256];
     private static byte[] visibleLayerMasks = new byte[256];
     private static boolean[] visibleOwnership = new boolean[256];
@@ -291,7 +294,7 @@ public final class Dx12GlInterop {
             }
             if (Phase0Capture.ENABLED && packGeometryActive && !packTranslucent && !packSceneInputs && !packShadows
                     && replacementFrame && configuredPasses.isEmpty() && mc.screen == null && mc.getOverlay() == null) {
-                Phase0Capture.frame(width, height, visibleKeys, visibleCount, fallbackSections, LIGHT_PIXELS,
+                Phase0Capture.frame(width, height, submittedVisibleKeys, submittedVisibleCount, fallbackSections, LIGHT_PIXELS,
                         MATRIX, cameraX, cameraY, cameraZ, mc.options.getEffectiveRenderDistance() * 16.0f,
                         configuredPackGeometry, packGeometryOptions, geometryScratch, materialScratch, sources, uniforms);
             }
@@ -400,11 +403,16 @@ public final class Dx12GlInterop {
         return com.redondoguibi.direct.backend.Dx12Shadow.SKIP_GL && com.redondoguibi.direct.backend.Dx12Shadow.presenting();
     }
 
+    private static void finishSceneForBackend() {
+        // Even in DX12-only mode GLFW's context still receives vanilla texture uploads.
+        // Drain them before switching queues so the driver doesn't accumulate GL work.
+        releaseHeldSceneLock();
+        finishGlWork();
+    }
+
     private static boolean backendTranslucent(int framebuffer) {
         if (NativeDx12.translucentFrameStatus() != NativeDx12.FRAME_RENDERED_CPU_SYNC) return false;
-        releaseHeldSceneLock(); // the backend writes the shared images: OpenGL must not hold them
-        // Shadow mode: OpenGL's pending consumption signal goes first, so the timeline never moves backwards.
-        finishGlWork();
+        finishSceneForBackend();
         if (!com.redondoguibi.direct.backend.Dx12Shadow.exportScene(framebuffer)) return false;
         int result = NativeDx12.renderTranslucentInterop(MATRIX, cameraX, cameraY, cameraZ, frameIndex);
         if (result == NativeDx12.FRAME_SKIPPED_BUSY || result == NativeDx12.FRAME_SKIPPED_BUDGET) return false;
@@ -421,10 +429,10 @@ public final class Dx12GlInterop {
 
     private static boolean backendWorld(int framebuffer, float[] uniforms) {
         if ((!backendOnly() && !lastSubmittedFrameReady("world post")) || !NativeDx12.isWorldFrameReady()) return false;
-        releaseHeldSceneLock();
-        finishGlWork();
+        finishSceneForBackend();
         if (!com.redondoguibi.direct.backend.Dx12Shadow.exportScene(framebuffer)) return false;
-        int result = NativeDx12.renderWorldInterop(uniforms, frameIndex);
+        int result = backendOnly() ? NativeDx12.renderWorldForBackend(uniforms, frameIndex)
+                : NativeDx12.renderWorldInterop(uniforms, frameIndex);
         if (result == NativeDx12.FRAME_SKIPPED_BUSY) return false;
         if (result != 0) throw new IllegalStateException("World render failed: " + result);
         long value = ++frameIndex;
@@ -456,18 +464,33 @@ public final class Dx12GlInterop {
         ownedBuffers.clear();
     }
 
+    private static void submitVisibleSections() {
+        if (visibleCount == submittedVisibleCount && replacementFrame == submittedExactCoverage
+                && java.util.Arrays.equals(visibleKeys, 0, visibleCount, submittedVisibleKeys, 0, visibleCount)) return;
+
+        NativeDx12.setVisibleSections(visibleKeys, visibleCount, replacementFrame);
+        // The JNI call copies the prefix. Swap scratch arrays so compaction next frame cannot overwrite it.
+        long[] previous = submittedVisibleKeys;
+        submittedVisibleKeys = visibleKeys;
+        visibleKeys = previous.length < submittedVisibleKeys.length ? new long[submittedVisibleKeys.length] : previous;
+        submittedVisibleCount = visibleCount;
+        submittedExactCoverage = replacementFrame;
+    }
+
     private static void selectUploadedSections() {
         var sections=currentVisibleSections;
         visibleCount=0;visibleTranslucentCount=0;fallbackSections=fallbackLayerMask=0;translucentCovered=true;ownedBuffers.clear();
         if(!ClientConfig.ENABLE_DX12.get())return;
         fallbackCount=0;
         if(visibleKeys.length<sections.size()){
-            visibleKeys=new long[sections.size()];
-            visibleSectionIndices=new int[sections.size()];
-            visibleLayerMasks=new byte[sections.size()];
-            visibleOwnership=new boolean[sections.size()];
-            fallbackKeys=new long[sections.size()];
-            fallbackSectionIndices=new int[sections.size()];
+            // The visible list grows gradually as distant chunks arrive.
+            int capacity = Math.max(sections.size(), visibleKeys.length + visibleKeys.length / 2);
+            visibleKeys = new long[capacity];
+            visibleSectionIndices = new int[capacity];
+            visibleLayerMasks = new byte[capacity];
+            visibleOwnership = new boolean[capacity];
+            fallbackKeys = new long[capacity];
+            fallbackSectionIndices = new int[capacity];
         }
         int candidates=0;
         for(int i=0;i<sections.size();i++){
@@ -719,19 +742,17 @@ public final class Dx12GlInterop {
             if (!captured) {
                 return;
             }
-            // DX12 alone: stages are not awaited on the CPU, so the renderer's previous frame may still run. Its
-            // resources are replaced below; wait for it here instead of falling back to vanilla terrain.
-            if (backendOnly() && frameIndex > 0) {
-                long waitStart = System.nanoTime();
-                if (!NativeDx12.waitInteropFrame(frameIndex)) throw new IllegalStateException("Previous DX12 frame did not complete.");
-                com.redondoguibi.direct.backend.Dx12Shadow.stageWait(System.nanoTime() - waitStart);
-            }
-
-            if (!NativeDx12.isCurrentFrameSlotReady()) {
+            boolean nativeOnly = backendOnly();
+            long waitStart = nativeOnly ? System.nanoTime() : 0;
+            boolean slotReady = NativeDx12.isCurrentFrameSlotReady();
+            if (nativeOnly) com.redondoguibi.direct.backend.Dx12Shadow.stageWait(System.nanoTime() - waitStart);
+            if (!slotReady) {
                 DirectStatusOverlay.setStatus("waiting_gpu");
                 return;
             }
-            if (!lastSubmittedFrameReady("terrain resource updates")) return;
+            // Hybrid still needs the previous hand-off to GL. Backend-only submissions
+            // are ordered on the GPU and native updates protect mutable bindings.
+            if (!nativeOnly && !lastSubmittedFrameReady("terrain resource updates")) return;
             configurePackGeometry();
             TerrainMeshStore.uploadPending();
             selectUploadedSections();
@@ -747,7 +768,7 @@ public final class Dx12GlInterop {
                 return;
             }
             uploadLightmap();
-            NativeDx12.setVisibleSections(visibleKeys, visibleCount, replacementFrame);
+            submitVisibleSections();
             if(DirectRenderApi.terrainEffects().shadows()>0){
                 var keys=TerrainMeshStore.shadowKeys();
                 if(keys!=submittedShadowKeys){NativeDx12.setShadowSections(keys);submittedShadowKeys=keys;}
@@ -777,7 +798,7 @@ public final class Dx12GlInterop {
             DirectRenderApi.PassSnapshot passSnapshot = DirectRenderApi.snapshotState();
             List<DirectRenderPass> passes = passSnapshot.passes();
             if (passSnapshot.revision() != configuredPassRevision) {
-                if (!lastSubmittedFrameReady("pass reconfiguration")) {
+                if (!nativeOnly && !lastSubmittedFrameReady("pass reconfiguration")) {
                     return;
                 }
                 String[] sources = NO_PASS_SOURCES;
@@ -1104,6 +1125,7 @@ public final class Dx12GlInterop {
     }
 
     private static void initialize(int frameWidth, int frameHeight) throws IOException {
+        submittedVisibleCount = -1;
         long initStarted = System.nanoTime();
         NativeLibrary.load();
         long[] handles = NativeDx12.initializeInteropCached(frameWidth, frameHeight,

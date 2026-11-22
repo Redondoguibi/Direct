@@ -18,6 +18,9 @@ struct DirectTerrainOutput {
 };
 bool directTerrainOutput(DirectTerrainOutput* out);
 
+/** Borrowed final world-pass texture for this exact submission, in PIXEL_SHADER_RESOURCE state. */
+ID3D12Resource* directWorldColor(UINT64 readyValue);
+
 /**
  * Before another queue writes the shared images (shadow mode): returns them from D3D11On12, which holds them after an
  * OpenGL lock, and signals fence to value on the terrain queue after that release.

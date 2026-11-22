@@ -40,6 +40,7 @@ constexpr DWORD kFenceWaitTimeoutMs = 5000;
 constexpr UINT kVertexStride = 20;
 constexpr UINT kLayerCount = 4;
 constexpr UINT kFramesInFlight = 3;
+bool g_backendOnly = false; // directTerrainBackendOnly
 constexpr UINT kAtlasSlots = 64;
 constexpr UINT kDrawConstantCount = 5;
 constexpr UINT kMaxExtensionPasses = 8;
@@ -273,7 +274,14 @@ struct ArenaPage {
     std::map<UINT64, UINT64> freeRanges;
 };
 
-struct TransparentQuad { float center[3]; std::array<UINT,6> indices; };
+template<class Index>
+void copySortedQuadIndices(uint8_t* destination, const std::vector<std::array<Index, 6>>& quads,
+        const std::vector<UINT>& order) {
+    for (UINT quad : order) {
+        std::memcpy(destination, quads[quad].data(), 6 * sizeof(Index));
+        destination += 6 * sizeof(Index);
+    }
+}
 
 // Face-direction groups (technique of Sodium's block-face culling): opaque/cutout quads of a
 // section are stably partitioned by their exact geometric facing at upload. Per frame, groups
@@ -318,7 +326,10 @@ struct TerrainSection {
     UINT64 allocationSize;
     D3D12_VERTEX_BUFFER_VIEW vertexView;
     D3D12_INDEX_BUFFER_VIEW indexView;
-    std::vector<TransparentQuad> transparent;
+    std::vector<std::array<float, 3>> transparentCenters;
+    // Only the array matching indexView.Format is populated at mesh upload.
+    std::vector<std::array<UINT16, 6>> transparent16;
+    std::vector<std::array<UINT, 6>> transparent32;
     mutable std::vector<UINT> transparentOrder;
     mutable double sortCamera[3];
     mutable bool transparentOrderValid=false;
@@ -339,6 +350,10 @@ struct VisibleSection {
  */
 template <class Emit>
 void forEachFaceRun(const TerrainSection* section, UINT layer, UINT8 mask, Emit&& emit) {
+    if (mask == kAllFaces) {
+        if (section->layerIndexCounts[layer]) emit(section->layerStart[layer], section->layerIndexCounts[layer]);
+        return;
+    }
     UINT start = 0, end = 0, gap = 0;
     bool open = false;
     for (UINT face = 0; face < kFaceCount; ++face) {
@@ -359,11 +374,6 @@ void forEachFaceRun(const TerrainSection* section, UINT layer, UINT8 mask, Emit&
     if (open) emit(start, end - start);
 }
 
-UINT countFaceRuns(const TerrainSection* section, UINT layer, UINT8 mask) {
-    UINT runs = 0;
-    forEachFaceRun(section, layer, mask, [&](UINT, UINT) { ++runs; });
-    return runs;
-}
 
 /**
  * Exact facing of a 6-index quad from its quantized positions (integer cross products, no
@@ -568,6 +578,11 @@ struct WorldGraph {
     ID3D12Resource* constants[kFramesInFlight] = {};
     uint8_t* constantsMapped[kFramesInFlight] = {};
     bool needsInitialClear = false;
+    // A slot's shader-visible tables remain immutable until its fence completes.
+    // Zero means missing. The other values encode the depth source and history parity.
+    std::array<UINT8, kFramesInFlight> descriptorKeys{};
+    ID3D12Resource* backendColor = nullptr; // owned by extensionTargets
+    UINT64 backendColorFence = 0;
 };
 
 struct Plane {
@@ -639,7 +654,7 @@ struct InteropRenderer {
     ID3D11Resource* wrappedDepthBridge;
     bool depthBridgeAcquired;
     bool directBridge;
-    bool bridgeSampling;
+
     ID3D12GraphicsCommandList* bridgeBeginList;
     ID3D12GraphicsCommandList* bridgeEndList;
     ID3D12GraphicsCommandList* graphList;
@@ -745,7 +760,12 @@ struct InteropRenderer {
     UINT atlasIndex;
     UINT nextAtlasSlot;
     std::vector<VisibleSection> visible;
-    std::vector<const TerrainSection*> transparentSections;
+    struct TransparentSection {
+        const TerrainSection* section;
+        double distanceSquared;
+    };
+    std::vector<TransparentSection> transparentSections;
+    bool transparentSectionsSorted;
     std::vector<double> transparentDistances;
     UINT64 translucentIndexBytes;
     float viewProjection[28];
@@ -1143,8 +1163,25 @@ bool currentFrameSlotReady(InteropRenderer* renderer, JNIEnv* env, bool* ready) 
         throwJava(env, "DX12 device was removed while checking the current frame slot.");
         return false;
     }
-    *ready = renderer->slots[renderer->slotIndex].fenceValue <= completed;
+    const UINT64 required = renderer->slots[renderer->slotIndex].fenceValue;
+    *ready = required <= completed;
+    if (!*ready && g_backendOnly) {
+        // World and translucent passes consume slots too. Wait only for the
+        // allocator being reused so that a busy GPU cannot drop a pack stage.
+        if (!waitFence(renderer, renderer->fence, required)) {
+            throwJava(env, "DX12 terrain frame slot timed out.");
+            return false;
+        }
+        *ready = true;
+    }
     return true;
+}
+
+// The terrain SRV table is shared by all in-flight terrain submissions.
+bool waitForTerrainBindings(InteropRenderer* renderer, JNIEnv* env) {
+    if (waitFence(renderer, renderer->fence, renderer->lastSignaledValue)) return true;
+    throwJava(env, "DX12 terrain bindings are still in flight.");
+    return false;
 }
 
 void releaseAllRetired(InteropRenderer* renderer) {
@@ -1218,6 +1255,7 @@ void retireSection(InteropRenderer* renderer, TerrainSection* section) {
 void clearVisibleSections(InteropRenderer* renderer) {
     renderer->visibleOrderValid = false;
     renderer->visible.clear();
+    renderer->transparentSectionsSorted = false;
     renderer->visibleOpaqueDraws = 0;
     renderer->visibleCutoutDraws = 0;
     renderer->visibleCulledLayerIndices = 0;
@@ -1236,6 +1274,8 @@ void retireTerrainSections(InteropRenderer* renderer) {
 }
 
 void releaseExtensionResources(InteropRenderer* renderer) {
+    renderer->graph.descriptorKeys.fill(0);
+    renderer->graph.backendColor = nullptr;
     for (ID3D12Resource*& target : renderer->extensionTargets) {
         release(target);
     }
@@ -1254,7 +1294,7 @@ void releaseSizeResources(InteropRenderer* renderer) {
     }
     release(renderer->wrappedDepthBridge);
     release(renderer->depthBridge);
-    renderer->directBridge = renderer->bridgeSampling = false;
+    renderer->directBridge = false;
     releaseGraphBuffers(renderer);
     release(renderer->wrappedColor);
     release(renderer->wrappedDepth);
@@ -1589,11 +1629,11 @@ uint64_t terrainShaderSourceHash() {
 // Cache entry layout: magic, payload size, payload FNV-1a, key, then the DXBC payload.
 struct ShaderCacheHeader { uint32_t magic; uint32_t size; uint64_t payloadHash; uint64_t key; };
 
-/** Thread-safe: D3DCompile and D3DCreateBlob may run concurrently. */
-bool compileShaderCached(const std::wstring& cacheDirectory, const char* entryPoint, const char* target,
-        bool cutout, ID3DBlob** bytecode, bool geometry) {
+template<class Compile>
+HRESULT cachedBytecode(const std::wstring& cacheDirectory, uint64_t key, ID3DBlob** bytecode,
+        Compile compile, bool* hit = nullptr) {
     *bytecode = nullptr;
-    const uint64_t key = shaderCacheKey(entryPoint, target, cutout, geometry);
+    if (hit) *hit = false;
     const std::wstring path = cacheDirectory.empty() ? std::wstring()
             : cacheDirectory + L"\\shaders\\" + hex64(key) + L".cso";
     std::vector<uint8_t> file;
@@ -1606,19 +1646,48 @@ bool compileShaderCached(const std::wstring& cacheDirectory, const char* entryPo
                 && header.payloadHash == fnv1a(14695981039346656037ull, payload, header.size)
                 && SUCCEEDED(D3DCreateBlob(header.size, bytecode))) {
             std::memcpy((*bytecode)->GetBufferPointer(), payload, header.size);
-            g_shaderCacheHits.fetch_add(1);
-            return true;
+            if (hit) *hit = true;
+            return S_OK;
         }
     }
-    if (!compileShader(entryPoint, target, cutout, bytecode, geometry)) return false;
-    g_shadersCompiled.fetch_add(1);
+    HRESULT result = compile();
+    if (FAILED(result)) return result;
     if (!path.empty()) {
         const auto size = static_cast<uint32_t>((*bytecode)->GetBufferSize());
         const ShaderCacheHeader header = {kShaderCacheMagic, size,
                 fnv1a(14695981039346656037ull, (*bytecode)->GetBufferPointer(), size), key};
         writeCacheFile(path, &header, sizeof(header), (*bytecode)->GetBufferPointer(), size);
     }
+    return S_OK;
+}
+
+bool compileShaderCached(const std::wstring& cacheDirectory, const char* entryPoint, const char* target,
+        bool cutout, ID3DBlob** bytecode, bool geometry) {
+    bool hit;
+    HRESULT result = cachedBytecode(cacheDirectory, shaderCacheKey(entryPoint, target, cutout, geometry), bytecode,
+            [&] { return compileShader(entryPoint, target, cutout, bytecode, geometry) ? S_OK : E_FAIL; }, &hit);
+    if (FAILED(result)) return false;
+    (hit ? g_shaderCacheHits : g_shadersCompiled).fetch_add(1);
     return true;
+}
+
+HRESULT compilePackStage(const InteropRenderer* renderer, const std::string& source, const D3D_SHADER_MACRO* macros,
+        const char* entry, const char* profile, UINT flags, ID3DBlob** bytecode, ID3DBlob** log) {
+    auto compile = [&] {
+        return D3DCompile(source.data(), source.size(), nullptr, macros, nullptr, entry, profile, flags, 0, bytecode, log);
+    };
+    if (renderer->cacheDirectory.empty()) return compile();
+    uint64_t key = fnv1a(14695981039346656037ull, "pack-dxbc-v1");
+    key = fnv1a(key, source.data(), source.size());
+    key = fnv1a(key, entry);
+    key = fnv1a(key, profile);
+    const UINT options[] = {flags, D3D_COMPILER_VERSION};
+    key = fnv1a(key, options, sizeof(options));
+    for (auto* macro = macros; macro && macro->Name; ++macro) {
+        key = fnv1a(key, macro->Name);
+        key = fnv1a(key, macro->Definition);
+    }
+    return cachedBytecode(renderer->cacheDirectory, key, bytecode, compile);
 }
 
 std::wstring pipelineLibraryPath(const InteropRenderer* renderer) {
@@ -1873,14 +1942,14 @@ bool compilePackGeometry(InteropRenderer* renderer, const std::string& hooks, st
     if (!hooks.empty()) {
         const std::string source = std::string(kTerrainShader) + "\n#line 1 \"pack-geometry.hlsl\"\n" + hooks;
         struct Compiled { ID3DBlob* code = nullptr; std::string error; };
-        auto compile = [&source](const char* entry, const char* target, bool cutout, bool lean) {
+        auto compile = [&source, renderer](const char* entry, const char* target, bool cutout, bool lean) {
             const D3D_SHADER_MACRO macros[] = {{"ATLAS_SLOTS", "64"}, {"DIRECT_GEOMETRY", "1"}, {"DIRECT_PACK", "1"},
                 {lean ? "DIRECT_LEAN" : "DIRECT_FULL", "1"}, {cutout ? "DIRECT_CUTOUT" : nullptr, cutout ? "1" : nullptr},
                 {nullptr, nullptr}};
             Compiled result;
             ID3DBlob* errors = nullptr;
-            if (FAILED(D3DCompile(source.data(), source.size(), nullptr, macros, nullptr, entry, target,
-                    D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &result.code, &errors))) {
+            if (FAILED(compilePackStage(renderer, source, macros, entry, target,
+                    D3DCOMPILE_OPTIMIZATION_LEVEL3, &result.code, &errors))) {
                 result.error = std::string(entry) + ": ";
                 result.error += errors ? static_cast<const char*>(errors->GetBufferPointer()) : "HLSL compilation failed";
                 release(result.code);
@@ -2043,6 +2112,7 @@ void writePassInputs(InteropRenderer* renderer, UINT slot, ID3D12Resource* input
 }
 
 bool allocatePassTargets(InteropRenderer* renderer, UINT first, UINT end, DXGI_FORMAT format) {
+    renderer->graph.descriptorKeys.fill(0);
     D3D12_RESOURCE_DESC description = {
         D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, renderer->width, renderer->height, 1, 1,
         format, {1, 0}, D3D12_TEXTURE_LAYOUT_UNKNOWN, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET
@@ -2185,8 +2255,8 @@ bool configureExtensionPasses(InteropRenderer* renderer, const std::vector<std::
         const D3D_SHADER_MACRO passMacros[] = {{"DIRECT_FULLSCREEN_VERTEX", "1"}, {nullptr, nullptr}};
         auto compileStage = [&](const char* entry, const char* profile, ID3DBlob** blob) {
             ID3DBlob* log = nullptr;
-            HRESULT hr = D3DCompile(source.data(), source.size(), nullptr, customVertex ? passMacros : nullptr,
-                    nullptr, entry, profile, D3DCOMPILE_ENABLE_STRICTNESS | D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, blob, &log);
+            HRESULT hr = compilePackStage(renderer, source, customVertex ? passMacros : nullptr,
+                    entry, profile, kTerrainCompileFlags, blob, &log);
             if (FAILED(hr)) {
                 std::string message = "Direct extension pass " + std::to_string(candidates.size()) + " " + entry
                         + " compilation failed: " + (log ? static_cast<const char*>(log->GetBufferPointer()) : "");
@@ -2575,6 +2645,7 @@ void collectVisibleSections(InteropRenderer* renderer, double cameraX, double ca
         float depth=clipW>0?static_cast<float>(clipZ/clipW):-std::numeric_limits<float>::max();
         VisibleSection entry{section,{static_cast<float>(ox),static_cast<float>(oy),static_cast<float>(oz)},depth,renderer->visible.size(),{}};
         for (UINT layer = 0; layer < kCulledLayers; ++layer) {
+            if (section->layerIndexCounts[layer] == 0) continue;
             UINT8 mask = kAllFaces;
             // Animated layers can change facing in the vertex shader; never cull those.
             if (cullFaces && !(windActive && section->windAnimated[layer])
@@ -2593,14 +2664,17 @@ void collectVisibleSections(InteropRenderer* renderer, double cameraX, double ca
                 }
             }
             entry.faceMask[layer] = mask;
-            if (section->layerIndexCounts[layer] == 0) continue;
-            const UINT runs = countFaceRuns(section, layer, mask);
-            (layer == 0 ? renderer->visibleOpaqueDraws : renderer->visibleCutoutDraws) += runs;
+            UINT& draws = layer == 0 ? renderer->visibleOpaqueDraws : renderer->visibleCutoutDraws;
             renderer->visibleCulledLayerIndices += section->layerIndexCounts[layer];
-            forEachFaceRun(section, layer, mask, [&](UINT, UINT count) { renderer->submittedCulledLayerIndices += count; });
+            forEachFaceRun(section, layer, mask, [&](UINT, UINT count) {
+                ++draws;
+                renderer->submittedCulledLayerIndices += count;
+            });
         }
         renderer->visible.push_back(entry);
-        if(!section->transparent.empty())renderer->translucentIndexBytes=((renderer->translucentIndexBytes+255)&~UINT64(255))+section->transparent.size()*24;
+        // Each quad is 12 or 24 bytes, so all section offsets stay 4-byte aligned in any sort order.
+        renderer->translucentIndexBytes += section->transparent16.size() * 6 * sizeof(UINT16)
+                + section->transparent32.size() * 6 * sizeof(UINT);
     };
     if(renderer->useVisibleKeys){
         for(jlong key:renderer->visibleKeys){auto it=renderer->sections.find(key);if(it!=renderer->sections.end())append(it->second);}
@@ -2894,68 +2968,45 @@ bool acquireBridgeInterop(InteropRenderer* r) {
     return SUCCEEDED(r->d3d11Device->GetDeviceRemovedReason());
 }
 
-// Prologue of a submission that reads what OpenGL wrote: returns both images to D3D12, then either
-// imports GL's depth into the native depth target (translucency) or prepares the bridge for sampling.
-bool bridgeBegin(InteropRenderer* r, FrameSlot& slot, bool importDepth, bool sampleDepth) {
-    if (!r->directBridge) return true;
+// Translucency depth-tests against the imported scene. World passes only sample the bridge.
+bool importTranslucentDepth(InteropRenderer* r, FrameSlot& slot) {
     releaseBridgeInterop(r);
-    if (!importDepth && !sampleDepth) return true;
     auto* list = r->bridgeBeginList;
     if (FAILED(slot.bridgeBegin->Reset()) || FAILED(list->Reset(slot.bridgeBegin, nullptr))) return false;
-    if (importDepth) {
-        const D3D12_RESOURCE_BARRIER copy[] = {
-            transition(r->depthBridge, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE),
-            transition(r->depthTarget, D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_COPY_DEST)
-        };
-        list->ResourceBarrier(ARRAYSIZE(copy), copy);
-        list->CopyResource(r->depthTarget, r->depthBridge);
-        const D3D12_RESOURCE_BARRIER restore[] = {
-            transition(r->depthBridge, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON),
-            transition(r->depthTarget, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_DEPTH_WRITE)
-        };
-        list->ResourceBarrier(ARRAYSIZE(restore), restore);
-    } else {
-        const auto sample = transition(r->depthBridge, D3D12_RESOURCE_STATE_COMMON, kGraphRead);
-        list->ResourceBarrier(1, &sample);
-    }
+    D3D12_RESOURCE_BARRIER copy[] = {
+        transition(r->depthBridge, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE),
+        transition(r->depthTarget, D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_COPY_DEST)
+    };
+    list->ResourceBarrier(ARRAYSIZE(copy), copy);
+    list->CopyResource(r->depthTarget, r->depthBridge);
+    for (auto& barrier : copy) std::swap(barrier.Transition.StateBefore, barrier.Transition.StateAfter);
+    list->ResourceBarrier(ARRAYSIZE(copy), copy);
     if (FAILED(list->Close())) return false;
     ID3D12CommandList* lists[] = {list};
     r->queue->ExecuteCommandLists(1, lists);
-    r->bridgeSampling = sampleDepth && !importDepth;
     return true;
 }
 
 // Epilogue: optionally exports the native depth into the bridge (a D3D12 copy instead of a D3D11
 // one), returns the bridge to COMMON and hands both images to D3D11On12 for the next WGL lock.
-bool g_backendOnly = false; // directTerrainBackendOnly
-
 bool bridgeEnd(InteropRenderer* r, FrameSlot& slot, bool exportDepth) {
     if (!r->directBridge) return true;
     if (g_backendOnly) exportDepth = false; // nobody samples the bridge after this frame
-    if (r->bridgeSampling || exportDepth) {
+    if (exportDepth) {
         auto* list = r->bridgeEndList;
         if (FAILED(slot.bridgeEnd->Reset()) || FAILED(list->Reset(slot.bridgeEnd, nullptr))) return false;
-        if (r->bridgeSampling) {
-            const auto rest = transition(r->depthBridge, kGraphRead, D3D12_RESOURCE_STATE_COMMON);
-            list->ResourceBarrier(1, &rest);
-        }
-        if (exportDepth) {
-            const D3D12_RESOURCE_BARRIER copy[] = {
-                transition(r->depthTarget, D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_COPY_SOURCE),
-                transition(r->depthBridge, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST)
-            };
-            list->ResourceBarrier(ARRAYSIZE(copy), copy);
-            list->CopyResource(r->depthBridge, r->depthTarget);
-            const D3D12_RESOURCE_BARRIER restore[] = {
-                transition(r->depthTarget, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_DEPTH_WRITE),
-                transition(r->depthBridge, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON)
-            };
-            list->ResourceBarrier(ARRAYSIZE(restore), restore);
-        }
+        D3D12_RESOURCE_BARRIER copy[] = {
+            transition(r->depthTarget, D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_COPY_SOURCE),
+            transition(r->depthBridge, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST)
+        };
+        list->ResourceBarrier(ARRAYSIZE(copy), copy);
+        list->CopyResource(r->depthBridge, r->depthTarget);
+        for (auto& barrier : copy) std::swap(barrier.Transition.StateBefore, barrier.Transition.StateAfter);
+        list->ResourceBarrier(ARRAYSIZE(copy), copy);
         if (FAILED(list->Close())) return false;
         ID3D12CommandList* lists[] = {list};
         r->queue->ExecuteCommandLists(1, lists);
-        r->bridgeSampling = false;
+
     }
     return g_backendOnly ? true : acquireBridgeInterop(r);
 }
@@ -3175,6 +3226,7 @@ bool parseWorldPass(const std::string& source, ExtensionPass& pass, PackBufferSp
 
 void releaseGraphBuffers(InteropRenderer* r) {
     auto& g = r->graph;
+    g.descriptorKeys.fill(0);
     for (UINT i = 0; i < kPackBuffers; ++i) {
         release(g.buffers[i][0]);
         release(g.buffers[i][1]);
@@ -3395,8 +3447,7 @@ bool configureWorldGraph(InteropRenderer* r, const std::vector<std::string>& sou
                 {customVertex ? "DIRECT_FULLSCREEN_VERTEX" : nullptr, customVertex ? "1" : nullptr}, {nullptr, nullptr}};
         auto compileStage = [&](const char* entry, const char* profile, ID3DBlob** blob) {
             ID3DBlob* log = nullptr;
-            const HRESULT result = D3DCompile(source.data(), source.size(), nullptr, macros, nullptr, entry, profile,
-                    D3DCOMPILE_ENABLE_STRICTNESS | D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, blob, &log);
+            const HRESULT result = compilePackStage(r, source, macros, entry, profile, kTerrainCompileFlags, blob, &log);
             if (FAILED(result)) {
                 throwIllegalArgument(env, "Direct world pass " + std::to_string(index) + " " + entry + " compilation failed: "
                         + (log ? static_cast<const char*>(log->GetBufferPointer()) : ""));
@@ -3494,6 +3545,7 @@ bool configureWorldGraph(InteropRenderer* r, const std::vector<std::string>& sou
     }
     for (auto& pass : r->worldPasses) release(pass.pipeline);
     r->worldPasses = std::move(candidates);
+    r->graph.descriptorKeys.fill(0);
     if (!r->extensionTargets[0] || !r->extensionTargets[1] || !r->extensionRtvHeap || !r->extensionSrvHeap) {
         releaseExtensionResources(r);
         if (!createExtensionResources(r, env, true)) return false;
@@ -3531,7 +3583,7 @@ bool snapshotTerrainDepth(InteropRenderer* r, FrameSlot& slot) {
 // t3 terrain-only depth, t4-t11 pack buffers, t12-t19 their previous frame, u0-u7 compute outputs,
 // b0 frame data and uniforms, b1 output and buffer sizes, s0 linear and s1 point clamp samplers.
 bool recordWorldGraph(InteropRenderer* r, FrameSlot& slot, UINT64 frameIndex, const float* uniforms,
-        ID3D12QueryHeap* timestamps, UINT firstQuery, bool bridgeDepth) {
+        ID3D12QueryHeap* timestamps, UINT firstQuery, bool bridgeDepth, ID3D12Resource** forwardColor = nullptr) {
     auto& g = r->graph;
     auto* list = r->extensionList;
     if (FAILED(slot.extension->Reset()) || FAILED(list->Reset(slot.extension, nullptr))) return false;
@@ -3548,10 +3600,11 @@ bool recordWorldGraph(InteropRenderer* r, FrameSlot& slot, UINT64 frameIndex, co
         barriers.clear();
     };
     barriers.push_back(transition(r->colorTarget, D3D12_RESOURCE_STATE_RENDER_TARGET, kGraphRead));
-    if (!bridgeDepth) barriers.push_back(transition(r->depthTarget, D3D12_RESOURCE_STATE_DEPTH_WRITE, kGraphRead));
-    for (UINT t = 0; t < kPassTargets; ++t) {
-        if (r->extensionTargets[t]) barriers.push_back(transition(r->extensionTargets[t], D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, kGraphRead));
-    }
+    const auto depthRest = bridgeDepth ? D3D12_RESOURCE_STATE_COMMON : D3D12_RESOURCE_STATE_DEPTH_WRITE;
+    barriers.push_back(transition(depth, depthRest, kGraphRead));
+    std::array<D3D12_RESOURCE_STATES, kPassTargets> chainStates;
+    chainStates.fill(D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    const UINT8 descriptorKey = static_cast<UINT8>(1 + g.parity + (bridgeDepth ? 2 : 0));
     flush();
     auto current = [&](UINT i) { return g.specs[i].history ? g.parity : 0u; };
     auto rtvOf = [&](UINT i, UINT copy) {
@@ -3585,11 +3638,13 @@ bool recordWorldGraph(InteropRenderer* r, FrameSlot& slot, UINT64 frameIndex, co
         D3D12_CPU_DESCRIPTOR_HANDLE rtvs[4] = {};
         UINT outW = r->width, outH = r->height;
         ID3D12Resource* chainOutput = nullptr;
+        UINT outputTarget = 0;
         bool written[kPackBuffers] = {};
         for (UINT j = 0; j < pass.outputCount; ++j) {
             const int output = pass.outputs[j];
             if (output < 0) {
                 const UINT target = (chainIndex & 1u) + (pass.hdr ? kLdrPassTargets : 0u);
+                outputTarget = target;
                 chainOutput = outputs[j] = r->extensionTargets[target];
                 rtvs[j] = extensionRtvBase;
                 rtvs[j].ptr += static_cast<SIZE_T>(target) * r->extensionRtvIncrement;
@@ -3603,41 +3658,47 @@ bool recordWorldGraph(InteropRenderer* r, FrameSlot& slot, UINT64 frameIndex, co
             if (!outputs[j]) return false;
         }
         const UINT table = (r->slotIndex * kMaxWorldPasses + p) * kGraphTable;
-        auto cpu = cpuBase;
-        cpu.ptr += static_cast<SIZE_T>(table) * g.srvIncrement;
-        auto srv = [&](ID3D12Resource* resource, DXGI_FORMAT format) {
-            D3D12_SHADER_RESOURCE_VIEW_DESC view = {};
-            view.Format = format;
-            view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-            view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-            view.Texture2D.MipLevels = 1;
-            r->device->CreateShaderResourceView(resource, &view, cpu);
-            cpu.ptr += g.srvIncrement;
-        };
-        srv(chain, chainFormat);
-        srv(depth, DXGI_FORMAT_R32_FLOAT);
-        srv(r->colorTarget, kColorFormat);
-        srv(g.terrainDepth ? g.terrainDepthSnapshot : nullptr, DXGI_FORMAT_R32_FLOAT);
-        for (UINT i = 0; i < kPackBuffers; ++i) {
-            const bool declared = g.specs[i].declared;
-            srv(declared && !written[i] ? g.buffers[i][current(i)] : nullptr, declared ? g.specs[i].format : kColorFormat);
-        }
-        for (UINT i = 0; i < kPackBuffers; ++i) {
-            const bool declared = g.specs[i].declared;
-            ID3D12Resource* previous = !declared ? nullptr
-                    : g.specs[i].history ? g.buffers[i][current(i) ^ 1u] : written[i] ? nullptr : g.buffers[i][0];
-            srv(previous, declared ? g.specs[i].format : kColorFormat);
-        }
-        for (UINT i = 0; i < kPackBuffers; ++i) {
-            D3D12_UNORDERED_ACCESS_VIEW_DESC view = {};
-            view.Format = g.specs[i].declared ? g.specs[i].format : kColorFormat;
-            view.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
-            ID3D12Resource* resource = pass.compute && written[i] ? g.buffers[i][current(i)] : nullptr;
-            r->device->CreateUnorderedAccessView(resource, nullptr, &view, cpu);
-            cpu.ptr += g.srvIncrement;
+        if (g.descriptorKeys[r->slotIndex] != descriptorKey) {
+            g.descriptorKeys[r->slotIndex] = 0; // a partially rewritten table must never be reused
+            auto cpu = cpuBase;
+            cpu.ptr += static_cast<SIZE_T>(table) * g.srvIncrement;
+            auto srv = [&](ID3D12Resource* resource, DXGI_FORMAT format) {
+                D3D12_SHADER_RESOURCE_VIEW_DESC view = {};
+                view.Format = format;
+                view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+                view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+                view.Texture2D.MipLevels = 1;
+                r->device->CreateShaderResourceView(resource, &view, cpu);
+                cpu.ptr += g.srvIncrement;
+            };
+            srv(chain, chainFormat);
+            srv(depth, DXGI_FORMAT_R32_FLOAT);
+            srv(r->colorTarget, kColorFormat);
+            srv(g.terrainDepth ? g.terrainDepthSnapshot : nullptr, DXGI_FORMAT_R32_FLOAT);
+            for (UINT i = 0; i < kPackBuffers; ++i) {
+                const bool declared = g.specs[i].declared;
+                srv(declared && !written[i] ? g.buffers[i][current(i)] : nullptr, declared ? g.specs[i].format : kColorFormat);
+            }
+            for (UINT i = 0; i < kPackBuffers; ++i) {
+                const bool declared = g.specs[i].declared;
+                ID3D12Resource* previous = !declared ? nullptr
+                        : g.specs[i].history ? g.buffers[i][current(i) ^ 1u] : written[i] ? nullptr : g.buffers[i][0];
+                srv(previous, declared ? g.specs[i].format : kColorFormat);
+            }
+            for (UINT i = 0; i < kPackBuffers; ++i) {
+                D3D12_UNORDERED_ACCESS_VIEW_DESC view = {};
+                view.Format = g.specs[i].declared ? g.specs[i].format : kColorFormat;
+                view.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+                ID3D12Resource* resource = pass.compute && written[i] ? g.buffers[i][current(i)] : nullptr;
+                r->device->CreateUnorderedAccessView(resource, nullptr, &view, cpu);
+                cpu.ptr += g.srvIncrement;
+            }
         }
         const D3D12_RESOURCE_STATES writeState = pass.compute ? D3D12_RESOURCE_STATE_UNORDERED_ACCESS : D3D12_RESOURCE_STATE_RENDER_TARGET;
-        for (UINT j = 0; j < pass.outputCount; ++j) barriers.push_back(transition(outputs[j], kGraphRead, writeState));
+        for (UINT j = 0; j < pass.outputCount; ++j) {
+            const auto before = pass.outputs[j] < 0 ? chainStates[outputTarget] : kGraphRead;
+            barriers.push_back(transition(outputs[j], before, writeState));
+        }
         flush();
         float constants[kPassConstantCount] = {};
         constants[1] = static_cast<float>(r->width);
@@ -3677,7 +3738,16 @@ bool recordWorldGraph(InteropRenderer* r, FrameSlot& slot, UINT64 frameIndex, co
             list->RSSetScissorRects(1, &scissor);
             list->DrawInstanced(3, 1, 0, 0);
         }
-        for (UINT j = 0; j < pass.outputCount; ++j) barriers.push_back(transition(outputs[j], writeState, kGraphRead));
+        for (UINT j = 0; j < pass.outputCount; ++j) {
+            auto after = kGraphRead;
+            if (pass.outputs[j] < 0) {
+                if (p + 1 == r->worldPasses.size()) {
+                    after = forwardColor ? D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE : D3D12_RESOURCE_STATE_COPY_SOURCE;
+                }
+                chainStates[outputTarget] = after;
+            }
+            barriers.push_back(transition(outputs[j], writeState, after));
+        }
         flush();
         if (pass.writesColor) {
             chain = chainOutput;
@@ -3685,24 +3755,30 @@ bool recordWorldGraph(InteropRenderer* r, FrameSlot& slot, UINT64 frameIndex, co
             ++chainIndex;
         }
     }
-    barriers.push_back(transition(r->colorTarget, kGraphRead, D3D12_RESOURCE_STATE_COPY_DEST));
-    barriers.push_back(transition(chain, kGraphRead, D3D12_RESOURCE_STATE_COPY_SOURCE));
-    flush();
-    list->CopyResource(r->colorTarget, chain);
-    barriers.push_back(transition(r->colorTarget, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_RENDER_TARGET));
-    barriers.push_back(transition(chain, D3D12_RESOURCE_STATE_COPY_SOURCE, kGraphRead));
-    flush();
-    for (UINT t = 0; t < kPassTargets; ++t) {
-        if (r->extensionTargets[t]) barriers.push_back(transition(r->extensionTargets[t], kGraphRead, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE));
+    if (forwardColor) {
+        *forwardColor = chain;
+        barriers.push_back(transition(r->colorTarget, kGraphRead, D3D12_RESOURCE_STATE_RENDER_TARGET));
+    } else {
+        barriers.push_back(transition(r->colorTarget, kGraphRead, D3D12_RESOURCE_STATE_COPY_DEST));
+        flush();
+        list->CopyResource(r->colorTarget, chain);
+        barriers.push_back(transition(r->colorTarget, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_RENDER_TARGET));
     }
-    if (!bridgeDepth) barriers.push_back(transition(r->depthTarget, kGraphRead, D3D12_RESOURCE_STATE_DEPTH_WRITE));
+    for (UINT t = 0; t < kPassTargets; ++t) {
+        if (chainStates[t] != D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE) {
+            barriers.push_back(transition(r->extensionTargets[t], chainStates[t], D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE));
+        }
+    }
+    barriers.push_back(transition(depth, kGraphRead, depthRest));
     flush();
     if (timestamps) {
         list->EndQuery(timestamps, D3D12_QUERY_TYPE_TIMESTAMP, firstQuery + 2);
         list->ResolveQueryData(timestamps, D3D12_QUERY_TYPE_TIMESTAMP, firstQuery, 3,
                 r->worldTimestampReadback, firstQuery * sizeof(UINT64));
     }
-    return SUCCEEDED(list->Close());
+    if (FAILED(list->Close())) return false;
+    g.descriptorKeys[r->slotIndex] = descriptorKey;
+    return true;
 }
 
 bool graphHasHistory(const InteropRenderer* r) {
@@ -3726,9 +3802,11 @@ bool prepareGeometry(InteropRenderer* r,FrameSlot& slot,double x,double y,double
     std::memcpy(c+64,r->materialSettings,sizeof(r->materialSettings));
     std::memcpy(c+kBuiltInGeometryConstants,r->packOptions,sizeof(r->packOptions));
     for(UINT i=0;i<4;i++)c[16+i]=r->geometrySettings[i];
-    if(!r->packSceneInputs&&c[17]==0&&c[18]==0){
-        if(c[67]==0&&(r->sceneColor||r->sceneDepth))releaseSceneSnapshots(r);
-        else if(r->sceneColor)releaseSceneColorSnapshot(r);
+    if (!r->packSceneInputs && c[17] == 0 && c[18] == 0
+            && (r->sceneColor || (c[67] == 0 && r->sceneDepth))) {
+        if (!waitForTerrainBindings(r, env)) return false;
+        if (c[67] == 0) releaseSceneSnapshots(r);
+        else releaseSceneColorSnapshot(r);
     }
     for(UINT i=0;i<4;i++)c[20+i]=r->geometrySettings[5+i];
     c[25]=(std::max)(r->geometrySettings[6],0.0f);c[26]=r->geometrySettings[9];c[27]=r->geometrySettings[4];
@@ -3744,6 +3822,7 @@ bool prepareGeometry(InteropRenderer* r,FrameSlot& slot,double x,double y,double
     if((c[16]>0 || r->packShadows) && c[25]>.02f){
         UINT size=r->packShadows?1024:r->geometrySettings[4]<.5f?512:r->geometrySettings[4]<1.5f?1024:2048;
         if(r->shadowSize!=size){
+            if (!waitForTerrainBindings(r, env)) return false;
             release(r->shadowMap);release(r->shadowDsv);r->shadowSize=0;
             D3D12_RESOURCE_DESC desc={D3D12_RESOURCE_DIMENSION_TEXTURE2D,0,size,size,1,1,DXGI_FORMAT_R32_TYPELESS,{1,0},D3D12_TEXTURE_LAYOUT_UNKNOWN,D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL};
             D3D12_HEAP_PROPERTIES heap={};heap.Type=D3D12_HEAP_TYPE_DEFAULT;D3D12_CLEAR_VALUE clear={};clear.Format=kDepthFormat;clear.DepthStencil.Depth=1;
@@ -3753,7 +3832,13 @@ bool prepareGeometry(InteropRenderer* r,FrameSlot& slot,double x,double y,double
         }
         auto eye=XMVectorSet(c[20]*128,c[21]*128,c[22]*128,1);auto view=XMMatrixLookAtLH(eye,XMVectorZero(),XMVectorSet(0,0,1,0));auto projection=XMMatrixOrthographicLH(96,96,.1f,256);
         XMFLOAT4X4 shadow;XMStoreFloat4x4(&shadow,XMMatrixMultiply(view,projection));std::memcpy(c,&shadow,64);c[24]=1;
-    }else if(r->shadowMap){release(r->shadowMap);release(r->shadowDsv);r->shadowSize=0;setDepthSrv(r,nullptr,66);}
+    } else if (r->shadowMap) {
+        if (!waitForTerrainBindings(r, env)) return false;
+        release(r->shadowMap);
+        release(r->shadowDsv);
+        r->shadowSize = 0;
+        setDepthSrv(r, nullptr, 66);
+    }
     std::memcpy(slot.passConstantsMapped+kMaxExtensionPasses*1024,c,sizeof(r->geometryConstants));
     if(c[24]>.5f){
         auto* list=r->shadowList;if(FAILED(slot.shadow->Reset())||FAILED(list->Reset(slot.shadow,packPipeline(r,3) ? packPipeline(r,3) : r->shadowPipeline))){throwJava(env,"Shadow command list reset failed");return false;}
@@ -3895,6 +3980,7 @@ bool renderInteropFrame(InteropRenderer* renderer, const float* viewProjection,
 bool uploadAtlas(InteropRenderer* renderer, const void* const* levelData, jsize levelCount,
         UINT width, UINT height, bool compress, UINT bc7EncoderThreads, JNIEnv* env, bool lightmap = false,
         bool preEncoded = false) {
+    if (!waitForTerrainBindings(renderer, env)) return false;
     // BC7 exige que o nível 0 seja múltiplo de 4; níveis menores são preenchidos por bloco.
     const bool bc7 = compress && width % 4 == 0 && height % 4 == 0;
     std::vector<std::vector<uint8_t>> encoded;
@@ -4103,7 +4189,9 @@ Java_com_redondoguibi_direct_NativeDx12_resizeInterop(JNIEnv* env, jclass, jint 
     bool acquired=renderer->colorAcquired||renderer->depthBridgeAcquired;
     releaseBridgeInterop(renderer);
     renderer->d3d11Context->Flush();
-    if(acquired){
+    if (acquired || g_backendOnly) {
+        // The terrain queue already waits for the backend's preceding use of
+        // these images. Drain past that wait before releasing the targets.
         ID3D12Fence* drain=nullptr;
         bool complete=SUCCEEDED(renderer->device->CreateFence(0,D3D12_FENCE_FLAG_NONE,IID_PPV_ARGS(&drain)))
                 &&SUCCEEDED(renderer->queue->Signal(drain,1))&&waitFence(renderer,drain,1);
@@ -4437,13 +4525,20 @@ Java_com_redondoguibi_direct_NativeDx12_updateTerrainSectionV2(JNIEnv* env, jcla
     const D3D12_GPU_VIRTUAL_ADDRESS address = page->resource->GetGPUVirtualAddress() + arenaOffset;
     section->vertexView = {address, static_cast<UINT>(vertexBytes), kVertexStride};
     section->indexView = {address + vertexBytes, static_cast<UINT>(gpuIndexBytes), compactIndices?DXGI_FORMAT_R16_UINT:DXGI_FORMAT_R32_UINT};
-    section->transparent.reserve(static_cast<size_t>(counts[3])/6);
-    for(UINT q=0;q<static_cast<UINT>(counts[3]);q+=6){
-        TransparentQuad quad={};
-        for(UINT i=0;i<6;i++)quad.indices[i]=allIndices[transparentStart+q+i];
-        // Average the two triangle centroids; duplicated diagonal vertices do not affect distance ordering within a plane.
-        for(UINT i:quad.indices){const auto* v=reinterpret_cast<const uint16_t*>(static_cast<const uint8_t*>(vertices)+i*kVertexStride);for(UINT a=0;a<3;a++)quad.center[a]+=(v[a]/1024.0f-16)/6.0f;}
-        section->transparent.push_back(quad);
+    const size_t quads = static_cast<size_t>(counts[3]) / 6;
+    section->transparentCenters.resize(quads);
+    if (compactIndices) section->transparent16.resize(quads);
+    else section->transparent32.resize(quads);
+    for (size_t q = 0; q < quads; ++q) {
+        const UINT* indices = allIndices + transparentStart + q * 6;
+        if (compactIndices) std::copy_n(indices, 6, section->transparent16[q].begin());
+        else std::copy_n(indices, 6, section->transparent32[q].begin());
+        auto& center = section->transparentCenters[q];
+        for (UINT i = 0; i < 6; ++i) {
+            const auto* v = reinterpret_cast<const uint16_t*>(
+                    static_cast<const uint8_t*>(vertices) + indices[i] * kVertexStride);
+            for (UINT axis = 0; axis < 3; ++axis) center[axis] += (v[axis] / 1024.0f - 16) / 6.0f;
+        }
     }
     UINT start = 0;
     for (UINT layer = 0; layer < kLayerCount; ++layer) {
@@ -4833,7 +4928,7 @@ extern "C" JNIEXPORT void JNICALL Java_com_redondoguibi_direct_NativeDx12_config
     if(enabled!=JNI_TRUE&&r->depthBridgeAcquired){r->d3d11On12->ReleaseWrappedResources(&r->wrappedDepthBridge,1);r->d3d11Context->Flush();r->depthBridgeAcquired=false;}
     if(enabled==JNI_TRUE&&!r->colorAcquired){ID3D11Resource* color=r->wrappedColor;r->d3d11On12->AcquireWrappedResources(&color,1);r->d3d11Context->Flush();r->colorAcquired=true;}
     r->directBridge=enabled==JNI_TRUE;
-    r->bridgeSampling=false;
+
 }
 extern "C" JNIEXPORT void JNICALL Java_com_redondoguibi_direct_NativeDx12_configureColorAlias(JNIEnv* env,jclass,jboolean enabled){
     auto* r=g_interopRenderer;if(!r){throwJava(env,"Interop not initialized");return;}
@@ -4856,21 +4951,23 @@ extern "C" JNIEXPORT jint JNICALL Java_com_redondoguibi_direct_NativeDx12_render
     struct ImportFenceGuard { InteropRenderer* r;FrameSlot& slot;UINT64 value;bool submitted=false;~ImportFenceGuard(){if(!submitted){if(SUCCEEDED(r->queue->Signal(r->fence,value))){r->lastSignaledValue=value;slot.fenceValue=value;}}} } guard{r,slot,static_cast<UINT64>(frameIndex)+1};
     if(r->uploadOpen){throwJava(env,"Translucent frame cannot overtake pending uploads");return -1;}slot.uploadOffset=0;
     // GL has finished capturing the current opaque scene and entities into the interop images.
-    if (r->directBridge ? !bridgeBegin(r, slot, true, false) : !importScene(r)) { throwJava(env, "Translucent scene import failed"); return -1; }
+    if (r->directBridge ? !importTranslucentDepth(r, slot) : !importScene(r)) { throwJava(env, "Translucent scene import failed"); return -1; }
     env->GetFloatArrayRegion(matrix,0,28,r->viewProjection);
     std::memcpy(slot.passConstantsMapped+kMaxExtensionPasses*1024,r->geometryConstants,sizeof(r->geometryConstants));
     auto* list=r->translucentList;if(FAILED(slot.translucent->Reset())||FAILED(list->Reset(slot.translucent,packPipeline(r,2) ? packPipeline(r,2) : r->translucentPipeline))){throwJava(env,"Translucent list reset failed");return -1;}
     if(r->profiling)list->EndQuery(r->timestampHeap,D3D12_QUERY_TYPE_TIMESTAMP,r->slotIndex*2);
     if(r->packSceneInputs||r->geometrySettings[1]>0||r->geometrySettings[2]>0||r->materialSettings[3]>0){
         bool needsColor=r->packSceneInputs||r->geometrySettings[1]>0||r->geometrySettings[2]>0;
+        if (((needsColor && !r->sceneColor) || !r->sceneDepth) && !waitForTerrainBindings(r, env)) return -1;
         if(needsColor&&!r->sceneColor){
             auto desc=r->colorTarget->GetDesc();desc.Flags=D3D12_RESOURCE_FLAG_NONE;D3D12_HEAP_PROPERTIES heap={};heap.Type=D3D12_HEAP_TYPE_DEFAULT;
             if(FAILED(r->device->CreateCommittedResource(&heap,D3D12_HEAP_FLAG_NONE,&desc,D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,nullptr,IID_PPV_ARGS(&r->sceneColor)))){throwJava(env,"Water scene allocation failed");return -1;}
             D3D12_SHADER_RESOURCE_VIEW_DESC srv={};srv.Format=kColorFormat;srv.ViewDimension=D3D12_SRV_DIMENSION_TEXTURE2D;srv.Shader4ComponentMapping=D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;srv.Texture2D.MipLevels=1;r->device->CreateShaderResourceView(r->sceneColor,&srv,materialSrv(r,64));
         }
         if(!r->sceneDepth){auto desc=r->depthTarget->GetDesc();desc.Flags=D3D12_RESOURCE_FLAG_NONE;D3D12_HEAP_PROPERTIES heap={};heap.Type=D3D12_HEAP_TYPE_DEFAULT;
-            if(FAILED(r->device->CreateCommittedResource(&heap,D3D12_HEAP_FLAG_NONE,&desc,D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,nullptr,IID_PPV_ARGS(&r->sceneDepth)))){throwJava(env,"Water depth snapshot allocation failed");return -1;}}
-        setDepthSrv(r,r->sceneDepth,65);
+            if(FAILED(r->device->CreateCommittedResource(&heap,D3D12_HEAP_FLAG_NONE,&desc,D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,nullptr,IID_PPV_ARGS(&r->sceneDepth)))){throwJava(env,"Water depth snapshot allocation failed");return -1;}
+            setDepthSrv(r,r->sceneDepth,65);
+        }
         if(needsColor){
             D3D12_RESOURCE_BARRIER copy[]={transition(r->sceneColor,D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,D3D12_RESOURCE_STATE_COPY_DEST),transition(r->colorTarget,D3D12_RESOURCE_STATE_RENDER_TARGET,D3D12_RESOURCE_STATE_COPY_SOURCE)};
             list->ResourceBarrier(2,copy);list->CopyResource(r->sceneColor,r->colorTarget);
@@ -4879,30 +4976,59 @@ extern "C" JNIEXPORT jint JNICALL Java_com_redondoguibi_direct_NativeDx12_render
         D3D12_RESOURCE_BARRIER copyDepth[]={transition(r->sceneDepth,D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,D3D12_RESOURCE_STATE_COPY_DEST),transition(r->depthTarget,D3D12_RESOURCE_STATE_DEPTH_WRITE,D3D12_RESOURCE_STATE_COPY_SOURCE)};
         list->ResourceBarrier(2,copyDepth);list->CopyResource(r->sceneDepth,r->depthTarget);
         D3D12_RESOURCE_BARRIER restoreDepth[]={transition(r->sceneDepth,D3D12_RESOURCE_STATE_COPY_DEST,D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE),transition(r->depthTarget,D3D12_RESOURCE_STATE_COPY_SOURCE,D3D12_RESOURCE_STATE_DEPTH_WRITE)};list->ResourceBarrier(2,restoreDepth);
-    }else if(r->sceneColor||r->sceneDepth){releaseSceneSnapshots(r);}
+    } else if (r->sceneColor || r->sceneDepth) {
+        if (!waitForTerrainBindings(r, env)) return -1;
+        releaseSceneSnapshots(r);
+    }
     auto rtv=r->rtvHeap->GetCPUDescriptorHandleForHeapStart();auto dsv=r->dsvHeap->GetCPUDescriptorHandleForHeapStart();
     list->OMSetRenderTargets(1,&rtv,FALSE,&dsv);ID3D12DescriptorHeap* heaps[]={r->srvHeap};list->SetDescriptorHeaps(1,heaps);list->SetGraphicsRootSignature(r->rootSignature);list->SetGraphicsRootDescriptorTable(2,r->srvHeap->GetGPUDescriptorHandleForHeapStart());list->SetGraphicsRootConstantBufferView(3,slot.passConstants->GetGPUVirtualAddress()+kMaxExtensionPasses*1024);list->SetGraphicsRoot32BitConstants(0,28,r->viewProjection,0);list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     D3D12_VIEWPORT viewport={0,0,static_cast<float>(r->width),static_cast<float>(r->height),0,1};D3D12_RECT rect={0,0,static_cast<LONG>(r->width),static_cast<LONG>(r->height)};list->RSSetViewports(1,&viewport);list->RSSetScissorRects(1,&rect);
-    auto& sections=r->transparentSections;sections.clear();for(auto& entry:r->visible)if(!entry.section->transparent.empty())sections.push_back(entry.section);
-    auto distance=[&](const TerrainSection* s){double x=s->x+8-cameraX,y=s->y+8-cameraY,z=s->z+8-cameraZ;return x*x+y*y+z*z;};
-    std::stable_sort(sections.begin(),sections.end(),[&](auto* a,auto* b){return distance(a)>distance(b);});
-    for(auto* section:sections){
+    auto& sections = r->transparentSections;
+    const bool sameView = r->visibleOrderValid && r->sortedCamera[0] == cameraX
+            && r->sortedCamera[1] == cameraY && r->sortedCamera[2] == cameraZ;
+    if (!r->transparentSectionsSorted || !sameView) {
+        sections.clear();
+        for (const auto& entry : r->visible) {
+            const auto* s = entry.section;
+            if (s->transparentCenters.empty()) continue;
+            double x = s->x + 8 - cameraX, y = s->y + 8 - cameraY, z = s->z + 8 - cameraZ;
+            sections.push_back({s, x*x + y*y + z*z});
+        }
+        std::stable_sort(sections.begin(), sections.end(), [](const auto& a, const auto& b) {
+            return a.distanceSquared > b.distanceSquared;
+        });
+        // Rebuilding the opaque selection invalidates even ties, which retain its traversal order.
+        r->transparentSectionsSorted = sameView;
+    }
+    for (const auto& sorted : sections) {
+        const auto* section = sorted.section;
         auto& order=section->transparentOrder;
         if(!section->transparentOrderValid||section->sortCamera[0]!=cameraX||section->sortCamera[1]!=cameraY||section->sortCamera[2]!=cameraZ){
-            order.resize(section->transparent.size());
+            order.resize(section->transparentCenters.size());
             auto& distances=r->transparentDistances;distances.resize(order.size());
             for(UINT i=0;i<order.size();i++){
-                order[i]=i;auto& q=section->transparent[i];
-                double x=section->x+q.center[0]-cameraX,y=section->y+q.center[1]-cameraY,z=section->z+q.center[2]-cameraZ;
+                order[i] = i;
+                const auto& center = section->transparentCenters[i];
+                double x=section->x+center[0]-cameraX,y=section->y+center[1]-cameraY,z=section->z+center[2]-cameraZ;
                 distances[i]=x*x+y*y+z*z;
             }
             // Original quad index breaks ties exactly like a stable sort of the original mesh.
             std::sort(order.begin(),order.end(),[&](UINT a,UINT b){return distances[a]!=distances[b]?distances[a]>distances[b]:a<b;});
             section->sortCamera[0]=cameraX;section->sortCamera[1]=cameraY;section->sortCamera[2]=cameraZ;section->transparentOrderValid=true;
         }
-        UINT64 bytes=static_cast<UINT64>(order.size())*24,offset=0;if(!reserveMappedRange(slot,bytes,256,&offset)){throwJava(env,"Translucent index budget exceeded; retain vanilla layer");return -1;}
-        auto* dst=reinterpret_cast<UINT*>(slot.uploadMapped+offset);for(UINT i:order){std::memcpy(dst,section->transparent[i].indices.data(),24);dst+=6;}
-        D3D12_INDEX_BUFFER_VIEW indices={slot.uploadBuffer->GetGPUVirtualAddress()+offset,static_cast<UINT>(bytes),DXGI_FORMAT_R32_UINT};list->IASetIndexBuffer(&indices);list->IASetVertexBuffers(0,1,&section->vertexView);
+        const bool compact = section->indexView.Format == DXGI_FORMAT_R16_UINT;
+        const UINT64 bytes = order.size() * 6 * (compact ? sizeof(UINT16) : sizeof(UINT));
+        UINT64 offset;
+        if (!reserveMappedRange(slot, bytes, sizeof(UINT), &offset)) {
+            throwJava(env, "Translucent index budget exceeded; retain vanilla layer");
+            return -1;
+        }
+        if (compact) copySortedQuadIndices(slot.uploadMapped + offset, section->transparent16, order);
+        else copySortedQuadIndices(slot.uploadMapped + offset, section->transparent32, order);
+        D3D12_INDEX_BUFFER_VIEW indices = {slot.uploadBuffer->GetGPUVirtualAddress() + offset,
+                static_cast<UINT>(bytes), section->indexView.Format};
+        list->IASetIndexBuffer(&indices);
+        list->IASetVertexBuffers(0,1,&section->vertexView);
         float positions[]={static_cast<float>(section->x-cameraX),static_cast<float>(section->y-cameraY),static_cast<float>(section->z-cameraZ),-1};UINT constants[5];std::memcpy(constants,positions,16);constants[4]=r->atlasIndex;list->SetGraphicsRoot32BitConstants(1,5,constants,0);list->DrawIndexedInstanced(static_cast<UINT>(order.size())*6,1,0,0,0);
     }
     if(FAILED(list->Close())){throwJava(env,"Translucent recording failed");return -1;}ID3D12CommandList* lists[]={list};r->queue->ExecuteCommandLists(1,lists);
@@ -4937,7 +5063,7 @@ extern "C" JNIEXPORT void JNICALL Java_com_redondoguibi_direct_NativeDx12_config
     }
     configureWorldGraph(r,passSources,env);
 }
-extern "C" JNIEXPORT jint JNICALL Java_com_redondoguibi_direct_NativeDx12_renderWorldInterop(JNIEnv* env,jclass,jfloatArray uniforms,jlong frameIndex){
+static jint renderWorld(JNIEnv* env, jfloatArray uniforms, jlong frameIndex, bool forwardColor) {
     auto* r=g_interopRenderer;
     if(!r||r->worldPasses.empty()||!uniforms||env->GetArrayLength(uniforms)!=r->worldPasses.size()*kPassUniformFloatCount||frameIndex<0||frameIndex>=INT64_MAX-1){throwJava(env,"Invalid world pass frame");return -1;}
     bool ready=false;if(!currentFrameSlotReady(r,env,&ready))return -1;if(!ready)return 2;
@@ -4956,8 +5082,11 @@ extern "C" JNIEXPORT jint JNICALL Java_com_redondoguibi_direct_NativeDx12_render
         ID3D12CommandList* begin[]={r->finishList};r->queue->ExecuteCommandLists(1,begin);
     }
     // The direct bridge samples GL's scene depth in place; the copied bridge imports it into depthTarget.
-    if (r->directBridge ? !bridgeBegin(r, slot, false, true) : !importScene(r)) { throwJava(env, "World scene import failed"); return -1; }
-    bool recorded=recordWorldGraph(r,slot,static_cast<UINT64>(frameIndex),values,worldTimer,worldQuery,r->directBridge);
+    if (r->directBridge) releaseBridgeInterop(r);
+    else if (!importScene(r)) { throwJava(env, "World scene import failed"); return -1; }
+    ID3D12Resource* output = nullptr;
+    bool recorded = recordWorldGraph(r, slot, static_cast<UINT64>(frameIndex), values, worldTimer, worldQuery,
+            r->directBridge, forwardColor ? &output : nullptr);
     if(!recorded){throwJava(env,"World pass recording failed");return -1;}
     ID3D12CommandList* lists[]={r->extensionList};r->queue->ExecuteCommandLists(1,lists);
     // World passes only sample depth. interopDepth still contains the scene depth imported above.
@@ -4966,12 +5095,23 @@ extern "C" JNIEXPORT jint JNICALL Java_com_redondoguibi_direct_NativeDx12_render
     UINT64 value=static_cast<UINT64>(frameIndex)+1;
     if(FAILED(r->queue->Signal(r->fence,value))){throwJava(env,"World fence failed");return -1;}
     r->lastSignaledValue=value;slot.fenceValue=value;slot.timestampValid=false;
+    r->graph.backendColor = output;
+    r->graph.backendColorFence = value;
     if(worldTimer){r->worldTimestampValid[r->slotIndex]=true;r->worldTimestampFence[r->slotIndex]=value;}
     r->slotIndex=(r->slotIndex+1)%kFramesInFlight;guard.submitted=true;
     return 0;
 }
 
-// {scene import ms, passes and output copy ms} of the latest completed profiled world frame, or null.
+extern "C" JNIEXPORT jint JNICALL Java_com_redondoguibi_direct_NativeDx12_renderWorldInterop(
+        JNIEnv* env, jclass, jfloatArray uniforms, jlong frameIndex) {
+    return renderWorld(env, uniforms, frameIndex, false);
+}
+extern "C" JNIEXPORT jint JNICALL Java_com_redondoguibi_direct_NativeDx12_renderWorldForBackend(
+        JNIEnv* env, jclass, jfloatArray uniforms, jlong frameIndex) {
+    return renderWorld(env, uniforms, frameIndex, true);
+}
+
+// {scene import ms, world graph ms} of the latest completed profiled world frame, or null.
 extern "C" JNIEXPORT jdoubleArray JNICALL Java_com_redondoguibi_direct_NativeDx12_worldFrameMetrics(JNIEnv* env,jclass){
     auto* r=g_interopRenderer;
     if(!r||!r->worldTimestampReadback||r->timestampFrequency==0)return nullptr;
@@ -5016,6 +5156,11 @@ bool directTerrainOutput(DirectTerrainOutput* out) {
     out->width = r->width;
     out->height = r->height;
     return true;
+}
+
+ID3D12Resource* directWorldColor(UINT64 readyValue) {
+    auto* r = g_interopRenderer;
+    return r && r->graph.backendColorFence == readyValue ? r->graph.backendColor : nullptr;
 }
 
 bool directTerrainHandOff(ID3D12Fence* fence, UINT64 value) {

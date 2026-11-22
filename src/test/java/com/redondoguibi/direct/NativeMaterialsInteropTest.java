@@ -142,7 +142,8 @@ abstract class NativeMaterialsInteropTestBase {
     }
     @Test void transparentBudgetRejectionDoesNotStrandTheRenderer(){
         var vertices=ByteBuffer.allocateDirect(80).order(ByteOrder.nativeOrder());for(float[] p:new float[][]{{-.5f,-.5f},{.5f,-.5f},{.5f,.5f},{-.5f,.5f}})vertex(vertices,p[0],p[1],.4f,-1,4);vertices.flip();
-        int quads=128*1024;var many=ByteBuffer.allocateDirect(quads*24).order(ByteOrder.nativeOrder());for(int q=0;q<quads;q++)for(int i:new int[]{0,1,2,2,3,0})many.putInt(i);many.flip();
+        // Six sections of 3 MiB each exceed the 16 MiB ring even with exact 16-bit indices.
+        int quads=256*1024;var many=ByteBuffer.allocateDirect(quads*24).order(ByteOrder.nativeOrder());for(int q=0;q<quads;q++)for(int i:new int[]{0,1,2,2,3,0})many.putInt(i);many.flip();
         float[] frame=matrix(new Matrix4f());
         for(int i=0;i<6;i++){
             NativeDx12.updateTerrainSection(i+1,0,0,0,vertices,4,many,new int[]{0,0,0,quads*6});

@@ -35,6 +35,7 @@ final class NativeDx12 {
     static native void configureRenderPasses(String[] pixelShaderSources);
     static native void configureWorldPasses(String[] sources);
     static native int renderWorldInterop(float[] uniforms,long frameIndex);
+    static native int renderWorldForBackend(float[] uniforms, long frameIndex);
     static native boolean isWorldFrameReady();
     /** {scene import ms, passes ms} of the latest completed profiled world frame, consumed once; null if none. */
     static native double[] worldFrameMetrics();
