@@ -12,6 +12,8 @@ final class Dx12BackendNative {
     /** Executes everything recorded so far and waits for the GPU. */
     static native void flush();
     static native long draws();
+    /** With the debug layer: validation messages collected at fence waits since the last call ("" otherwise). */
+    static native String messages();
 
     static native void textureImage(int id, int level, int glInternalFormat, int width, int height);
     static native void textureSubImage(int id, int level, int x, int y, int width, int height, int glFormat, long pixels,
@@ -27,14 +29,26 @@ final class Dx12BackendNative {
     static native void clear(int framebuffer, int mask, float r, float g, float b, float a, float depth, int[] scissor,
             int colorWrite);
 
+    /** Static mesh storage (VertexBuffer.Usage.STATIC). @param id 0 for a new mesh @return the mesh id */
+    static native int meshUpload(int id, long vertices, int vertexBytes, long indices, int indexBytes);
+    static native void meshIndices(int id, long indices, int indexBytes);
+    static native void meshDelete(int id);
+    static native long meshBytes();
+    /** Debug: a static mesh's vertices (which 0) or indices (1), copied out by the GPU (runs the recorded commands first). */
+    static native int meshGpuRead(int id, int which, ByteBuffer out);
+
+    /** glBlitFramebuffer of whole, equally sized attachments. rect = src x0,y0,x1,y1, dst x0,y0,x1,y1. @return false if unsupported */
+    static native boolean blit(int readFramebuffer, int drawFramebuffer, int[] rect, int mask);
+
     static native int createProgram(String name, byte[] vertexHlsl, byte[] fragmentHlsl, int cbufferBytes, int textures);
 
     /**
+     * @param mesh   a static mesh id, or 0 to copy {@code vertices}/{@code indices} for this draw
      * @param layout {location, dxgiFormat, byteOffset} per vertex element the program reads
      * @param inputs every vertex input location of the program
      * @param state  blend[7], depth[3], cull, colorMask, scissor[5], viewport[4], polygonOffset, factor bits, units bits
      */
-    static native void draw(int program, int framebuffer, long vertices, int vertexBytes, int stride, int[] layout,
+    static native void draw(int program, int framebuffer, int mesh, long vertices, int vertexBytes, int stride, int[] layout,
             int[] inputs, long indices, int indexBytes, boolean wideIndices, int indexCount, int glMode, int[] state,
             ByteBuffer cbuffer, int cbufferBytes, int[] textures);
 

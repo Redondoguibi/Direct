@@ -70,6 +70,11 @@ abstract class GlStateManagerShadowMixin {
     private static void direct$framebufferTexture(int target, int attachment, int textureTarget, int texture, int level, CallbackInfo ci) {
         Dx12Shadow.framebufferTexture(target, attachment, textureTarget, texture);
     }
+    @Inject(method = "_glBlitFrameBuffer", at = @At("HEAD"))
+    private static void direct$blitFramebuffer(int sx0, int sy0, int sx1, int sy1, int dx0, int dy0, int dx1, int dy1, int mask,
+            int filter, CallbackInfo ci) {
+        Dx12Shadow.blitFramebuffer(sx0, sy0, sx1, sy1, dx0, dy0, dx1, dy1, mask);
+    }
     @Inject(method = "_glDeleteFramebuffers", at = @At("HEAD"))
     private static void direct$deleteFramebuffer(int framebuffer, CallbackInfo ci) { Dx12Shadow.deleteFramebuffer(framebuffer); }
 }

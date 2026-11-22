@@ -74,6 +74,9 @@ public final class Dx12Shadow {
     private static final ByteBuffer cbuffer = ByteBuffer.allocateDirect(4096).order(ByteOrder.LITTLE_ENDIAN);
     // ---- Statistics --------------------------------------------------------------------------------------------
     static long draws, skippedDraws, errors;
+    /** Per frame: VertexBuffer.draw calls, draws handed to native, and the native count at frame start. */
+    static int frameCalls, frameDraws, lastCalls, lastDraws;
+    static long nativeAtFrameStart, lastNative;
     // ---- Trace (-Ddirect.phase1.trace=true): every clear and draw of the current frame ----------------------------
     static final boolean TRACE = Boolean.getBoolean("direct.phase1.trace");
     static final StringBuilder trace = new StringBuilder();
@@ -296,43 +299,100 @@ public final class Dx12Shadow {
     }
 
     // ---- Meshes and draws --------------------------------------------------------------------------------------
-    /** Copy of what a VertexBuffer last uploaded; the MeshData is closed right after upload. */
+    /**
+     * What a VertexBuffer last uploaded; the MeshData is closed right after upload. Static buffers (terrain sections,
+     * sky, clouds) live in native mesh storage ({@code id}); dynamic ones (BufferUploader) keep a Java copy that each
+     * draw sends to the upload ring.
+     */
     public static final class Mesh {
         ByteBuffer vertices, indices;
-        int vertexBytes, indexBytes, indexCount, glMode;
+        int vertexBytes, indexBytes, indexCount, glMode, id;
+        /** The VertexBuffer's OpenGL vertex buffer name, for -Ddirect.phase2.verifyMeshes. */
+        public int glBuffer;
+        /** The VertexBuffer's own index count at draw time, for -Ddirect.phase2.verifyMeshes. */
+        public int glIndexCount;
+        boolean sequentialIndices;
         boolean wide;
         VertexFormat format;
+        VertexFormat.IndexType indexType;
     }
 
-    public static void upload(Mesh mesh, MeshData data) {
+    private static ByteBuffer scratchIndices;
+
+    public static void upload(Mesh mesh, MeshData data, boolean persistent) {
         if (!live()) return;
         try {
             MeshData.DrawState state = data.drawState();
             ByteBuffer source = data.vertexBuffer();
             mesh.format = state.format();
-            mesh.vertexBytes = source == null ? 0 : source.remaining();
-            mesh.vertices = copy(mesh.vertices, source);
             VertexFormat.Mode mode = state.mode();
             mesh.glMode = mode == VertexFormat.Mode.TRIANGLE_FAN ? 4 : mode.asGLMode;
+            mesh.indexType = state.indexType();
             ByteBuffer indexSource = data.indexBuffer();
+            if (persistent) {
+                ByteBuffer indices;
+                if (indexSource != null) {
+                    mesh.sequentialIndices = false;
+                    indices = indexSource;
+                    mesh.wide = mesh.indexType == VertexFormat.IndexType.INT;
+                    mesh.indexCount = state.indexCount();
+                } else {
+                    scratchIndices = sequential(scratchIndices, mesh, mode, state.vertexCount(), state.indexCount());
+                    indices = scratchIndices;
+                }
+                // A null vertex buffer keeps the previous OpenGL contents; this mirror has none to keep.
+                mesh.vertexBytes = source == null ? 0 : source.remaining();
+                mesh.indexBytes = indices.remaining();
+                mesh.vertices = mesh.indices = null;
+                mesh.id = Dx12BackendNative.meshUpload(mesh.id, source == null ? 0 : MemoryUtil.memAddress(source), mesh.vertexBytes,
+                        MemoryUtil.memAddress(indices), mesh.indexBytes);
+                return;
+            }
+            mesh.vertexBytes = source == null ? 0 : source.remaining();
+            mesh.vertices = copy(mesh.vertices, source);
             if (indexSource != null) {
                 mesh.indices = copy(mesh.indices, indexSource);
                 mesh.indexBytes = indexSource.remaining();
-                mesh.wide = state.indexType() == VertexFormat.IndexType.INT;
+                mesh.wide = mesh.indexType == VertexFormat.IndexType.INT;
                 mesh.indexCount = state.indexCount();
             } else {
-                sequential(mesh, mode, state.vertexCount(), state.indexCount());
+                mesh.indices = sequential(mesh.indices, mesh, mode, state.vertexCount(), state.indexCount());
             }
         } catch (RuntimeException ex) {
             fail("upload", ex);
         }
     }
 
-    /** VertexBuffer.uploadIndexBuffer: a re-sorted index buffer for the same vertices. */
+    /** VertexBuffer.uploadIndexBuffer: a re-sorted index buffer for the same vertices, of the last upload's index type. */
     public static void uploadIndices(Mesh mesh, ByteBuffer indices) {
         if (!live() || indices == null) return;
-        mesh.indices = copy(mesh.indices, indices);
-        mesh.indexBytes = indices.remaining();
+        try {
+            mesh.wide = mesh.indexType == VertexFormat.IndexType.INT;
+            mesh.indexBytes = indices.remaining();
+            if (mesh.id > 0) Dx12BackendNative.meshIndices(mesh.id, MemoryUtil.memAddress(indices), mesh.indexBytes);
+            else mesh.indices = copy(mesh.indices, indices);
+        } catch (RuntimeException ex) {
+            fail("uploadIndices", ex);
+        }
+    }
+
+    /** VertexBuffer.close. */
+    public static void close(Mesh mesh) {
+        mesh.vertices = mesh.indices = null;
+        if (mesh.id <= 0 || !ready) return;
+        try { Dx12BackendNative.meshDelete(mesh.id); } catch (RuntimeException ex) { fail("meshDelete", ex); }
+        mesh.id = 0;
+    }
+
+    /** GlStateManager._glBlitFrameBuffer (RenderTarget.copyDepthFrom). */
+    public static void blitFramebuffer(int sx0, int sy0, int sx1, int sy1, int dx0, int dy0, int dx1, int dy1, int mask) {
+        if (!live()) return;
+        try {
+            if (!Dx12BackendNative.blit(readFramebuffer, drawFramebuffer, new int[]{sx0, sy0, sx1, sy1, dx0, dy0, dx1, dy1}, mask))
+                unsupported.putIfAbsent("blit " + (sx1 - sx0) + "x" + (sy1 - sy0) + "->" + (dx1 - dx0) + "x" + (dy1 - dy0), "scaled or partial");
+        } catch (RuntimeException ex) {
+            fail("blit", ex);
+        }
     }
 
     private static ByteBuffer copy(ByteBuffer target, ByteBuffer source) {
@@ -344,16 +404,16 @@ public final class Dx12Shadow {
         return target;
     }
 
-    /** RenderSystem's shared sequential index buffers, generated as 32-bit indices. */
-    private static void sequential(Mesh mesh, VertexFormat.Mode mode, int vertexCount, int indexCount) {
+    /** RenderSystem's shared sequential index buffers, generated as 32-bit indices into {@code target}. */
+    private static ByteBuffer sequential(ByteBuffer target, Mesh mesh, VertexFormat.Mode mode, int vertexCount, int indexCount) {
         int count;
         if (mode == VertexFormat.Mode.TRIANGLE_FAN) count = Math.max(0, vertexCount - 2) * 3;
         else count = indexCount;
         int bytes = count * 4;
-        if (mesh.indices == null || mesh.indices.capacity() < bytes)
-            mesh.indices = ByteBuffer.allocateDirect(Math.max(bytes, 256)).order(ByteOrder.nativeOrder());
-        mesh.indices.clear();
-        IntBuffer out = mesh.indices.asIntBuffer();
+        if (target == null || target.capacity() < bytes)
+            target = ByteBuffer.allocateDirect(Math.max(bytes, 256)).order(ByteOrder.nativeOrder());
+        target.clear();
+        IntBuffer out = target.asIntBuffer();
         if (mode == VertexFormat.Mode.QUADS || mode == VertexFormat.Mode.LINES) {
             boolean lines = mode == VertexFormat.Mode.LINES;
             for (int i = 0, base = 0; i + 6 <= count; i += 6, base += 4) {
@@ -365,14 +425,62 @@ public final class Dx12Shadow {
         } else {
             for (int i = 0; i < count; i++) out.put(i);
         }
-        mesh.indices.limit(bytes);
+        target.limit(bytes);
+        mesh.sequentialIndices = mode == VertexFormat.Mode.QUADS;
         mesh.indexBytes = bytes;
         mesh.indexCount = count;
         mesh.wide = true;
+        return target;
     }
 
+    /** Debug: every 30th frame, each static mesh drawn is compared with OpenGL's copy of its vertices. */
+    private static final boolean VERIFY_MESHES = Boolean.getBoolean("direct.phase2.verifyMeshes");
+    private static long frameIndex, verified, mismatched;
+
+    private static void verify(Mesh mesh) {
+        int previous = org.lwjgl.opengl.GL11.glGetInteger(org.lwjgl.opengl.GL15.GL_ARRAY_BUFFER_BINDING);
+        org.lwjgl.opengl.GL15.glBindBuffer(org.lwjgl.opengl.GL15.GL_ARRAY_BUFFER, mesh.glBuffer);
+        int size = org.lwjgl.opengl.GL15.glGetBufferParameteri(org.lwjgl.opengl.GL15.GL_ARRAY_BUFFER, org.lwjgl.opengl.GL15.GL_BUFFER_SIZE);
+        ByteBuffer gl = MemoryUtil.memAlloc(Math.max(size, 1)), dx = MemoryUtil.memAlloc(Math.max(size, 1));
+        try {
+            org.lwjgl.opengl.GL15.glGetBufferSubData(org.lwjgl.opengl.GL15.GL_ARRAY_BUFFER, 0, gl);
+            int stored = Dx12BackendNative.meshGpuRead(mesh.id, 0, dx);
+            verified++;
+            int first = -1;
+            for (int i = 0; i < Math.min(size, stored) && first < 0; i++) if (gl.get(i) != dx.get(i)) first = i;
+            int badIndex = -1;
+            if (mesh.sequentialIndices) {
+                ByteBuffer indices = MemoryUtil.memAlloc(Math.max(mesh.indexBytes, 4));
+                try {
+                    int bytes = Dx12BackendNative.meshGpuRead(mesh.id, 1, indices);
+                    if (bytes != mesh.indexCount * 4) badIndex = -2;
+                    for (int i = 0; i < mesh.indexCount && badIndex == -1 && 4 * i + 4 <= bytes; i++) {
+                        int quad = i / 6, corner = new int[]{0, 1, 2, 2, 3, 0}[i % 6];
+                        if (indices.getInt(4 * i) != quad * 4 + corner) badIndex = i;
+                    }
+                } finally {
+                    MemoryUtil.memFree(indices);
+                }
+            }
+            if (mesh.glIndexCount != mesh.indexCount) badIndex = -3;
+            if (stored != size || stored != mesh.vertexBytes || first >= 0 || badIndex != -1) {
+                mismatched++;
+                if (mismatched <= 20) Direct.LOGGER.warn("Direct phase2 mesh mismatch id={} glBuffer={} glBytes={} stored={} expected={} firstDiff={} badIndex={} indexCount={}/{}",
+                        mesh.id, mesh.glBuffer, size, stored, mesh.vertexBytes, first, badIndex, mesh.indexCount, mesh.glIndexCount);
+            }
+        } finally {
+            org.lwjgl.opengl.GL15.glBindBuffer(org.lwjgl.opengl.GL15.GL_ARRAY_BUFFER, previous);
+            MemoryUtil.memFree(gl);
+            MemoryUtil.memFree(dx);
+        }
+    }
+
+    static String meshVerification() { return VERIFY_MESHES ? verified + " checked, " + mismatched + " mismatched" : "off"; }
+
     public static void draw(Mesh mesh) {
-        if (!live() || mesh.vertices == null || mesh.indexCount == 0 || mesh.format == null) return;
+        frameCalls++;
+        if (!live() || (mesh.vertices == null && mesh.id <= 0) || mesh.indexCount == 0 || mesh.format == null) return;
+        if (VERIFY_MESHES && mesh.id > 0 && frameIndex % 30 == 0) verify(mesh);
         Object current = program;
         String kind, name;
         if (current instanceof ShaderInstance shader) { kind = "core"; name = shader.getName(); }
@@ -412,10 +520,12 @@ public final class Dx12Shadow {
                     scissor ? scissorX + "," + scissorY + "," + scissorW + "x" + scissorH : "off",
                     blend ? srcRgb + "," + dstRgb + "," + srcAlpha + "," + dstAlpha + "/" + equation : "off", depthTest, depthFunc, depthMask,
                     cull, colorMask, java.util.Arrays.toString(textures), floats(info.cbufferBytes)));
-            Dx12BackendNative.draw(info.id, drawFramebuffer, MemoryUtil.memAddress(mesh.vertices), mesh.vertexBytes,
-                    format.getVertexSize(), layoutArray, info.inputLocations, MemoryUtil.memAddress(mesh.indices),
+            Dx12BackendNative.draw(info.id, drawFramebuffer, mesh.id, mesh.id > 0 ? 0 : MemoryUtil.memAddress(mesh.vertices),
+                    mesh.vertexBytes, format.getVertexSize(), layoutArray, info.inputLocations,
+                    mesh.id > 0 ? 0 : MemoryUtil.memAddress(mesh.indices),
                     mesh.indexBytes, mesh.wide, mesh.indexCount, mesh.glMode, state, cbuffer, info.cbufferBytes, textures);
             draws++;
+            frameDraws++;
         } catch (RuntimeException ex) {
             fail("draw " + kind + "/" + name, ex);
         }
@@ -495,6 +605,13 @@ public final class Dx12Shadow {
     /** Window.updateDisplay: everything of the frame is recorded; run it so the next frame starts empty. */
     public static void endFrame() {
         if (!ready) return;
+        frameIndex++;
+        lastCalls = frameCalls;
+        lastDraws = frameDraws;
+        long nativeNow = Dx12BackendNative.draws();
+        lastNative = nativeNow - nativeAtFrameStart;
+        nativeAtFrameStart = nativeNow;
+        frameCalls = frameDraws = 0;
         Dx12ShadowProbe.frame();
         try {
             if (presenting()) {
@@ -511,10 +628,22 @@ public final class Dx12Shadow {
             fail(presenting() ? "present" : "flush", ex);
         }
         trace.setLength(0);
+        if (DEBUG && debugLogged < 50) {
+            String messages = Dx12BackendNative.messages();
+            if (!messages.isEmpty()) {
+                debugLogged++;
+                Direct.LOGGER.warn("Direct DX12 backend debug layer:{}", messages.length() > 4000 ? messages.substring(0, 4000) + " ..." : messages);
+            }
+        }
     }
+
+    private static final boolean DEBUG = Boolean.getBoolean("direct.phase1.debug");
+    private static int debugLogged;
 
     /** Present mode, once the backend runs; until then OpenGL keeps showing the loading screens. */
     public static boolean presenting() { return PRESENT && ready && !broken; }
+
+    static long meshBytes() { return ready ? Dx12BackendNative.meshBytes() : 0; }
 
     static void readback(int texture, ByteBuffer out) {
         Dx12BackendNative.readback(texture, out);

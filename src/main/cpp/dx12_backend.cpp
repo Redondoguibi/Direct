@@ -17,6 +17,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <map>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -58,6 +59,13 @@ struct Program {
     ComPtr<ID3DBlob> vs, ps;
     UINT cbufferBytes = 0, textures = 0;
 };
+
+// Persistent vertex/index storage of static VertexBuffers (terrain sections, sky, clouds), sub-allocated from
+// default-heap pages and filled with copies staged in the upload ring. Freed ranges return to their page after the
+// next fence wait. (Drawing straight from persistently mapped upload-heap pages occasionally showed stale geometry on
+// Intel UHD 630 although the bytes were correct; see docs/fase2-dx12-total.md.)
+struct Range { UINT page = 0; UINT64 offset = 0, bytes = 0; };
+struct MeshBuffers { Range vertices, indices; UINT vertexBytes = 0, indexBytes = 0; };
 
 struct PsoKey {
     int program;
@@ -160,7 +168,15 @@ public:
             if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&layer)))) layer->EnableDebugLayer();
         }
         check(D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device)), "D3D12CreateDevice");
-        if (debug) device.As(&info);
+        if (debug && SUCCEEDED(device.As(&info))) {
+            // Clears use GL's per-call colors; the optimized-clear-value notice is expected.
+            D3D12_MESSAGE_ID quiet[] = {D3D12_MESSAGE_ID_CLEARRENDERTARGETVIEW_MISMATCHINGCLEARVALUE,
+                                        D3D12_MESSAGE_ID_CLEARDEPTHSTENCILVIEW_MISMATCHINGCLEARVALUE};
+            D3D12_INFO_QUEUE_FILTER filter{};
+            filter.DenyList.NumIDs = 2;
+            filter.DenyList.pIDList = quiet;
+            info->AddStorageFilterEntries(&filter);
+        }
         D3D12_COMMAND_QUEUE_DESC queueDesc{};
         queueDesc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
         check(device->CreateCommandQueue(&queueDesc, IID_PPV_ARGS(&queue)), "CreateCommandQueue");
@@ -318,6 +334,81 @@ public:
         }
     }
 
+    // ---- Static meshes --------------------------------------------------------------------------------------
+    int meshUpload(int id, const uint8_t* vertices, UINT vertexBytes, const uint8_t* indices, UINT indexBytes) {
+        if (id <= 0) id = nextMesh++;
+        auto& mesh = meshes[id];
+        release(mesh.vertices);
+        mesh.vertices = store(vertices, vertexBytes);
+        mesh.vertexBytes = vertexBytes;
+        release(mesh.indices);
+        mesh.indices = store(indices, indexBytes);
+        mesh.indexBytes = indexBytes;
+        return id;
+    }
+    void meshIndices(int id, const uint8_t* indices, UINT indexBytes) {
+        auto found = meshes.find(id);
+        if (found == meshes.end()) return;
+        release(found->second.indices);
+        found->second.indices = store(indices, indexBytes);
+        found->second.indexBytes = indexBytes;
+    }
+    void meshDelete(int id) {
+        auto found = meshes.find(id);
+        if (found == meshes.end()) return;
+        release(found->second.vertices);
+        release(found->second.indices);
+        meshes.erase(found);
+    }
+    UINT64 meshBytes() const { return meshBytesInUse; }
+    // Debug (-Ddirect.phase2.verifyMeshes): a static mesh's vertices (which 0) or indices (1), copied out by the GPU.
+    UINT meshGpuRead(int id, int which, uint8_t* out, UINT capacity) {
+        auto found = meshes.find(id);
+        if (found == meshes.end()) return 0;
+        const Range& range = which == 0 ? found->second.vertices : found->second.indices;
+        UINT bytes = (std::min)(capacity, which == 0 ? found->second.vertexBytes : found->second.indexBytes);
+        if (!range.bytes || !bytes) return 0;
+        ComPtr<ID3D12Resource> buffer;
+        D3D12_HEAP_PROPERTIES heapProps{D3D12_HEAP_TYPE_READBACK};
+        auto desc = bufferDesc(bytes);
+        check(device->CreateCommittedResource(&heapProps, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                IID_PPV_ARGS(&buffer)), "mesh readback");
+        transitionPage(range.page, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        list->CopyBufferRegion(buffer.Get(), 0, pages[range.page].buffer.Get(), range.offset, bytes);
+        flush();
+        uint8_t* mapped = nullptr;
+        D3D12_RANGE readRange{0, bytes};
+        check(buffer->Map(0, &readRange, reinterpret_cast<void**>(&mapped)), "Map mesh readback");
+        std::memcpy(out, mapped, bytes);
+        D3D12_RANGE none{0, 0};
+        buffer->Unmap(0, &none);
+        return bytes;
+    }
+
+    // glBlitFramebuffer between two framebuffers of the same size (RenderTarget.copyDepthFrom, color copies).
+    // Scaled or partial blits are not supported and return false.
+    bool blit(int readFbo, int drawFbo, const int rect[8], int mask) {
+        auto source = framebuffers.find(readFbo), dest = framebuffers.find(drawFbo);
+        if (readFbo == 0 || drawFbo == 0 || source == framebuffers.end() || dest == framebuffers.end()) return false;
+        bool ok = true;
+        auto copy = [&](Texture* from, Texture* to) {
+            if (!from || !to || from == to) return;
+            bool whole = rect[0] == 0 && rect[1] == 0 && rect[4] == 0 && rect[5] == 0
+                    && static_cast<UINT>(rect[2]) == from->width && static_cast<UINT>(rect[3]) == from->height
+                    && static_cast<UINT>(rect[6]) == to->width && static_cast<UINT>(rect[7]) == to->height;
+            if (!whole || from->width != to->width || from->height != to->height || from->format != to->format) { ok = false; return; }
+            transition(*from, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            transition(*to, D3D12_RESOURCE_STATE_COPY_DEST);
+            D3D12_TEXTURE_COPY_LOCATION src{from->resource.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
+            D3D12_TEXTURE_COPY_LOCATION dst{to->resource.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
+            src.SubresourceIndex = dst.SubresourceIndex = 0;
+            list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+        };
+        if (mask & 0x4000) copy(colorTarget(source->second.color), colorTarget(dest->second.color));
+        if (mask & 0x100) copy(depthTarget(source->second.depth), depthTarget(dest->second.depth));
+        return ok;
+    }
+
     // ---- Programs and draws ---------------------------------------------------------------------------------
     int createProgram(const std::string& name, const std::string& vertex, const std::string& fragment,
             UINT cbufferBytes, UINT textureCount, std::string& error) {
@@ -331,7 +422,8 @@ public:
     }
 
     // layout: per element {location, dxgiFormat, offset}; location -1 is ignored. inputs: shader input locations.
-    void draw(int programId, int fbo, const uint8_t* vertices, UINT vertexBytes, UINT stride, const int* layout,
+    // meshId > 0: vertices and indices come from that static mesh; otherwise they are copied into the upload ring.
+    void draw(int programId, int fbo, int meshId, const uint8_t* vertices, UINT vertexBytes, UINT stride, const int* layout,
             int layoutCount, const int* inputs, int inputCount, const uint8_t* indices, UINT indexBytes, bool wideIndices,
             UINT indexCount, int topology, const int* state, const uint8_t* cbuffer, UINT cbufferBytes,
             const int* textureIds, int textureCount) {
@@ -367,33 +459,56 @@ public:
         ID3D12PipelineState* pso = pipeline(key, program, stride, layout, layoutCount, inputs, inputCount);
         if (!pso) return;
 
-        // Data: vertices, indices and constants all come from the upload ring for this frame.
-        UINT64 vertexOffset = allocate(vertexBytes, 16);
-        std::memcpy(ringData + vertexOffset, vertices, vertexBytes);
-        UINT64 indexOffset = allocate(indexBytes, 16);
-        std::memcpy(ringData + indexOffset, indices, indexBytes);
-        UINT64 constantOffset = 0;
+        // Textures and their sampler table first: a new table may flush, and nothing of this draw is recorded yet.
+        Texture* bound[kMaxTextures] = {};
+        D3D12_SAMPLER_DESC samplerDescs[kMaxTextures];
+        for (UINT i = 0; i < kMaxTextures; ++i) {
+            if (static_cast<int>(i) < textureCount && textureIds[i] > 0) {
+                auto it = textures.find(textureIds[i]);
+                if (it != textures.end() && it->second.resource && &it->second != color && &it->second != depth) bound[i] = &it->second;
+            }
+            samplerDescs[i] = samplerDesc(bound[i]);
+        }
+        UINT samplerBase = samplerTable(samplerDescs);
         UINT constantBytes = static_cast<UINT>(alignUp((std::max)(program.cbufferBytes, 16u), 256));
-        constantOffset = allocate(constantBytes, 256);
+        UINT64 ringNeed = constantBytes + 256 + (meshId > 0 ? 0 : static_cast<UINT64>(vertexBytes) + indexBytes + 32);
+        reserve(ringNeed, kMaxTextures); // the only flush point from here on: a flush would free this draw's ring data
+
+        // Data: static meshes live in the mesh pages; everything else comes from the upload ring for this frame.
+        D3D12_GPU_VIRTUAL_ADDRESS vertexAddress, indexAddress;
+        int vertexPage = -1, indexPage = -1;
+        if (meshId > 0) {
+            auto mesh = meshes.find(meshId);
+            if (mesh == meshes.end()) throw std::runtime_error("static mesh missing");
+            if (mesh->second.vertexBytes == 0 || mesh->second.indexBytes == 0) throw std::runtime_error("static mesh empty");
+            vertexBytes = mesh->second.vertexBytes;
+            indexBytes = mesh->second.indexBytes;
+            vertexAddress = meshAddress(mesh->second.vertices);
+            indexAddress = meshAddress(mesh->second.indices);
+            vertexPage = static_cast<int>(mesh->second.vertices.page);
+            indexPage = static_cast<int>(mesh->second.indices.page);
+        } else {
+            UINT64 vertexOffset = allocate(vertexBytes, 16);
+            std::memcpy(ringData + vertexOffset, vertices, vertexBytes);
+            UINT64 indexOffset = allocate(indexBytes, 16);
+            std::memcpy(ringData + indexOffset, indices, indexBytes);
+            vertexAddress = ring->GetGPUVirtualAddress() + vertexOffset;
+            indexAddress = ring->GetGPUVirtualAddress() + indexOffset;
+        }
+        if (static_cast<UINT64>(indexCount) * (wideIndices ? 4 : 2) > indexBytes) throw std::runtime_error("index count beyond index buffer");
+        UINT64 constantOffset = allocate(constantBytes, 256);
         std::memset(ringData + constantOffset, 0, constantBytes);
         std::memcpy(ringData + constantOffset, cbuffer, (std::min)(cbufferBytes, program.cbufferBytes));
 
         if (color) transition(*color, D3D12_RESOURCE_STATE_RENDER_TARGET);
         if (depth) transition(*depth, key.depth[0] ? D3D12_RESOURCE_STATE_DEPTH_WRITE : D3D12_RESOURCE_STATE_DEPTH_READ);
         // The root table always spans t0..t11/s0..s11; slots the program does not use get a null view.
-        UINT tableCount = kMaxTextures;
-        UINT viewBase = allocateViews(tableCount);
-        UINT samplerBase = allocateSamplers(tableCount);
-        for (UINT i = 0; i < tableCount; ++i) {
-            Texture* texture = nullptr;
-            if (static_cast<int>(i) < textureCount && textureIds[i] > 0) {
-                auto it = textures.find(textureIds[i]);
-                if (it != textures.end() && it->second.resource && &it->second != color && &it->second != depth) texture = &it->second;
-            }
+        UINT viewBase = allocateViews(kMaxTextures);
+        for (UINT i = 0; i < kMaxTextures; ++i) {
+            Texture* texture = bound[i];
             if (texture) transition(*texture, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
             device->CopyDescriptorsSimple(1, gpuViewCpu(viewBase + i), cpuView(texture ? texture->cpuView : nullView),
                     D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-            createSampler(texture, samplerBase + i);
         }
 
         D3D12_CPU_DESCRIPTOR_HANDLE rtvHandle{}, dsvHandle{};
@@ -419,10 +534,13 @@ public:
                 : topology == 0 ? D3D_PRIMITIVE_TOPOLOGY_POINTLIST : D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
         list->IASetPrimitiveTopology(primitive);
         D3D12_VERTEX_BUFFER_VIEW buffers[2] = {
-            {ring->GetGPUVirtualAddress() + vertexOffset, vertexBytes, stride},
+            {vertexAddress, vertexBytes, stride},
             {ring->GetGPUVirtualAddress() + defaultAttribute, 16, 0}};
+        // After every allocation of this draw (any of them may flush and reset the page states).
+        if (vertexPage >= 0) transitionPage(static_cast<UINT>(vertexPage), kMeshRead);
+        if (indexPage >= 0) transitionPage(static_cast<UINT>(indexPage), kMeshRead);
         list->IASetVertexBuffers(0, 2, buffers);
-        D3D12_INDEX_BUFFER_VIEW indexView{ring->GetGPUVirtualAddress() + indexOffset, indexBytes,
+        D3D12_INDEX_BUFFER_VIEW indexView{indexAddress, indexBytes,
                                           wideIndices ? DXGI_FORMAT_R32_UINT : DXGI_FORMAT_R16_UINT};
         list->IASetIndexBuffer(&indexView);
         list->DrawIndexedInstanced(indexCount, 1, 0, 0, 0);
@@ -451,12 +569,14 @@ public:
         barrier.Transition = {backBuffers[index].Get(), D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
                               D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET};
         list->ResourceBarrier(1, &barrier);
-        UINT viewBase = allocateViews(kMaxTextures), samplerBase = allocateSamplers(kMaxTextures);
-        for (UINT i = 0; i < kMaxTextures; ++i) {
+        D3D12_SAMPLER_DESC pointClamp[kMaxTextures];
+        for (auto& desc : pointClamp) desc = samplerDesc(nullptr);
+        UINT samplerBase = samplerTable(pointClamp);
+        reserve(512, kMaxTextures);
+        UINT viewBase = allocateViews(kMaxTextures);
+        for (UINT i = 0; i < kMaxTextures; ++i)
             device->CopyDescriptorsSimple(1, gpuViewCpu(viewBase + i), cpuView(i == 0 ? texture.cpuView : nullView),
                     D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-            createSampler(nullptr, samplerBase + i); // point, clamp
-        }
         UINT64 constants = allocate(256, 256);
         auto rtvHandle = rtvs->GetCPUDescriptorHandleForHeapStart();
         rtvHandle.ptr += static_cast<SIZE_T>(backBufferRtv[index]) * rtvSize;
@@ -538,14 +658,20 @@ public:
         check(fence->SetEventOnCompletion(fenceValue, event), "SetEventOnCompletion");
         if (WaitForSingleObject(event, 10000) != WAIT_OBJECT_0) throw std::runtime_error("DX12 backend fence timed out");
         check(device->GetDeviceRemovedReason(), "device");
+        if (info && pendingMessages.size() < 16384) pendingMessages += debugMessages();
         check(allocator->Reset(), "allocator Reset");
         check(list->Reset(allocator.Get(), nullptr), "list Reset");
         ringOffset = persistentRing;
-        viewOffset = samplerOffset = 0;
+        viewOffset = 0;
         retired.clear();
+        for (const auto& range : pendingFree) give(range);
+        for (auto& page : pages) page.state = D3D12_RESOURCE_STATE_COMMON; // buffers decay after execution
+        pendingFree.clear();
     }
 
     UINT64 draws() const { return drawCount; }
+    // Debug layer messages collected at fence waits since the last call.
+    std::string takeMessages() { std::string out; out.swap(pendingMessages); return out; }
 
 private:
     struct Framebuffer { int color = 0, depth = 0; };
@@ -560,7 +686,9 @@ private:
     UINT64 fenceValue = 0;
     ComPtr<ID3D12DescriptorHeap> views, samplers, cpuViews, rtvs, dsvs;
     UINT viewSize = 0, samplerSize = 0, rtvSize = 0, dsvSize = 0;
-    UINT viewOffset = 0, samplerOffset = 0, cpuViewNext = 0, rtvNext = 0, dsvNext = 0;
+    UINT viewOffset = 0, samplerNext = 0, cpuViewNext = 0, rtvNext = 0, dsvNext = 0;
+    // Shader-visible sampler tables (12 samplers each) are cached by content; the heap holds at most 2048 samplers.
+    std::unordered_map<std::string, UINT> samplerTables;
     std::vector<int> freeCpuViews, freeRtvs, freeDsvs;
     int nullView = 0;
     ComPtr<ID3D12RootSignature> root;
@@ -573,6 +701,82 @@ private:
     std::unordered_map<PsoKey, ComPtr<ID3D12PipelineState>, PsoHash> psos;
     std::vector<ComPtr<ID3D12Resource>> retired;
     UINT64 drawCount = 0;
+    std::string pendingMessages;
+    struct Page { ComPtr<ID3D12Resource> buffer; UINT64 bytes = 0; std::map<UINT64, UINT64> free;
+                  D3D12_RESOURCE_STATES state = D3D12_RESOURCE_STATE_COMMON; };
+    static constexpr D3D12_RESOURCE_STATES kMeshRead = D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER | D3D12_RESOURCE_STATE_INDEX_BUFFER;
+    static constexpr UINT64 kPageBytes = 32ull << 20;
+    std::vector<Page> pages;
+    std::unordered_map<int, MeshBuffers> meshes;
+    std::vector<Range> pendingFree;
+    int nextMesh = 1;
+    UINT64 meshBytesInUse = 0;
+
+    D3D12_GPU_VIRTUAL_ADDRESS meshAddress(const Range& range) { return pages[range.page].buffer->GetGPUVirtualAddress() + range.offset; }
+
+    void transitionPage(UINT page, D3D12_RESOURCE_STATES state) {
+        auto& p = pages[page];
+        if (p.state == state) return;
+        D3D12_RESOURCE_BARRIER barrier{};
+        barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        barrier.Transition = {p.buffer.Get(), D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, p.state, state};
+        list->ResourceBarrier(1, &barrier);
+        p.state = state;
+    }
+
+    // First fit over the pages' free lists, a new page when none fits; the bytes are staged in the ring and copied.
+    Range store(const uint8_t* data, UINT bytes) {
+        Range range;
+        if (bytes == 0 || !data) return range;
+        // Stage first: a full ring flushes, which also returns pending ranges to the free lists.
+        UINT64 staged = allocate(bytes, 16);
+        std::memcpy(ringData + staged, data, bytes);
+        UINT64 size = alignUp(bytes, 256);
+        bool found = false;
+        for (UINT p = 0; p < pages.size() && !found; ++p) {
+            auto& free = pages[p].free;
+            for (auto it = free.begin(); it != free.end(); ++it) {
+                if (it->second < size) continue;
+                range = {p, it->first, size};
+                UINT64 rest = it->second - size, at = it->first + size;
+                free.erase(it);
+                if (rest) free[at] = rest;
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            Page page;
+            page.bytes = (std::max)(kPageBytes, size);
+            D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_DEFAULT};
+            auto desc = bufferDesc(page.bytes);
+            check(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON,
+                    nullptr, IID_PPV_ARGS(&page.buffer)), "mesh page");
+            if (page.bytes > size) page.free[size] = page.bytes - size;
+            pages.push_back(std::move(page));
+            range = {static_cast<UINT>(pages.size() - 1), 0, size};
+        }
+        transitionPage(range.page, D3D12_RESOURCE_STATE_COPY_DEST);
+        list->CopyBufferRegion(pages[range.page].buffer.Get(), range.offset, ring.Get(), staged, bytes);
+        meshBytesInUse += size;
+        return range;
+    }
+    // A range may still be read by recorded commands; it is reused only after the next fence wait.
+    void release(Range& range) {
+        if (range.bytes) pendingFree.push_back(range);
+        range = {};
+    }
+    void give(const Range& range) {
+        meshBytesInUse -= range.bytes;
+        auto& free = pages[range.page].free;
+        auto next = free.emplace(range.offset, range.bytes).first;
+        if (next != free.begin()) {
+            auto previous = std::prev(next);
+            if (previous->first + previous->second == next->first) { previous->second += next->second; free.erase(next); next = previous; }
+        }
+        auto after = std::next(next);
+        if (after != free.end() && next->first + next->second == after->first) { next->second += after->second; free.erase(after); }
+    }
     static constexpr UINT kBackBuffers = 2;
     ComPtr<IDXGISwapChain3> swapChain;
     ComPtr<ID3D12Resource> backBuffers[kBackBuffers];
@@ -704,10 +908,29 @@ float4 ps(V v) : SV_Target0 { return float4(Source.SampleLevel(Point, v.uv, 0).r
         viewOffset += count;
         return base;
     }
-    UINT allocateSamplers(UINT count) {
-        if (samplerOffset + count > kSamplerRing) flush();
-        UINT base = samplerOffset;
-        samplerOffset += count;
+    // Makes room for one draw: if its ring bytes or views do not fit, runs the recorded work now, before any of the
+    // draw's data is written. Allocations made after this never flush.
+    void reserve(UINT64 ringBytes, UINT views) {
+        if (ringBytes + persistentRing + 256 > kRingBytes) throw std::runtime_error("draw larger than the DX12 backend ring");
+        if (alignUp(ringOffset, 256) + ringBytes > kRingBytes || viewOffset + views > kViewRing) flush();
+    }
+    UINT samplerTable(const D3D12_SAMPLER_DESC (&descs)[kMaxTextures]) {
+        std::string key(reinterpret_cast<const char*>(descs), sizeof(descs));
+        auto found = samplerTables.find(key);
+        if (found != samplerTables.end()) return found->second;
+        if (samplerNext + kMaxTextures > kSamplerRing) {
+            flush(); // recorded draws still reference the old tables
+            samplerTables.clear();
+            samplerNext = 0;
+        }
+        UINT base = samplerNext;
+        samplerNext += kMaxTextures;
+        for (UINT i = 0; i < kMaxTextures; ++i) {
+            auto handle = samplers->GetCPUDescriptorHandleForHeapStart();
+            handle.ptr += static_cast<SIZE_T>(base + i) * samplerSize;
+            device->CreateSampler(&descs[i], handle);
+        }
+        samplerTables.emplace(std::move(key), base);
         return base;
     }
     int allocateCpuView() {
@@ -821,7 +1044,7 @@ float4 ps(V v) : SV_Target0 { return float4(Source.SampleLevel(Point, v.uv, 0).r
         texture.state = state;
     }
 
-    void createSampler(Texture* texture, UINT slot) {
+    D3D12_SAMPLER_DESC samplerDesc(Texture* texture) {
         D3D12_SAMPLER_DESC desc{};
         int minFilter = texture ? texture->minFilter : 9728, magFilter = texture ? texture->magFilter : 9728;
         bool minLinear = minFilter == 9729 || minFilter == 9985 || minFilter == 9987;
@@ -840,9 +1063,7 @@ float4 ps(V v) : SV_Target0 { return float4(Source.SampleLevel(Point, v.uv, 0).r
         desc.MinLOD = mipmapped ? (std::max)(0.0f, texture->minLod) : 0.0f;
         float top = texture ? static_cast<float>((std::min)(static_cast<UINT>(texture->maxLevel), texture->levels - 1)) : 0.0f;
         desc.MaxLOD = mipmapped ? (std::min)(top, texture->maxLod) : 0.0f;
-        auto handle = samplers->GetCPUDescriptorHandleForHeapStart();
-        handle.ptr += static_cast<SIZE_T>(slot) * samplerSize;
-        device->CreateSampler(&desc, handle);
+        return desc;
     }
 
     ID3D12PipelineState* pipeline(const PsoKey& key, Program& program, UINT stride, const int* layout, int layoutCount,
@@ -962,6 +1183,10 @@ BACKEND(create) void JNICALL JNI_NAME(create)(JNIEnv* env, jclass, jboolean debu
 }
 BACKEND(destroy) void JNICALL JNI_NAME(destroy)(JNIEnv*, jclass) { g_backend.reset(); }
 BACKEND(flush) void JNICALL JNI_NAME(flush)(JNIEnv* env, jclass) { guarded(env, [&] { g_backend->flush(); }); }
+BACKEND(messages) jstring JNICALL JNI_NAME(messages)(JNIEnv* env, jclass) {
+    std::string text = g_backend ? g_backend->takeMessages() : std::string();
+    return env->NewStringUTF(text.c_str());
+}
 BACKEND(draws) jlong JNICALL JNI_NAME(draws)(JNIEnv*, jclass) { return g_backend ? static_cast<jlong>(g_backend->draws()) : 0; }
 
 BACKEND(textureImage) void JNICALL JNI_NAME(textureImage)(JNIEnv* env, jclass, jint id, jint level, jint internal, jint w, jint h) {
@@ -1008,7 +1233,40 @@ BACKEND(createProgram) jint JNICALL JNI_NAME(createProgram)(JNIEnv* env, jclass,
     });
     return result;
 }
-BACKEND(draw) void JNICALL JNI_NAME(draw)(JNIEnv* env, jclass, jint program, jint fbo, jlong vertices, jint vertexBytes,
+BACKEND(meshUpload) jint JNICALL JNI_NAME(meshUpload)(JNIEnv* env, jclass, jint id, jlong vertices, jint vertexBytes,
+        jlong indices, jint indexBytes) {
+    jint result = 0;
+    guarded(env, [&] {
+        result = g_backend->meshUpload(id, reinterpret_cast<const uint8_t*>(vertices), static_cast<UINT>(vertexBytes),
+                reinterpret_cast<const uint8_t*>(indices), static_cast<UINT>(indexBytes));
+    });
+    return result;
+}
+BACKEND(meshIndices) void JNICALL JNI_NAME(meshIndices)(JNIEnv* env, jclass, jint id, jlong indices, jint indexBytes) {
+    guarded(env, [&] { g_backend->meshIndices(id, reinterpret_cast<const uint8_t*>(indices), static_cast<UINT>(indexBytes)); });
+}
+BACKEND(meshDelete) void JNICALL JNI_NAME(meshDelete)(JNIEnv* env, jclass, jint id) {
+    guarded(env, [&] { g_backend->meshDelete(id); });
+}
+BACKEND(meshBytes) jlong JNICALL JNI_NAME(meshBytes)(JNIEnv*, jclass) { return g_backend ? static_cast<jlong>(g_backend->meshBytes()) : 0; }
+BACKEND(meshGpuRead) jint JNICALL JNI_NAME(meshGpuRead)(JNIEnv* env, jclass, jint id, jint which, jobject out) {
+    jint bytes = 0;
+    guarded(env, [&] {
+        bytes = static_cast<jint>(g_backend->meshGpuRead(id, which, static_cast<uint8_t*>(env->GetDirectBufferAddress(out)),
+                static_cast<UINT>(env->GetDirectBufferCapacity(out))));
+    });
+    return bytes;
+}
+BACKEND(blit) jboolean JNICALL JNI_NAME(blit)(JNIEnv* env, jclass, jint readFbo, jint drawFbo, jintArray rect, jint mask) {
+    jboolean ok = JNI_FALSE;
+    guarded(env, [&] {
+        jint r[8];
+        env->GetIntArrayRegion(rect, 0, 8, r);
+        ok = g_backend->blit(readFbo, drawFbo, reinterpret_cast<int*>(r), mask) ? JNI_TRUE : JNI_FALSE;
+    });
+    return ok;
+}
+BACKEND(draw) void JNICALL JNI_NAME(draw)(JNIEnv* env, jclass, jint program, jint fbo, jint mesh, jlong vertices, jint vertexBytes,
         jint stride, jintArray layout, jintArray inputs, jlong indices, jint indexBytes, jboolean wide, jint indexCount,
         jint topology, jintArray state, jobject cbuffer, jint cbufferBytes, jintArray textures) {
     guarded(env, [&] {
@@ -1018,7 +1276,7 @@ BACKEND(draw) void JNICALL JNI_NAME(draw)(JNIEnv* env, jclass, jint program, jin
         jint* textureData = env->GetIntArrayElements(textures, nullptr);
         const auto* constants = static_cast<const uint8_t*>(env->GetDirectBufferAddress(cbuffer));
         try {
-            g_backend->draw(program, fbo, reinterpret_cast<const uint8_t*>(vertices), static_cast<UINT>(vertexBytes),
+            g_backend->draw(program, fbo, mesh, reinterpret_cast<const uint8_t*>(vertices), static_cast<UINT>(vertexBytes),
                     static_cast<UINT>(stride), reinterpret_cast<int*>(layoutData), env->GetArrayLength(layout) / 3,
                     reinterpret_cast<int*>(inputData), env->GetArrayLength(inputs),
                     reinterpret_cast<const uint8_t*>(indices), static_cast<UINT>(indexBytes), wide == JNI_TRUE,
